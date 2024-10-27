@@ -11,6 +11,9 @@ MiniDB is a simplified, small-scale database system implemented in Go. It's desi
 - Concurrent access support
 
 ## Project Structure
+
+```bash
+
 minidb/
 ├── cmd/
 │ └── minidb/
@@ -26,6 +29,8 @@ minidb/
 │ └── engine.go
 ├── go.mod
 └── README.md
+
+```
 
 ## Getting Started
 
