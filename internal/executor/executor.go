@@ -37,12 +37,22 @@ func formatTable(headers []string, rows []storage.Row) string {
 		return "No rows found"
 	}
 
+	// 如果是 SELECT *，需要从第一行数据中获取所有列名
+	if len(headers) == 1 && headers[0] == "*" {
+		// 从第一行获取所有列名
+		headers = make([]string, 0)
+		for key := range rows[0] {
+			headers = append(headers, key)
+		}
+	}
+
 	// 计算每列的最大宽度
 	colWidths := make([]int, len(headers))
 	for i, header := range headers {
 		colWidths[i] = len(header)
 		for _, row := range rows {
-			width := len(fmt.Sprintf("%v", row[i]))
+				// 使用 header 而不是索引 i 来访问 map
+			width := len(fmt.Sprintf("%v", row[header]))
 			if width > colWidths[i] {
 				colWidths[i] = width
 			}
@@ -73,8 +83,9 @@ func formatTable(headers []string, rows []storage.Row) string {
 	// 写入数据行
 	for _, row := range rows {
 		result.WriteString("|")
-		for i := range headers {
-			result.WriteString(fmt.Sprintf(" %-*v |", colWidths[i], row[i]))
+		for i, header := range headers {
+			// 使用 header 而不是索引 i 来访问 map
+			result.WriteString(fmt.Sprintf(" %-*v |", colWidths[i], row[header]))
 		}
 		result.WriteString("\n")
 	}
@@ -90,6 +101,9 @@ func (e *Executor) executeSelect(query *parser.Query) (string, error) {
 	rows, err := e.storage.Select(query.Table, query.Fields)
 	if err != nil {
 		return "", err
+	}
+	if len(rows) == 0 {
+		return "No rows found", nil
 	}
 	return formatTable(query.Fields, rows), nil
 }

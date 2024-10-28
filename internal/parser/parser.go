@@ -75,16 +75,39 @@ func (p *Parser) parseInsert(parts []string) (*Query, error) {
 }
 
 func (p *Parser) parseUpdate(parts []string) (*Query, error) {
-	// 简化实现，仅支持 "UPDATE table_name SET field=value WHERE condition"
-	if len(parts) < 7 || parts[2] != "SET" || parts[len(parts)-2] != "WHERE" {
+	// 修改 UPDATE 语句的解析逻辑
+	if len(parts) < 7 || parts[2] != "SET" {
 		return nil, errors.New("invalid UPDATE query")
 	}
+
+	// 查找 WHERE 子句的位置
+	whereIndex := -1
+	for i, part := range parts {
+		if part == "WHERE" {
+			whereIndex = i
+			break
+		}
+	}
+	
+	if whereIndex == -1 {
+		return nil, errors.New("UPDATE query must have WHERE clause")
+	}
+
+	// 解析 SET 子句
+	setClause := strings.Split(parts[3], "=")
+	if len(setClause) != 2 {
+		return nil, errors.New("invalid SET clause in UPDATE query")
+	}
+
+	// 解析 WHERE 子句
+	whereCondition := strings.Join(parts[whereIndex+1:], " ")
+
 	return &Query{
 		Type:   UPDATE,
 		Table:  parts[1],
-		Fields: []string{strings.Split(parts[3], "=")[0]},
-		Values: []string{strings.Split(parts[3], "=")[1]},
-		Where:  parts[len(parts)-1],
+		Fields: []string{setClause[0]},
+		Values: []string{setClause[1]},
+		Where:  whereCondition,
 	}, nil
 }
 
@@ -99,4 +122,3 @@ func (p *Parser) parseDelete(parts []string) (*Query, error) {
 		Where: parts[4],
 	}, nil
 }
-

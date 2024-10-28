@@ -78,7 +78,7 @@ telnet localhost 8086
 Once connected, you can send SQL queries to the server. Here are some example queries:
 
 ```sql
-INSERT INTO users VALUES (1, John, Doe)
+INSERT INTO users VALUES (1, Yason, Lee)
 SELECT * FROM users
 UPDATE users SET col2=Jane WHERE col1=1
 DELETE FROM users WHERE col1=1
