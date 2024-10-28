@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/storage"
@@ -30,12 +31,67 @@ func (e *Executor) Execute(query *parser.Query) (string, error) {
 	}
 }
 
+// formatTable 将字段名和数据行格式化为 ASCII 表格
+func formatTable(headers []string, rows []storage.Row) string {
+	if len(rows) == 0 {
+		return "No rows found"
+	}
+
+	// 计算每列的最大宽度
+	colWidths := make([]int, len(headers))
+	for i, header := range headers {
+		colWidths[i] = len(header)
+		for _, row := range rows {
+			width := len(fmt.Sprintf("%v", row[i]))
+			if width > colWidths[i] {
+				colWidths[i] = width
+			}
+		}
+	}
+
+	var result strings.Builder
+
+	// 绘制分隔线的辅助函数
+	drawLine := func() {
+		result.WriteString("+")
+		for _, width := range colWidths {
+			result.WriteString(strings.Repeat("-", width+2))
+			result.WriteString("+")
+		}
+		result.WriteString("\n")
+	}
+
+	// 写入表头
+	drawLine()
+	result.WriteString("|")
+	for i, header := range headers {
+		result.WriteString(fmt.Sprintf(" %-*s |", colWidths[i], header))
+	}
+	result.WriteString("\n")
+	drawLine()
+
+	// 写入数据行
+	for _, row := range rows {
+		result.WriteString("|")
+		for i := range headers {
+			result.WriteString(fmt.Sprintf(" %-*v |", colWidths[i], row[i]))
+		}
+		result.WriteString("\n")
+	}
+	drawLine()
+
+	// 添加统计信息
+	result.WriteString(fmt.Sprintf("\nTotal: %d rows", len(rows)))
+	
+	return result.String()
+}
+
 func (e *Executor) executeSelect(query *parser.Query) (string, error) {
 	rows, err := e.storage.Select(query.Table, query.Fields)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Selected %d rows", len(rows)), nil
+	return formatTable(query.Fields, rows), nil
 }
 
 func (e *Executor) executeInsert(query *parser.Query) (string, error) {
@@ -61,4 +117,3 @@ func (e *Executor) executeDelete(query *parser.Query) (string, error) {
 	}
 	return fmt.Sprintf("Deleted %d rows", count), nil
 }
-

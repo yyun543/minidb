@@ -63,14 +63,14 @@ To start the MiniDB server, run:
 ./minidb
 ```
 
-The server will start and listen on port 8080 by default.
+The server will start and listen on port 8086 by default.
 
 ### Connecting to the Server
 
 You can use any TCP client (like telnet) to connect to the server and send SQL queries:
 
 ```bash
-telnet localhost 8080
+telnet localhost 8086
 ```
 
 ## Usage
@@ -79,7 +79,7 @@ Once connected, you can send SQL queries to the server. Here are some example qu
 
 ```sql
 INSERT INTO users VALUES (1, John, Doe)
-SELECT FROM users
+SELECT * FROM users
 UPDATE users SET col2=Jane WHERE col1=1
 DELETE FROM users WHERE col1=1
 ```

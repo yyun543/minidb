@@ -15,7 +15,7 @@ func main() {
 	engine := storage.NewEngine()
 
 	// 创建一个示例表
-	err := engine.CreateTable("users")
+	err := engine.CreateTable("USERS")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func main() {
 	executor := executor.NewExecutor(engine)
 
 	// 创建服务器
-	server, err := network.NewServer(":8080", parser, executor)
+	server, err := network.NewServer(":8086", parser, executor)
 	if err != nil {
 		log.Fatal(err)
 	}
