@@ -29,7 +29,7 @@ func NewParser() *Parser {
 }
 
 func (p *Parser) Parse(query string) (*Query, error) {
-	// 移除末尾分号并清理空白字符
+	// Remove trailing semicolon and clean whitespace
 	query = strings.TrimSpace(strings.TrimSuffix(query, ";"))
 	
 	parts := strings.Fields(query)
@@ -37,7 +37,7 @@ func (p *Parser) Parse(query string) (*Query, error) {
 		return nil, errors.New("empty query")
 	}
 
-	// 只将命令关键字转换为大写进行匹配
+	// Only convert command keywords to uppercase for matching
 	switch strings.ToUpper(parts[0]) {
 	case "SELECT":
 		return p.parseSelect(parts)
@@ -57,9 +57,9 @@ func (p *Parser) parseSelect(parts []string) (*Query, error) {
 		return nil, errors.New("invalid SELECT query")
 	}
 
-	// 解析字段列表
+	// Parse field list
 	fields := strings.Split(parts[1], ",")
-	// 清理每个字段的空格
+	// Clean whitespace from each field
 	for i := range fields {
 		fields[i] = strings.TrimSpace(fields[i])
 	}
@@ -76,15 +76,14 @@ func (p *Parser) parseInsert(parts []string) (*Query, error) {
 		return nil, errors.New("invalid INSERT query")
 	}
 	
-	// 提取括号中的值
+	// Extract values within parentheses
 	valuesStr := strings.Join(parts[4:], " ")
 	valuesStr = strings.Trim(valuesStr, "()")
 	
-	// 分割值并清理
+	// Split values and clean
 	values := strings.Split(valuesStr, ",")
+	// Remove possible quotes
 	for i := range values {
-		values[i] = strings.TrimSpace(values[i])
-		// 移除可能存在的引号
 		values[i] = strings.Trim(values[i], "'\"")
 	}
 	
@@ -96,50 +95,81 @@ func (p *Parser) parseInsert(parts []string) (*Query, error) {
 }
 
 func (p *Parser) parseUpdate(parts []string) (*Query, error) {
-	// 修改 UPDATE 语句的解析逻辑
-	if len(parts) < 7 || parts[2] != "SET" {
+	// Check basic syntax
+	if len(parts) < 4 {
 		return nil, errors.New("invalid UPDATE query")
 	}
 
-	// 查找 WHERE 子句的位置
-	whereIndex := -1
-	for i, part := range parts {
-		if part == "WHERE" {
-			whereIndex = i
-			break
-		}
-	}
+	// Reconstruct full query string for better handling of equals sign
+	fullQuery := strings.Join(parts, " ")
 	
-	if whereIndex == -1 {
+	// Split main parts
+	sections := strings.SplitN(fullQuery, "SET", 2)
+	if len(sections) != 2 {
+		return nil, errors.New("UPDATE query must have SET clause")
+	}
+
+	// Get table name
+	table := strings.TrimSpace(strings.TrimPrefix(sections[0], "UPDATE"))
+
+	// Handle SET and WHERE parts
+	setAndWhere := strings.SplitN(sections[1], "WHERE", 2)
+	if len(setAndWhere) != 2 {
 		return nil, errors.New("UPDATE query must have WHERE clause")
 	}
 
-	// 解析 SET 子句
-	setClause := strings.Split(parts[3], "=")
-	if len(setClause) != 2 {
+	// Parse SET clause
+	setClause := strings.TrimSpace(setAndWhere[0])
+	setParts := strings.Split(setClause, "=")
+	if len(setParts) != 2 {
 		return nil, errors.New("invalid SET clause in UPDATE query")
 	}
 
-	// 解析 WHERE 子句
-	whereCondition := strings.Join(parts[whereIndex+1:], " ")
+	field := strings.TrimSpace(setParts[0])
+	value := strings.TrimSpace(setParts[1])
+	// Remove possible quotes
+	value = strings.Trim(value, "'\"")
+
+	// Get WHERE condition
+	whereCondition := strings.TrimSpace(setAndWhere[1])
 
 	return &Query{
 		Type:   UPDATE,
-		Table:  parts[1],  // 保持表名原始大小写
-		Fields: []string{setClause[0]},
-		Values: []string{setClause[1]},
+		Table:  table,
+		Fields: []string{field},
+		Values: []string{value},
 		Where:  whereCondition,
 	}, nil
 }
 
 func (p *Parser) parseDelete(parts []string) (*Query, error) {
-	// 简化实现，仅支持 "DELETE FROM table_name WHERE condition"
-	if len(parts) != 5 || parts[1] != "FROM" || parts[3] != "WHERE" {
-		return nil, errors.New("invalid DELETE query")
+	// Check basic syntax
+	if len(parts) < 4 || strings.ToUpper(parts[1]) != "FROM" {
+		return nil, errors.New("invalid DELETE query: must be in format 'DELETE FROM table WHERE condition'")
 	}
+
+	// Reconstruct full query string
+	fullQuery := strings.Join(parts, " ")
+	
+	// Split main parts
+	sections := strings.SplitN(fullQuery, "WHERE", 2)
+	if len(sections) != 2 {
+		return nil, errors.New("DELETE query must have WHERE clause")
+	}
+
+	// Get table name
+	tableParts := strings.Fields(sections[0])
+	if len(tableParts) != 3 { // DELETE FROM table
+		return nil, errors.New("invalid DELETE query format")
+	}
+	table := strings.TrimSpace(tableParts[2])
+
+	// Get WHERE condition
+	whereCondition := strings.TrimSpace(sections[1])
+
 	return &Query{
 		Type:  DELETE,
-		Table: parts[2],  // 保持表名原始大小写
-		Where: parts[4],
+		Table: table,
+		Where: whereCondition,
 	}, nil
 }

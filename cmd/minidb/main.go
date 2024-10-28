@@ -11,22 +11,22 @@ import (
 )
 
 func main() {
-	// 创建存储引擎
+	// Create storage engine
 	engine := storage.NewEngine()
 
-	// 创建一个示例表
+	// Create a sample table
 	err := engine.CreateTable("users")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// 创建解析器
+	// Create parser
 	parser := parser.NewParser()
 
-	// 创建执行器
+	// Create executor
 	executor := executor.NewExecutor(engine)
 
-	// 创建服务器
+	// Create server
 	server, err := network.NewServer(":8086", parser, executor)
 	if err != nil {
 		log.Fatal(err)
@@ -38,4 +38,3 @@ func main() {
 		log.Fatal(err)
 	}
 }
-

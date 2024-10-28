@@ -28,7 +28,7 @@ func (e *Engine) CreateTable(name string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// 统一使用小写表名
+	// Use lowercase table names consistently
 	name = strings.ToLower(name)
 
 	if _, exists := e.Tables[name]; exists {
@@ -45,7 +45,7 @@ func (e *Engine) Select(table string, fields []string) ([]Row, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// 统一使用小写表名
+	// Use lowercase table names consistently
 	table = strings.ToLower(table)
 
 	t, exists := e.Tables[table]
@@ -76,7 +76,7 @@ func (e *Engine) Insert(table string, values []string) error {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// 统一使用小写表名
+	// Use lowercase table names consistently
 	table = strings.ToLower(table)
 
 	t, exists := e.Tables[table]
@@ -99,7 +99,7 @@ func (e *Engine) Update(table, field, value, where string) (int, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// 统一使用小写表名
+	// Use lowercase table names consistently
 	table = strings.ToLower(table)
 
 	t, exists := e.Tables[table]
@@ -124,7 +124,7 @@ func (e *Engine) Delete(table, where string) (int, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// 统一使用小写表名
+	// Use lowercase table names consistently
 	table = strings.ToLower(table)
 
 	t, exists := e.Tables[table]
@@ -160,7 +160,7 @@ func evaluateWhere(row Row, where string) bool {
 
 	field := strings.TrimSpace(parts[0])
 	value := strings.TrimSpace(parts[1])
-	// 移除可能的引号
+	// Remove possible quotes
 	value = strings.Trim(value, "'\"")
 	
 	actualValue, exists := row[field]

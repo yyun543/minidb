@@ -32,28 +32,28 @@ func (e *Executor) Execute(query *parser.Query) (string, error) {
 	}
 }
 
-// formatTable 将字段名和数据行格式化为 ASCII 表格
+// formatTable formats field names and data rows into an ASCII table
 func formatTable(headers []string, rows []storage.Row) string {
 	if len(rows) == 0 {
 		return "Empty set (0 rows)"
 	}
 
-	// 如果是 SELECT *，需要从第一行数据中获取所有列名并排序
+	// If SELECT *, get all column names from first row and sort them
 	if len(headers) == 1 && headers[0] == "*" {
 		headers = make([]string, 0)
 		for key := range rows[0] {
 			headers = append(headers, key)
 		}
-		// 可选：对列名进行排序以保持一致的显示顺序
+		// Optional: sort column names for consistent display order
 		sort.Strings(headers)
 	}
 
-	// 计算每列的最大宽度
+	// Calculate maximum width for each column
 	colWidths := make([]int, len(headers))
 	for i, header := range headers {
 		colWidths[i] = len(header)
 		for _, row := range rows {
-				// 使用 header 而不是索引 i 来访问 map
+				// Use header instead of index i to access map
 			width := len(fmt.Sprintf("%v", row[header]))
 			if width > colWidths[i] {
 				colWidths[i] = width
@@ -63,7 +63,7 @@ func formatTable(headers []string, rows []storage.Row) string {
 
 	var result strings.Builder
 
-	// 绘制分隔线的辅助函数
+	// Helper function to draw separator line
 	drawLine := func() {
 		result.WriteString("+")
 		for _, width := range colWidths {
@@ -73,7 +73,7 @@ func formatTable(headers []string, rows []storage.Row) string {
 		result.WriteString("\n")
 	}
 
-	// 写入表头
+	// Write headers
 	drawLine()
 	result.WriteString("|")
 	for i, header := range headers {
@@ -82,18 +82,18 @@ func formatTable(headers []string, rows []storage.Row) string {
 	result.WriteString("\n")
 	drawLine()
 
-	// 写入数据行
+	// Write data rows
 	for _, row := range rows {
 		result.WriteString("|")
 		for i, header := range headers {
-			// 使用 header 而不是索引 i 来访问 map
+			// Use header instead of index i to access map
 			result.WriteString(fmt.Sprintf(" %-*v |", colWidths[i], row[header]))
 		}
 		result.WriteString("\n")
 	}
 	drawLine()
 
-	// 添加统计信息
+	// Add statistics
 	result.WriteString(fmt.Sprintf("\nTotal: %d rows", len(rows)))
 	
 	return result.String()

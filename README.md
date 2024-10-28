@@ -80,8 +80,12 @@ Once connected, you can send SQL queries to the server. Here are some example qu
 ```sql
 INSERT INTO users VALUES (1, Yason, Lee);
 SELECT * FROM users;
+INSERT INTO users VALUES (2, Zion, Lee);
+SELECT * FROM users;
 UPDATE users SET col2=Jane WHERE col1=1;
+SELECT * FROM users;
 DELETE FROM users WHERE col1=1;
+SELECT * FROM users;
 ```
 
 

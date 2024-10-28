@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"time"
+	"io"
 
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/executor"
@@ -44,7 +45,7 @@ func (s *Server) Start() error {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	
-	// 设置连接超时
+	// Set connection timeout
 	conn.SetDeadline(time.Now().Add(60 * time.Second))
 	
 	reader := bufio.NewReader(conn)
@@ -70,7 +71,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 		
-		// 重置连接超时
+		// Reset connection timeout
 		conn.SetDeadline(time.Now().Add(30 * time.Second))
 		
 		parsedQuery, err := s.parser.Parse(query)
