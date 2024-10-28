@@ -3,13 +3,13 @@ package network
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
-	"io"
 
-	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/executor"
+	"github.com/yyun543/minidb/internal/parser"
 )
 
 type Server struct {
@@ -44,13 +44,13 @@ func (s *Server) Start() error {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
-	
+
 	// Set connection timeout
-	conn.SetDeadline(time.Now().Add(60 * time.Second))
-	
+	conn.SetDeadline(time.Now().Add(600 * time.Second))
+
 	reader := bufio.NewReader(conn)
 	fmt.Fprintf(conn, "Welcome to MiniDB! Enter your SQL query or type 'exit' to quit.\n")
-	
+
 	for {
 		fmt.Fprintf(conn, "minidb> ")
 		query, err := reader.ReadString('\n')
@@ -60,32 +60,32 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 			return
 		}
-		
+
 		query = strings.TrimSpace(query)
 		if query == "" {
 			continue
 		}
-		
+
 		if strings.ToLower(query) == "exit" || strings.ToLower(query) == "quit" {
 			fmt.Fprintf(conn, "Bye!\n")
 			return
 		}
-		
+
 		// Reset connection timeout
 		conn.SetDeadline(time.Now().Add(30 * time.Second))
-		
+
 		parsedQuery, err := s.parser.Parse(query)
 		if err != nil {
 			fmt.Fprintf(conn, "Error: %v\n", err)
 			continue
 		}
-		
+
 		result, err := s.executor.Execute(parsedQuery)
 		if err != nil {
 			fmt.Fprintf(conn, "Error: %v\n", err)
 			continue
 		}
-		
+
 		fmt.Fprintf(conn, "%s\n", result)
 	}
 }

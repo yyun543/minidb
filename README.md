@@ -4,32 +4,39 @@ MiniDB is a simplified, small-scale database system implemented in Go. It's desi
 
 ## Features
 
-- Basic SQL query support (SELECT, INSERT, UPDATE, DELETE)
-- In-memory storage engine
-- Simple network communication layer
-- Query parsing and execution
-- Concurrent access support
+- SQL Query Support:
+  - DDL (Data Definition Language):
+    - CREATE TABLE - Create new tables with schema
+    - DROP TABLE - Remove existing tables
+    - SHOW TABLES - List all tables
+  - DML (Data Manipulation Language):
+    - SELECT - Query data from tables
+    - INSERT - Add new records
+    - UPDATE - Modify existing records
+    - DELETE - Remove records
+- In-memory storage engine with schema support
+- Concurrent access support with proper locking
+- Network communication layer
+- SQL query parsing and execution
 
 ## Project Structure
 
 ```bash
-
 minidb/
 ├── cmd/
-│ └── minidb/
-│ └── main.go
+│   └── minidb/
+│       └── main.go
 ├── internal/
-│ ├── network/
-│ │ └── server.go
-│ ├── parser/
-│ │ └── parser.go
-│ ├── executor/
-│ │ └── executor.go
-│ └── storage/
-│ └── engine.go
+│   ├── network/
+│   │   └── server.go
+│   ├── parser/
+│   │   └── parser.go
+│   ├── executor/
+│   │   └── executor.go
+│   └── storage/
+│       └── engine.go
 ├── go.mod
 └── README.md
-
 ```
 
 ## Getting Started
@@ -73,23 +80,41 @@ You can use any TCP client (like telnet) to connect to the server and send SQL q
 telnet localhost 8086
 ```
 
-## Usage
+## Usage Examples
 
 Once connected, you can send SQL queries to the server. Here are some example queries:
 
+### DDL Operations
 ```sql
-INSERT INTO users VALUES (1, Yason, Lee);
-SELECT * FROM users;
-INSERT INTO users VALUES (2, Zion, Lee);
-SELECT * FROM users;
-UPDATE users SET col2=Jane WHERE col1=1;
-SELECT * FROM users;
-DELETE FROM users WHERE col1=1;
-SELECT * FROM users;
+-- Create a new table
+CREATE TABLE users (id INT, name VARCHAR, email VARCHAR);
+CREATE TABLE users_back (id INT, name VARCHAR, email VARCHAR);
+
+-- Show all tables
+SHOW TABLES;
+
+-- Drop a table
+DROP TABLE users_back;
 ```
 
+### DML Operations
+```sql
+-- Insert data
+INSERT INTO users VALUES (1, John, john@example.com);
+INSERT INTO users VALUES (2, Harry, harry@example.com);
 
-To exit the client, type `exit` and press Enter.
+-- Query data
+SELECT * FROM users;
+SELECT name, email FROM users;
+
+-- Update data
+UPDATE users SET name=Jane WHERE id=1;
+
+-- Delete data
+DELETE FROM users WHERE id=1;
+```
+
+To exit the client, type `exit` or `quit` and press Enter.
 
 ## Limitations
 
@@ -97,19 +122,22 @@ This is a simplified database system and has several limitations:
 
 - Only supports basic SQL operations
 - Uses in-memory storage (data is not persistent)
-- Limited error handling and security features
+- Limited data types support
 - No support for complex queries (e.g., JOIN, GROUP BY)
 - No indexing or query optimization
+- Basic error handling and security features
 
 ## Future Improvements
 
 - Implement persistent storage
 - Add support for more complex SQL operations
+- Add support for more data types
 - Implement indexing and query optimization
-- Add transaction support
+- Add transaction support (ACID properties)
 - Improve error handling and add logging
 - Implement security features (authentication, authorization)
 - Add support for configuration options
+- Add support for foreign keys and constraints
 
 ## Contributing
 
@@ -118,4 +146,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-

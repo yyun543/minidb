@@ -8,18 +8,24 @@ import (
 type QueryType int
 
 const (
-	SELECT QueryType = iota
+	// DDL Operations
+	CREATE QueryType = iota
+	DROP
+	SHOW
+	// DML Operations
+	SELECT
 	INSERT
 	UPDATE
 	DELETE
 )
 
 type Query struct {
-	Type   QueryType
-	Table  string
-	Fields []string
-	Values []string
-	Where  string
+	Type    QueryType
+	Table   string
+	Fields  []string // For SELECT and CREATE TABLE (column names)
+	Values  []string // For INSERT and column types in CREATE TABLE
+	Where   string   // For SELECT, UPDATE, DELETE conditions
+	Command string   // For special commands like SHOW TABLES
 }
 
 type Parser struct{}
@@ -31,7 +37,7 @@ func NewParser() *Parser {
 func (p *Parser) Parse(query string) (*Query, error) {
 	// Remove trailing semicolon and clean whitespace
 	query = strings.TrimSpace(strings.TrimSuffix(query, ";"))
-	
+
 	parts := strings.Fields(query)
 	if len(parts) == 0 {
 		return nil, errors.New("empty query")
@@ -39,6 +45,14 @@ func (p *Parser) Parse(query string) (*Query, error) {
 
 	// Only convert command keywords to uppercase for matching
 	switch strings.ToUpper(parts[0]) {
+	// DDL Operations
+	case "CREATE":
+		return p.parseCreate(parts)
+	case "DROP":
+		return p.parseDropTable(parts)
+	case "SHOW":
+		return p.parseShow(parts)
+	// DML Operations
 	case "SELECT":
 		return p.parseSelect(parts)
 	case "INSERT":
@@ -57,17 +71,46 @@ func (p *Parser) parseSelect(parts []string) (*Query, error) {
 		return nil, errors.New("invalid SELECT query")
 	}
 
-	// Parse field list
-	fields := strings.Split(parts[1], ",")
-	// Clean whitespace from each field
-	for i := range fields {
-		fields[i] = strings.TrimSpace(fields[i])
+	// Extract fields between SELECT and FROM
+	fieldsStr := strings.Join(parts[1:], " ")
+	fromIndex := strings.Index(strings.ToUpper(fieldsStr), "FROM")
+	if fromIndex == -1 {
+		return nil, errors.New("invalid SELECT query: missing FROM clause")
+	}
+	fieldsStr = fieldsStr[:fromIndex]
+
+	// Split fields by comma and clean
+	var fields []string
+	if fieldsStr == "*" {
+		fields = []string{"*"}
+	} else {
+		fields = strings.Split(fieldsStr, ",")
+		for i := range fields {
+			fields[i] = strings.TrimSpace(fields[i])
+			if fields[i] == "" {
+				return nil, errors.New("empty field name in SELECT query")
+			}
+		}
+	}
+
+	// Get table name and WHERE clause
+	remainingStr := strings.TrimSpace(strings.Join(parts[3:], " "))
+	tableParts := strings.Fields(remainingStr)
+	if len(tableParts) == 0 {
+		return nil, errors.New("missing table name")
+	}
+
+	table := tableParts[0]
+	var where string
+	if len(tableParts) > 1 && strings.ToUpper(tableParts[1]) == "WHERE" {
+		where = strings.Join(tableParts[2:], " ")
 	}
 
 	return &Query{
 		Type:   SELECT,
-		Table:  parts[3],
+		Table:  table,
 		Fields: fields,
+		Where:  where,
 	}, nil
 }
 
@@ -75,18 +118,18 @@ func (p *Parser) parseInsert(parts []string) (*Query, error) {
 	if len(parts) < 5 || strings.ToUpper(parts[1]) != "INTO" || strings.ToUpper(parts[3]) != "VALUES" {
 		return nil, errors.New("invalid INSERT query")
 	}
-	
+
 	// Extract values within parentheses
 	valuesStr := strings.Join(parts[4:], " ")
 	valuesStr = strings.Trim(valuesStr, "()")
-	
+
 	// Split values and clean
 	values := strings.Split(valuesStr, ",")
 	// Remove possible quotes
 	for i := range values {
 		values[i] = strings.Trim(values[i], "'\"")
 	}
-	
+
 	return &Query{
 		Type:   INSERT,
 		Table:  parts[2],
@@ -102,7 +145,7 @@ func (p *Parser) parseUpdate(parts []string) (*Query, error) {
 
 	// Reconstruct full query string for better handling of equals sign
 	fullQuery := strings.Join(parts, " ")
-	
+
 	// Split main parts
 	sections := strings.SplitN(fullQuery, "SET", 2)
 	if len(sections) != 2 {
@@ -114,7 +157,7 @@ func (p *Parser) parseUpdate(parts []string) (*Query, error) {
 
 	// Handle SET and WHERE parts
 	setAndWhere := strings.SplitN(sections[1], "WHERE", 2)
-	if len(setAndWhere) != 2 {
+	if len(setAndWhere) < 2 {
 		return nil, errors.New("UPDATE query must have WHERE clause")
 	}
 
@@ -150,7 +193,7 @@ func (p *Parser) parseDelete(parts []string) (*Query, error) {
 
 	// Reconstruct full query string
 	fullQuery := strings.Join(parts, " ")
-	
+
 	// Split main parts
 	sections := strings.SplitN(fullQuery, "WHERE", 2)
 	if len(sections) != 2 {
@@ -171,5 +214,63 @@ func (p *Parser) parseDelete(parts []string) (*Query, error) {
 		Type:  DELETE,
 		Table: table,
 		Where: whereCondition,
+	}, nil
+}
+
+// parseCreate handles CREATE TABLE statements
+func (p *Parser) parseCreate(parts []string) (*Query, error) {
+	if len(parts) < 4 || strings.ToUpper(parts[1]) != "TABLE" {
+		return nil, errors.New("invalid CREATE TABLE syntax")
+	}
+
+	tableName := parts[2]
+
+	// Extract column definitions within parentheses
+	columnsStr := strings.Join(parts[3:], " ")
+	columnsStr = strings.Trim(columnsStr, "()")
+
+	// Split column definitions
+	columnDefs := strings.Split(columnsStr, ",")
+	fields := make([]string, 0)
+	types := make([]string, 0)
+
+	for _, def := range columnDefs {
+		parts := strings.Fields(strings.TrimSpace(def))
+		if len(parts) < 2 {
+			return nil, errors.New("invalid column definition")
+		}
+		fields = append(fields, parts[0])
+		types = append(types, parts[1])
+	}
+
+	return &Query{
+		Type:   CREATE,
+		Table:  tableName,
+		Fields: fields,
+		Values: types,
+	}, nil
+}
+
+// parseDropTable handles DROP TABLE statements
+func (p *Parser) parseDropTable(parts []string) (*Query, error) {
+	if len(parts) != 3 || strings.ToUpper(parts[1]) != "TABLE" {
+		return nil, errors.New("invalid DROP TABLE syntax")
+	}
+
+	return &Query{
+		Type:  DROP,
+		Table: parts[2],
+	}, nil
+}
+
+// parseShow handles SHOW TABLES statement
+func (p *Parser) parseShow(parts []string) (*Query, error) {
+	if len(parts) != 2 || strings.ToUpper(parts[1]) != "TABLES" {
+		return nil, errors.New("invalid SHOW command")
+	}
+
+	return &Query{
+		Type:    SHOW,
+		Command: "TABLES",
 	}, nil
 }

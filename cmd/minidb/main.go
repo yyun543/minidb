@@ -14,12 +14,6 @@ func main() {
 	// Create storage engine
 	engine := storage.NewEngine()
 
-	// Create a sample table
-	err := engine.CreateTable("users")
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	// Create parser
 	parser := parser.NewParser()
 

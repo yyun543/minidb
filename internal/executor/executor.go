@@ -2,8 +2,8 @@ package executor
 
 import (
 	"fmt"
-	"strings"
 	"sort"
+	"strings"
 
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/storage"
@@ -19,6 +19,14 @@ func NewExecutor(storage *storage.Engine) *Executor {
 
 func (e *Executor) Execute(query *parser.Query) (string, error) {
 	switch query.Type {
+	// DDL Operations
+	case parser.CREATE:
+		return e.executeCreate(query)
+	case parser.DROP:
+		return e.executeDropTable(query)
+	case parser.SHOW:
+		return e.executeShow(query)
+	// DML Operations
 	case parser.SELECT:
 		return e.executeSelect(query)
 	case parser.INSERT:
@@ -53,7 +61,7 @@ func formatTable(headers []string, rows []storage.Row) string {
 	for i, header := range headers {
 		colWidths[i] = len(header)
 		for _, row := range rows {
-				// Use header instead of index i to access map
+			// Use header instead of index i to access map
 			width := len(fmt.Sprintf("%v", row[header]))
 			if width > colWidths[i] {
 				colWidths[i] = width
@@ -95,7 +103,7 @@ func formatTable(headers []string, rows []storage.Row) string {
 
 	// Add statistics
 	result.WriteString(fmt.Sprintf("\nTotal: %d rows", len(rows)))
-	
+
 	return result.String()
 }
 
@@ -132,4 +140,44 @@ func (e *Executor) executeDelete(query *parser.Query) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("Deleted %d rows", count), nil
+}
+
+func (e *Executor) executeCreate(query *parser.Query) (string, error) {
+	err := e.storage.CreateTableWithColumns(query.Table, query.Fields, query.Values)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Table %s created successfully", query.Table), nil
+}
+
+func (e *Executor) executeDropTable(query *parser.Query) (string, error) {
+	err := e.storage.DropTable(query.Table)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Table %s dropped successfully", query.Table), nil
+}
+
+func (e *Executor) executeShow(query *parser.Query) (string, error) {
+	if query.Command == "TABLES" {
+		tables := e.storage.ShowTables()
+		if len(tables) == 0 {
+			return "No tables found", nil
+		}
+
+		// Format the output as a table
+		var result strings.Builder
+		result.WriteString("+----------------+\n")
+		result.WriteString("| Table Name     |\n")
+		result.WriteString("+----------------+\n")
+
+		for _, table := range tables {
+			result.WriteString(fmt.Sprintf("| %-14s |\n", table))
+		}
+
+		result.WriteString("+----------------+\n")
+		result.WriteString(fmt.Sprintf("\nTotal: %d tables", len(tables)))
+		return result.String(), nil
+	}
+	return "", fmt.Errorf("unsupported SHOW command")
 }
