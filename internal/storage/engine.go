@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -54,10 +55,10 @@ func (e *Engine) CreateTableWithColumns(name string, columns []string, types []s
 		return fmt.Errorf("table %s already exists", name)
 	}
 
-	// Create table schema
+	// Create table schema with lowercase column names
 	schema := make(Row)
 	for i, col := range columns {
-		schema[col] = types[i]
+		schema[strings.ToLower(col)] = types[i]
 	}
 
 	e.Tables[name] = &Table{
@@ -82,9 +83,15 @@ func (e *Engine) Select(table string, fields []string) ([]Row, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	// Convert field names to lowercase for comparison
+	lowerFields := make([]string, len(fields))
+	for i, field := range fields {
+		lowerFields[i] = strings.ToLower(field)
+	}
+
 	// Validate fields against schema
-	if fields[0] != "*" {
-		for _, field := range fields {
+	if lowerFields[0] != "*" {
+		for _, field := range lowerFields {
 			if _, exists := t.Schema[field]; !exists {
 				return nil, fmt.Errorf("column %s does not exist in table %s", field, table)
 			}
@@ -94,15 +101,17 @@ func (e *Engine) Select(table string, fields []string) ([]Row, error) {
 	result := make([]Row, len(t.Rows))
 	for i, row := range t.Rows {
 		result[i] = make(Row)
-		if fields[0] == "*" {
+		if lowerFields[0] == "*" {
 			// Copy all fields
-			for col := range t.Schema {
-				result[i][col] = row[col]
+			for col, val := range row {
+				result[i][col] = val
 			}
 		} else {
 			// Copy selected fields
-			for _, field := range fields {
-				result[i][field] = row[field]
+			for _, field := range lowerFields {
+				if val, exists := row[field]; exists {
+					result[i][field] = val
+				}
 			}
 		}
 	}
@@ -144,6 +153,7 @@ func (e *Engine) Insert(table string, values []string) error {
 	// Create new row using schema column names
 	row := make(Row)
 	for i, col := range columns {
+		// 确保使用小写列名存储
 		row[col] = strings.TrimSpace(values[i])
 	}
 
@@ -155,16 +165,15 @@ func (e *Engine) Update(table, field, value, where string) (int, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// Use lowercase table names consistently
 	table = strings.ToLower(table)
-	field = strings.TrimSpace(field)
+	field = strings.ToLower(strings.TrimSpace(field))
+	value = strings.TrimSpace(value)
 
 	t, exists := e.Tables[table]
 	if !exists {
 		return 0, fmt.Errorf("table %s does not exist", table)
 	}
 
-	// Validate field exists in schema
 	if _, exists := t.Schema[field]; !exists {
 		return 0, fmt.Errorf("column %s does not exist in table %s", field, table)
 	}
@@ -175,7 +184,7 @@ func (e *Engine) Update(table, field, value, where string) (int, error) {
 	count := 0
 	for i := range t.Rows {
 		if evaluateWhere(t.Rows[i], where) {
-			t.Rows[i][field] = strings.TrimSpace(value)
+			t.Rows[i][field] = value
 			count++
 		}
 	}
@@ -220,18 +229,29 @@ func evaluateWhere(row Row, where string) bool {
 		return false
 	}
 
-	field := strings.TrimSpace(parts[0])
-	value := strings.TrimSpace(parts[1])
-	// Remove possible quotes
-	value = strings.Trim(value, "'\"")
+	field := strings.ToLower(strings.TrimSpace(parts[0]))
+	expectedValue := strings.TrimSpace(parts[1])
+	// 移除可能存在的引号
+	expectedValue = strings.Trim(expectedValue, "'\"")
 
 	actualValue, exists := row[field]
 	if !exists {
 		return false
 	}
 
-	// Case-insensitive comparison
-	return strings.EqualFold(strings.TrimSpace(actualValue), strings.TrimSpace(value))
+	// 移除实际值中可能存在的引号
+	actualValue = strings.Trim(actualValue, "'\"")
+
+	// 首先尝试数值比较
+	expectedNum, expectedErr := strconv.ParseFloat(expectedValue, 64)
+	actualNum, actualErr := strconv.ParseFloat(actualValue, 64)
+
+	if expectedErr == nil && actualErr == nil {
+		return expectedNum == actualNum
+	}
+
+	// 如果不是数值，进行字符串比较
+	return actualValue == expectedValue
 }
 
 func (e *Engine) ShowTables() []string {
