@@ -49,9 +49,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 			fmt.Println("Error reading from connection:", err)
 			return
 		}
+		
+		// 清理输入，移除多余的空白字符
 		query = strings.TrimSpace(query)
-		if query == "exit" {
+		if query == "exit" || query == "exit;" {
 			return
+		}
+		
+		// 如果查询为空，继续下一次循环
+		if query == "" {
+			continue
 		}
 		
 		parsedQuery, err := s.parser.Parse(query)
@@ -69,4 +76,3 @@ func (s *Server) handleConnection(conn net.Conn) {
 		fmt.Fprintf(conn, "%s\n", result)
 	}
 }
-

@@ -29,12 +29,16 @@ func NewParser() *Parser {
 }
 
 func (p *Parser) Parse(query string) (*Query, error) {
-	parts := strings.Fields(strings.ToUpper(query))
+	// 移除末尾分号并清理空白字符
+	query = strings.TrimSpace(strings.TrimSuffix(query, ";"))
+	
+	parts := strings.Fields(query)
 	if len(parts) == 0 {
 		return nil, errors.New("empty query")
 	}
 
-	switch parts[0] {
+	// 只将命令关键字转换为大写进行匹配
+	switch strings.ToUpper(parts[0]) {
 	case "SELECT":
 		return p.parseSelect(parts)
 	case "INSERT":
@@ -49,27 +53,27 @@ func (p *Parser) Parse(query string) (*Query, error) {
 }
 
 func (p *Parser) parseSelect(parts []string) (*Query, error) {
-	// 简化实现，仅支持 "SELECT * FROM table_name"
-	if len(parts) != 4 || parts[1] != "*" || parts[2] != "FROM" {
+	// 检查关键字时使用大写比较
+	if len(parts) != 4 || strings.ToUpper(parts[2]) != "FROM" {
 		return nil, errors.New("invalid SELECT query")
 	}
 	return &Query{
 		Type:   SELECT,
-		Table:  parts[3],
+		Table:  parts[3],  // 保持表名原始大小写
 		Fields: []string{"*"},
 	}, nil
 }
 
 func (p *Parser) parseInsert(parts []string) (*Query, error) {
-	// 简化实现，仅支持 "INSERT INTO table_name VALUES (value1, value2, ...)"
-	if len(parts) < 5 || parts[1] != "INTO" || parts[3] != "VALUES" {
+	// 检查关键字时使用大写比较
+	if len(parts) < 5 || strings.ToUpper(parts[1]) != "INTO" || strings.ToUpper(parts[3]) != "VALUES" {
 		return nil, errors.New("invalid INSERT query")
 	}
 	values := strings.Join(parts[4:], " ")
 	values = strings.Trim(values, "()")
 	return &Query{
 		Type:   INSERT,
-		Table:  parts[2],
+		Table:  parts[2],  // 保持表名原始大小写
 		Values: strings.Split(values, ","),
 	}, nil
 }
@@ -104,7 +108,7 @@ func (p *Parser) parseUpdate(parts []string) (*Query, error) {
 
 	return &Query{
 		Type:   UPDATE,
-		Table:  parts[1],
+		Table:  parts[1],  // 保持表名原始大小写
 		Fields: []string{setClause[0]},
 		Values: []string{setClause[1]},
 		Where:  whereCondition,
@@ -118,7 +122,7 @@ func (p *Parser) parseDelete(parts []string) (*Query, error) {
 	}
 	return &Query{
 		Type:  DELETE,
-		Table: parts[2],
+		Table: parts[2],  // 保持表名原始大小写
 		Where: parts[4],
 	}, nil
 }

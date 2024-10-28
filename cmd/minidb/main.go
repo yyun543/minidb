@@ -15,7 +15,7 @@ func main() {
 	engine := storage.NewEngine()
 
 	// 创建一个示例表
-	err := engine.CreateTable("USERS")
+	err := engine.CreateTable("users")
 	if err != nil {
 		log.Fatal(err)
 	}

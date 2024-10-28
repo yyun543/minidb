@@ -28,6 +28,9 @@ func (e *Engine) CreateTable(name string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// 统一使用小写表名
+	name = strings.ToLower(name)
+
 	if _, exists := e.Tables[name]; exists {
 		return fmt.Errorf("table %s already exists", name)
 	}
@@ -41,6 +44,9 @@ func (e *Engine) CreateTable(name string) error {
 func (e *Engine) Select(table string, fields []string) ([]Row, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+
+	// 统一使用小写表名
+	table = strings.ToLower(table)
 
 	t, exists := e.Tables[table]
 	if !exists {
@@ -70,6 +76,9 @@ func (e *Engine) Insert(table string, values []string) error {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	// 统一使用小写表名
+	table = strings.ToLower(table)
+
 	t, exists := e.Tables[table]
 	if !exists {
 		return fmt.Errorf("table %s does not exist", table)
@@ -89,6 +98,9 @@ func (e *Engine) Insert(table string, values []string) error {
 func (e *Engine) Update(table, field, value, where string) (int, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+
+	// 统一使用小写表名
+	table = strings.ToLower(table)
 
 	t, exists := e.Tables[table]
 	if !exists {
@@ -111,6 +123,9 @@ func (e *Engine) Update(table, field, value, where string) (int, error) {
 func (e *Engine) Delete(table, where string) (int, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+
+	// 统一使用小写表名
+	table = strings.ToLower(table)
 
 	t, exists := e.Tables[table]
 	if !exists {
@@ -143,4 +158,3 @@ func evaluateWhere(row Row, where string) bool {
 	value := strings.TrimSpace(parts[1])
 	return row[field] == value
 }
-
