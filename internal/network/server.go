@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/executor"
@@ -42,34 +43,45 @@ func (s *Server) Start() error {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
+	
+	// 设置连接超时
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
+	
 	reader := bufio.NewReader(conn)
+	fmt.Fprintf(conn, "Welcome to MiniDB! Enter your SQL query or type 'exit' to quit.\n")
+	
 	for {
+		fmt.Fprintf(conn, "minidb> ")
 		query, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Println("Error reading from connection:", err)
+			if err != io.EOF {
+				fmt.Println("Error reading from connection:", err)
+			}
 			return
 		}
 		
-		// 清理输入，移除多余的空白字符
 		query = strings.TrimSpace(query)
-		if query == "exit" || query == "exit;" {
-			return
-		}
-		
-		// 如果查询为空，继续下一次循环
 		if query == "" {
 			continue
 		}
 		
+		if strings.ToLower(query) == "exit" || strings.ToLower(query) == "quit" {
+			fmt.Fprintf(conn, "Bye!\n")
+			return
+		}
+		
+		// 重置连接超时
+		conn.SetDeadline(time.Now().Add(30 * time.Second))
+		
 		parsedQuery, err := s.parser.Parse(query)
 		if err != nil {
-			fmt.Fprintf(conn, "Error parsing query: %v\n", err)
+			fmt.Fprintf(conn, "Error: %v\n", err)
 			continue
 		}
 		
 		result, err := s.executor.Execute(parsedQuery)
 		if err != nil {
-			fmt.Fprintf(conn, "Error executing query: %v\n", err)
+			fmt.Fprintf(conn, "Error: %v\n", err)
 			continue
 		}
 		

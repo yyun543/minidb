@@ -53,28 +53,45 @@ func (p *Parser) Parse(query string) (*Query, error) {
 }
 
 func (p *Parser) parseSelect(parts []string) (*Query, error) {
-	// 检查关键字时使用大写比较
-	if len(parts) != 4 || strings.ToUpper(parts[2]) != "FROM" {
+	if len(parts) < 4 || strings.ToUpper(parts[2]) != "FROM" {
 		return nil, errors.New("invalid SELECT query")
 	}
+
+	// 解析字段列表
+	fields := strings.Split(parts[1], ",")
+	// 清理每个字段的空格
+	for i := range fields {
+		fields[i] = strings.TrimSpace(fields[i])
+	}
+
 	return &Query{
 		Type:   SELECT,
-		Table:  parts[3],  // 保持表名原始大小写
-		Fields: []string{"*"},
+		Table:  parts[3],
+		Fields: fields,
 	}, nil
 }
 
 func (p *Parser) parseInsert(parts []string) (*Query, error) {
-	// 检查关键字时使用大写比较
 	if len(parts) < 5 || strings.ToUpper(parts[1]) != "INTO" || strings.ToUpper(parts[3]) != "VALUES" {
 		return nil, errors.New("invalid INSERT query")
 	}
-	values := strings.Join(parts[4:], " ")
-	values = strings.Trim(values, "()")
+	
+	// 提取括号中的值
+	valuesStr := strings.Join(parts[4:], " ")
+	valuesStr = strings.Trim(valuesStr, "()")
+	
+	// 分割值并清理
+	values := strings.Split(valuesStr, ",")
+	for i := range values {
+		values[i] = strings.TrimSpace(values[i])
+		// 移除可能存在的引号
+		values[i] = strings.Trim(values[i], "'\"")
+	}
+	
 	return &Query{
 		Type:   INSERT,
-		Table:  parts[2],  // 保持表名原始大小写
-		Values: strings.Split(values, ","),
+		Table:  parts[2],
+		Values: values,
 	}, nil
 }
 

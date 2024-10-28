@@ -149,12 +149,24 @@ func (e *Engine) Delete(table, where string) (int, error) {
 }
 
 func evaluateWhere(row Row, where string) bool {
-	// 简化实现，仅支持简单的等于条件
+	if where == "" {
+		return true
+	}
+
 	parts := strings.Split(where, "=")
 	if len(parts) != 2 {
 		return false
 	}
+
 	field := strings.TrimSpace(parts[0])
 	value := strings.TrimSpace(parts[1])
-	return row[field] == value
+	// 移除可能的引号
+	value = strings.Trim(value, "'\"")
+	
+	actualValue, exists := row[field]
+	if !exists {
+		return false
+	}
+	
+	return actualValue == value
 }

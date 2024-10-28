@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"strings"
+	"sort"
 
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/storage"
@@ -34,16 +35,17 @@ func (e *Executor) Execute(query *parser.Query) (string, error) {
 // formatTable 将字段名和数据行格式化为 ASCII 表格
 func formatTable(headers []string, rows []storage.Row) string {
 	if len(rows) == 0 {
-		return "No rows found"
+		return "Empty set (0 rows)"
 	}
 
-	// 如果是 SELECT *，需要从第一行数据中获取所有列名
+	// 如果是 SELECT *，需要从第一行数据中获取所有列名并排序
 	if len(headers) == 1 && headers[0] == "*" {
-		// 从第一行获取所有列名
 		headers = make([]string, 0)
 		for key := range rows[0] {
 			headers = append(headers, key)
 		}
+		// 可选：对列名进行排序以保持一致的显示顺序
+		sort.Strings(headers)
 	}
 
 	// 计算每列的最大宽度
