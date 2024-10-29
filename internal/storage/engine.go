@@ -2,259 +2,145 @@ package storage
 
 import (
 	"fmt"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 )
 
-type Row map[string]string
-
-type Table struct {
-	Rows   []Row
-	Schema Row // Stores column names and their types
-	mu     sync.RWMutex
-}
-
 type Engine struct {
-	Tables map[string]*Table
-	mu     sync.RWMutex
+	Tables      map[string]*Table       // 行存储
+	ColumnStore map[string]*ColumnStore // 列存储
+	mu          sync.RWMutex
 }
 
 func NewEngine() *Engine {
 	return &Engine{
-		Tables: make(map[string]*Table),
+		Tables:      make(map[string]*Table),
+		ColumnStore: make(map[string]*ColumnStore),
 	}
 }
 
-func (e *Engine) CreateTable(name string) error {
+func (e *Engine) CreateTable(name string, schema Row) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Use lowercase table names consistently
 	name = strings.ToLower(name)
-
 	if _, exists := e.Tables[name]; exists {
 		return fmt.Errorf("table %s already exists", name)
 	}
 
-	e.Tables[name] = &Table{
-		Rows: make([]Row, 0),
-	}
+	e.Tables[name] = NewTable(schema)
+	e.ColumnStore[name] = NewColumnStore(schema)
 	return nil
 }
 
-func (e *Engine) CreateTableWithColumns(name string, columns []string, types []string) error {
+func (e *Engine) DropTable(name string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Use lowercase table names consistently
 	name = strings.ToLower(name)
-
-	if _, exists := e.Tables[name]; exists {
-		return fmt.Errorf("table %s already exists", name)
+	if _, exists := e.Tables[name]; !exists {
+		return fmt.Errorf("table %s does not exist", name)
 	}
 
-	// Create table schema with lowercase column names
-	schema := make(Row)
-	for i, col := range columns {
-		schema[strings.ToLower(col)] = types[i]
-	}
-
-	e.Tables[name] = &Table{
-		Rows:   make([]Row, 0),
-		Schema: schema,
-	}
+	delete(e.Tables, name)
+	delete(e.ColumnStore, name)
 	return nil
-}
-
-func (e *Engine) Select(table string, fields []string) ([]Row, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	// Use lowercase table names consistently
-	table = strings.ToLower(table)
-
-	t, exists := e.Tables[table]
-	if !exists {
-		return nil, fmt.Errorf("table %s does not exist", table)
-	}
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	// Convert field names to lowercase for comparison
-	lowerFields := make([]string, len(fields))
-	for i, field := range fields {
-		lowerFields[i] = strings.ToLower(field)
-	}
-
-	// Validate fields against schema
-	if lowerFields[0] != "*" {
-		for _, field := range lowerFields {
-			if _, exists := t.Schema[field]; !exists {
-				return nil, fmt.Errorf("column %s does not exist in table %s", field, table)
-			}
-		}
-	}
-
-	result := make([]Row, len(t.Rows))
-	for i, row := range t.Rows {
-		result[i] = make(Row)
-		if lowerFields[0] == "*" {
-			// Copy all fields
-			for col, val := range row {
-				result[i][col] = val
-			}
-		} else {
-			// Copy selected fields
-			for _, field := range lowerFields {
-				if val, exists := row[field]; exists {
-					result[i][field] = val
-				}
-			}
-		}
-	}
-	return result, nil
 }
 
 func (e *Engine) Insert(table string, values []string) error {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// Use lowercase table names consistently
 	table = strings.ToLower(table)
-
-	t, exists := e.Tables[table]
+	rowStore, exists := e.Tables[table]
 	if !exists {
 		return fmt.Errorf("table %s does not exist", table)
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Check if schema exists
-	if t.Schema == nil {
-		return fmt.Errorf("table %s has no schema defined", table)
+	// 插入到行存储
+	if err := rowStore.Insert(values); err != nil {
+		return err
 	}
 
-	// Get ordered column names from schema
-	columns := make([]string, 0, len(t.Schema))
-	for col := range t.Schema {
-		columns = append(columns, col)
-	}
-	sort.Strings(columns) // Sort for consistent order
-
-	// Validate number of values matches schema
-	if len(values) != len(columns) {
-		return fmt.Errorf("invalid number of values: expected %d, got %d", len(columns), len(values))
-	}
-
-	// Create new row using schema column names
-	row := make(Row)
-	for i, col := range columns {
-		// 确保使用小写列名存储
-		row[col] = strings.TrimSpace(values[i])
-	}
-
-	t.Rows = append(t.Rows, row)
-	return nil
+	// 同步到列存储
+	colStore := e.ColumnStore[table]
+	return colStore.Insert(values)
 }
 
-func (e *Engine) Update(table, field, value, where string) (int, error) {
+func (e *Engine) Select(table string, columns []string, where string, isAnalytical bool) ([]Row, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
 	table = strings.ToLower(table)
-	field = strings.ToLower(strings.TrimSpace(field))
-	value = strings.TrimSpace(value)
 
-	t, exists := e.Tables[table]
-	if !exists {
-		return 0, fmt.Errorf("table %s does not exist", table)
-	}
-
-	if _, exists := t.Schema[field]; !exists {
-		return 0, fmt.Errorf("column %s does not exist in table %s", field, table)
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	count := 0
-	for i := range t.Rows {
-		if evaluateWhere(t.Rows[i], where) {
-			t.Rows[i][field] = value
-			count++
+	if isAnalytical {
+		store, exists := e.ColumnStore[table]
+		if !exists {
+			return nil, fmt.Errorf("table %s does not exist", table)
 		}
+		return store.Select(columns, where)
 	}
-	return count, nil
+
+	store, exists := e.Tables[table]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", table)
+	}
+	return store.Select(columns, where)
 }
 
-func (e *Engine) Delete(table, where string) (int, error) {
+func (e *Engine) Update(table, column, value, where string) (int, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// Use lowercase table names consistently
 	table = strings.ToLower(table)
-
-	t, exists := e.Tables[table]
+	rowStore, exists := e.Tables[table]
 	if !exists {
 		return 0, fmt.Errorf("table %s does not exist", table)
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	count := 0
-	newRows := make([]Row, 0, len(t.Rows))
-	for _, row := range t.Rows {
-		if !evaluateWhere(row, where) {
-			newRows = append(newRows, row)
-		} else {
-			count++
-		}
+	// 更新行存储
+	count, err := rowStore.Update(column, value, where)
+	if err != nil {
+		return 0, err
 	}
-	t.Rows = newRows
+
+	// 同步到列存储
+	colStore := e.ColumnStore[table]
+	_, err = colStore.Update(column, value, where)
+	if err != nil {
+		return 0, err
+	}
+
 	return count, nil
 }
 
-func evaluateWhere(row Row, where string) bool {
-	if where == "" {
-		return true
-	}
+func (e *Engine) Delete(table string, where string) (int, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 
-	parts := strings.Split(where, "=")
-	if len(parts) != 2 {
-		return false
-	}
-
-	field := strings.ToLower(strings.TrimSpace(parts[0]))
-	expectedValue := strings.TrimSpace(parts[1])
-	// 移除可能存在的引号
-	expectedValue = strings.Trim(expectedValue, "'\"")
-
-	actualValue, exists := row[field]
+	table = strings.ToLower(table)
+	rowStore, exists := e.Tables[table]
 	if !exists {
-		return false
+		return 0, fmt.Errorf("table %s does not exist", table)
 	}
 
-	// 移除实际值中可能存在的引号
-	actualValue = strings.Trim(actualValue, "'\"")
-
-	// 首先尝试数值比较
-	expectedNum, expectedErr := strconv.ParseFloat(expectedValue, 64)
-	actualNum, actualErr := strconv.ParseFloat(actualValue, 64)
-
-	if expectedErr == nil && actualErr == nil {
-		return expectedNum == actualNum
+	// 从行存储删除
+	count, err := rowStore.Delete(where)
+	if err != nil {
+		return 0, err
 	}
 
-	// 如果不是数值，进行字符串比较
-	return actualValue == expectedValue
+	// 同步到列存储
+	colStore := e.ColumnStore[table]
+	_, err = colStore.Delete(where)
+	if err != nil {
+		return 0, err
+	}
+
+	return count, nil
 }
 
-func (e *Engine) ShowTables() []string {
+func (e *Engine) GetTables() []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -265,17 +151,34 @@ func (e *Engine) ShowTables() []string {
 	return tables
 }
 
-func (e *Engine) DropTable(name string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+type Transaction struct {
+	engine     *Engine
+	operations []Operation
+	mu         sync.Mutex
+}
 
-	// Use lowercase table names consistently
-	name = strings.ToLower(name)
-
-	if _, exists := e.Tables[name]; !exists {
-		return fmt.Errorf("table %s does not exist", name)
+func (e *Engine) Begin() *Transaction {
+	return &Transaction{
+		engine:     e,
+		operations: make([]Operation, 0),
 	}
+}
 
-	delete(e.Tables, name)
+func (tx *Transaction) Commit() error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+
+	// 执行所有操作
+	for _, op := range tx.operations {
+		if err := op.Execute(tx.engine); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (tx *Transaction) Rollback() {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	tx.operations = nil
 }
