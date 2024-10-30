@@ -5,134 +5,95 @@ import (
 	"strconv"
 )
 
+// Parser SQL解析器
 type Parser struct {
-	lexer        *Lexer
-	currentToken Token
-	peekToken    Token
-	errors       []string
+	lexer        *Lexer   // 词法分析器
+	currentToken Token    // 当前token
+	peekToken    Token    // 下一个token
+	errors       []string // 解析错误
 }
 
+// NewParser 创建新的解析器
 func NewParser(input string) *Parser {
 	p := &Parser{
-		lexer:  NewLexer(input),
-		errors: []string{},
+		lexer: NewLexer(input),
 	}
-	// 读取两个token以初始化current和peek
+	// 读取两个token，设置current和peek
 	p.nextToken()
 	p.nextToken()
 	return p
 }
 
-func (p *Parser) Errors() []string {
-	return p.errors
-}
-
-func (p *Parser) nextToken() {
-	p.currentToken = p.peekToken
-	p.peekToken = p.lexer.NextToken()
-}
-
-func (p *Parser) expectPeek(t TokenType) bool {
-	if p.peekToken.Type == t {
-		p.nextToken()
-		return true
-	}
-	p.peekError(t)
-	return false
-}
-
-func (p *Parser) peekError(t TokenType) {
-	msg := fmt.Sprintf("expected next token to be %v, got %v instead at line %d, column %d",
-		t, p.peekToken.Type, p.peekToken.Line, p.peekToken.Column)
-	p.errors = append(p.errors, msg)
-}
-
+// Parse 解析SQL语句
 func (p *Parser) Parse() (Statement, error) {
 	switch p.currentToken.Type {
-	case SELECT:
+	case TOK_SELECT:
 		return p.parseSelect()
-	case INSERT:
+	case TOK_INSERT:
 		return p.parseInsert()
-	case UPDATE:
+	case TOK_UPDATE:
 		return p.parseUpdate()
-	case DELETE:
+	case TOK_DELETE:
 		return p.parseDelete()
-	case CREATE:
-		return p.parseCreateTable()
-	case DROP:
-		return p.parseDropTable()
-	case SHOW:
-		return p.parseShowTables()
+	case TOK_CREATE:
+		return p.parseCreate()
 	default:
-		return nil, fmt.Errorf("unexpected token %v at line %d, column %d",
-			p.currentToken.Type, p.currentToken.Line, p.currentToken.Column)
+		return nil, fmt.Errorf("unexpected token: %s", p.currentToken)
 	}
 }
 
+// parseSelect 解析SELECT语句
 func (p *Parser) parseSelect() (*SelectStmt, error) {
-	stmt := &SelectStmt{BaseNode: BaseNode{nodeType: SELECT}}
+	stmt := &SelectStmt{}
 
-	// Parse fields
-	if !p.expectPeek(MULTIPLY) && !p.expectPeek(IDENT) {
-		return nil, fmt.Errorf("expected field name or * after SELECT")
-	}
-
-	stmt.Fields = make([]Expression, 0)
-	for {
-		var expr Expression
-		if p.currentToken.Type == MULTIPLY {
-			expr = &Identifier{
-				BaseNode: BaseNode{nodeType: IDENTIFIER},
-				Name:     "*",
-			}
-		} else {
-			expr = &Identifier{
-				BaseNode: BaseNode{nodeType: IDENTIFIER},
-				Name:     p.currentToken.Literal,
-			}
-
-			// Check for alias
-			if p.peekToken.Type == AS {
-				p.nextToken() // consume AS
-				if !p.expectPeek(IDENT) {
-					return nil, fmt.Errorf("expected identifier after AS")
-				}
-				expr = &Identifier{
-					BaseNode: BaseNode{nodeType: IDENTIFIER},
-					Name:     fmt.Sprintf("%s AS %s", expr.(*Identifier).Name, p.currentToken.Literal),
-				}
-			}
+	// 检查SELECT后是否有字段
+	if p.peekTokenIs(TOK_FROM) {
+		return nil, &ParseError{
+			Message:  "no fields specified",
+			Line:     p.peekToken.Line,
+			Column:   p.peekToken.Column,
+			Token:    p.peekToken,
+			Expected: "field list",
 		}
-		stmt.Fields = append(stmt.Fields, expr)
+	}
 
-		if p.peekToken.Type != COMMA {
-			break
+	// 解析字段列表
+	fields, err := p.parseExpressionList()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Fields = fields
+
+	// 检查是否有FROM子句
+	if !p.expectPeek(TOK_FROM) {
+		return nil, &ParseError{
+			Message:  "missing FROM clause",
+			Line:     p.currentToken.Line,
+			Column:   p.currentToken.Column,
+			Token:    p.currentToken,
+			Expected: "FROM",
 		}
-		p.nextToken() // consume comma
-		p.nextToken() // move to next field
 	}
 
-	// Parse FROM clause
-	if !p.expectPeek(FROM) {
-		return nil, fmt.Errorf("expected FROM after SELECT fields")
-	}
-	if !p.expectPeek(IDENT) {
-		return nil, fmt.Errorf("expected table name after FROM")
-	}
-	stmt.From = p.currentToken.Literal
-
-	// Parse optional JOIN
-	if p.peekToken.Type == JOIN || p.peekToken.Type == LEFT || p.peekToken.Type == RIGHT {
-		p.nextToken()
-		if err := p.parseJoin(stmt); err != nil {
+	// 添加类型检查
+	for _, field := range stmt.Fields {
+		if err := p.validateExpression(field); err != nil {
 			return nil, err
 		}
 	}
 
-	// Parse optional WHERE
-	if p.peekToken.Type == WHERE {
-		p.nextToken() // consume WHERE
-		p.nextToken() // move to first token of expression
+	// 解析FROM子句
+	if !p.expectPeek(TOK_FROM) {
+		return nil, fmt.Errorf("expected FROM")
+	}
+	if !p.expectPeek(TOK_IDENT) {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.Table = p.currentToken.Literal
+
+	// 解析WHERE子句
+	if p.peekTokenIs(TOK_WHERE) {
+		p.nextToken()
 		where, err := p.parseExpression(LOWEST)
 		if err != nil {
 			return nil, err
@@ -140,535 +101,104 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.Where = where
 	}
 
-	// Parse optional GROUP BY
-	if p.peekToken.Type == GROUP {
-		p.nextToken() // consume GROUP
-		if !p.expectPeek(BY) {
-			return nil, fmt.Errorf("expected BY after GROUP")
-		}
-
-		stmt.GroupBy = make([]string, 0)
-		for {
-			if !p.expectPeek(IDENT) {
-				return nil, fmt.Errorf("expected identifier in GROUP BY")
-			}
-			stmt.GroupBy = append(stmt.GroupBy, p.currentToken.Literal)
-
-			if p.peekToken.Type != COMMA {
-				break
-			}
-			p.nextToken() // consume comma
-		}
-
-		// Parse optional HAVING
-		if p.peekToken.Type == HAVING {
-			p.nextToken() // consume HAVING
-			p.nextToken() // move to first token of expression
-			having, err := p.parseExpression(LOWEST)
-			if err != nil {
-				return nil, err
-			}
-			stmt.Having = having
-		}
-	}
-
-	// Parse optional ORDER BY
-	if p.peekToken.Type == ORDER {
-		p.nextToken() // consume ORDER
-		if !p.expectPeek(BY) {
+	// 解析ORDER BY子句
+	if p.peekTokenIs(TOK_ORDER) {
+		p.nextToken()
+		if !p.expectPeek(TOK_BY) {
 			return nil, fmt.Errorf("expected BY after ORDER")
 		}
-
-		stmt.OrderBy = make([]OrderByExpr, 0)
-		for {
-			if !p.expectPeek(IDENT) {
-				return nil, fmt.Errorf("expected identifier in ORDER BY")
-			}
-			expr := OrderByExpr{
-				Expr: &Identifier{
-					BaseNode: BaseNode{nodeType: IDENTIFIER},
-					Name:     p.currentToken.Literal,
-				},
-				Ascending: true,
-			}
-
-			// Check for optional ASC/DESC
-			if p.peekToken.Type == ASC || p.peekToken.Type == DESC {
-				p.nextToken()
-				expr.Ascending = p.currentToken.Type == ASC
-			}
-
-			stmt.OrderBy = append(stmt.OrderBy, expr)
-
-			if p.peekToken.Type != COMMA {
-				break
-			}
-			p.nextToken() // consume comma
+		orderBy, err := p.parseOrderBy()
+		if err != nil {
+			return nil, err
 		}
+		stmt.OrderBy = orderBy
 	}
 
-	// Parse optional LIMIT and OFFSET
-	if p.peekToken.Type == LIMIT {
-		p.nextToken() // consume LIMIT
-		if !p.expectPeek(NUMBER) {
+	// 解析LIMIT子句
+	if p.peekTokenIs(TOK_LIMIT) {
+		p.nextToken()
+		if !p.expectPeek(TOK_NUMBER) {
 			return nil, fmt.Errorf("expected number after LIMIT")
 		}
 		limit, err := strconv.Atoi(p.currentToken.Literal)
 		if err != nil {
-			return nil, fmt.Errorf("invalid LIMIT value: %s", p.currentToken.Literal)
+			return nil, fmt.Errorf("invalid LIMIT value")
 		}
 		stmt.Limit = &limit
-
-		// Parse optional OFFSET
-		if p.peekToken.Type == OFFSET {
-			p.nextToken() // consume OFFSET
-			if !p.expectPeek(NUMBER) {
-				return nil, fmt.Errorf("expected number after OFFSET")
-			}
-			offset, err := strconv.Atoi(p.currentToken.Literal)
-			if err != nil {
-				return nil, fmt.Errorf("invalid OFFSET value: %s", p.currentToken.Literal)
-			}
-			stmt.Offset = &offset
-		}
 	}
 
 	return stmt, nil
 }
 
-func (p *Parser) parseJoin(stmt *SelectStmt) error {
-	switch p.currentToken.Type {
-	case JOIN:
-		stmt.JoinType = INNER_JOIN
-	case LEFT:
-		if !p.expectPeek(JOIN) {
-			return fmt.Errorf("expected JOIN after LEFT")
-		}
-		stmt.JoinType = LEFT_JOIN
-	case RIGHT:
-		if !p.expectPeek(JOIN) {
-			return fmt.Errorf("expected JOIN after RIGHT")
-		}
-		stmt.JoinType = RIGHT_JOIN
-	}
-
-	if !p.expectPeek(IDENT) {
-		return fmt.Errorf("expected table name after JOIN")
-	}
-	stmt.JoinTable = p.currentToken.Literal
-
-	if !p.expectPeek(ON) {
-		return fmt.Errorf("expected ON after JOIN table")
-	}
-
-	p.nextToken() // move to first token of join condition
-	joinCond, err := p.parseExpression(LOWEST)
-	if err != nil {
-		return err
-	}
-	stmt.JoinOn = joinCond
-
-	return nil
-}
-
-const (
-	_ int = iota
-	LOWEST
-	OR          // OR
-	AND         // AND
-	EQUALS      // ==
-	LESSGREATER // > or <
-	SUM         // +
-	PRODUCT     // *
-	PREFIX      // -X or !X
-	CALL        // myFunction(X)
-)
-
-var precedences = map[TokenType]int{
-	EQ:       EQUALS,
-	NEQ:      EQUALS,
-	LT:       LESSGREATER,
-	GT:       LESSGREATER,
-	LTE:      LESSGREATER,
-	GTE:      LESSGREATER,
-	PLUS:     SUM,
-	MINUS:    SUM,
-	MULTIPLY: PRODUCT,
-	DIVIDE:   PRODUCT,
-	MOD:      PRODUCT,
-	AND:      AND,
-	OR:       OR,
-	LPAREN:   CALL,
-}
-
-func (p *Parser) parseExpression(precedence int) (Expression, error) {
-	prefix := p.prefixParseFn(p.currentToken.Type)
-	if prefix == nil {
-		return nil, fmt.Errorf("no prefix parse function for %s found", p.currentToken.Type)
-	}
-
-	leftExp, err := prefix()
-	if err != nil {
-		return nil, err
-	}
-
-	for precedence < p.peekPrecedence() {
-		infix := p.infixParseFn(p.peekToken.Type)
-		if infix == nil {
-			return leftExp, nil
-		}
-
-		p.nextToken()
-
-		leftExp, err = infix(leftExp)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return leftExp, nil
-}
-
-func (p *Parser) prefixParseFn(tokenType TokenType) func() (Expression, error) {
-	switch tokenType {
-	case IDENT:
-		return p.parseIdentifier
-	case STRING:
-		return p.parseStringLiteral
-	case NUMBER:
-		return p.parseNumberLiteral
-	case LPAREN:
-		return p.parseGroupedExpression
-	case MINUS:
-		return p.parsePrefixExpression
-	case NOT:
-		return p.parsePrefixExpression
-	}
-	return nil
-}
-
-func (p *Parser) infixParseFn(tokenType TokenType) func(Expression) (Expression, error) {
-	switch tokenType {
-	case PLUS, MINUS, MULTIPLY, DIVIDE, MOD,
-		EQ, NEQ, LT, GT, LTE, GTE,
-		AND, OR:
-		return p.parseInfixExpression
-	case LPAREN:
-		return p.parseFunctionCall
-	}
-	return nil
-}
-
-func (p *Parser) parseIdentifier() (Expression, error) {
-	return &Identifier{
-		BaseNode: BaseNode{nodeType: IDENTIFIER},
-		Name:     p.currentToken.Literal,
-	}, nil
-}
-
-func (p *Parser) parseStringLiteral() (Expression, error) {
-	return &Literal{
-		BaseNode: BaseNode{nodeType: STRING_LIT},
-		Value:    p.currentToken.Literal,
-	}, nil
-}
-
-func (p *Parser) parseNumberLiteral() (Expression, error) {
-	return &Literal{
-		BaseNode: BaseNode{nodeType: NUMBER_LIT},
-		Value:    p.currentToken.Literal,
-	}, nil
-}
-
-func (p *Parser) parseGroupedExpression() (Expression, error) {
-	p.nextToken()
-
-	exp, err := p.parseExpression(LOWEST)
-	if err != nil {
-		return nil, err
-	}
-
-	if !p.expectPeek(RPAREN) {
-		return nil, fmt.Errorf("expected )")
-	}
-
-	return exp, nil
-}
-
-func (p *Parser) parsePrefixExpression() (Expression, error) {
-	operator := p.currentToken.Literal
-	p.nextToken()
-
-	right, err := p.parseExpression(PREFIX)
-	if err != nil {
-		return nil, err
-	}
-
-	return &ComparisonExpr{
-		BaseNode: BaseNode{nodeType: COMPARISON},
-		Left:     nil,
-		Operator: operator,
-		Right:    right,
-	}, nil
-}
-
-func (p *Parser) parseInfixExpression(left Expression) (Expression, error) {
-	operator := p.currentToken.Literal
-	precedence := p.curPrecedence()
-	p.nextToken()
-
-	right, err := p.parseExpression(precedence)
-	if err != nil {
-		return nil, err
-	}
-
-	return &ComparisonExpr{
-		BaseNode: BaseNode{nodeType: COMPARISON},
-		Left:     left,
-		Operator: operator,
-		Right:    right,
-	}, nil
-}
-
-func (p *Parser) parseFunctionCall(function Expression) (Expression, error) {
-	ident, ok := function.(*Identifier)
-	if !ok {
-		return nil, fmt.Errorf("expected function name")
-	}
-
-	args, err := p.parseFunctionArguments()
-	if err != nil {
-		return nil, err
-	}
-
-	return &FunctionExpr{
-		BaseNode: BaseNode{nodeType: FUNCTION},
-		Name:     ident.Name,
-		Args:     args,
-	}, nil
-}
-
-func (p *Parser) parseFunctionArguments() ([]Expression, error) {
-	args := make([]Expression, 0)
-
-	if p.peekToken.Type == RPAREN {
-		p.nextToken()
-		return args, nil
-	}
-
-	p.nextToken()
-	arg, err := p.parseExpression(LOWEST)
-	if err != nil {
-		return nil, err
-	}
-	args = append(args, arg)
-
-	for p.peekToken.Type == COMMA {
-		p.nextToken()
-		p.nextToken()
-		arg, err := p.parseExpression(LOWEST)
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, arg)
-	}
-
-	if !p.expectPeek(RPAREN) {
-		return nil, fmt.Errorf("expected ) after function arguments")
-	}
-
-	return args, nil
-}
-
-func (p *Parser) curPrecedence() int {
-	if p, ok := precedences[p.currentToken.Type]; ok {
-		return p
-	}
-	return LOWEST
-}
-
-func (p *Parser) peekPrecedence() int {
-	if p, ok := precedences[p.peekToken.Type]; ok {
-		return p
-	}
-	return LOWEST
-}
-
-func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
-	stmt := &CreateTableStmt{BaseNode: BaseNode{nodeType: CREATE_TABLE}}
-
-	// Parse TABLE keyword
-	if !p.expectPeek(TABLE) {
-		return nil, fmt.Errorf("expected TABLE after CREATE")
-	}
-
-	// Parse table name
-	if !p.expectPeek(IDENT) {
-		return nil, fmt.Errorf("expected table name")
-	}
-	stmt.TableName = p.currentToken.Literal
-
-	// Parse column definitions
-	if !p.expectPeek(LPAREN) {
-		return nil, fmt.Errorf("expected ( after table name")
-	}
-
-	stmt.Columns = make([]ColumnDef, 0)
-	for {
-		if p.currentToken.Type == RPAREN {
-			break
-		}
-
-		// 解析列名
-		if p.currentToken.Type != IDENT {
-			return nil, fmt.Errorf("expected column name")
-		}
-		colName := p.currentToken.Literal
-
-		// 解析数据类型
-		if !p.expectPeek(IDENT) {
-			return nil, fmt.Errorf("expected data type")
-		}
-		dataType := p.currentToken.Literal
-
-		// 解析约束
-		constraints := make([]string, 0)
-		for p.peekToken.Type != COMMA && p.peekToken.Type != RPAREN {
-			p.nextToken()
-			constraints = append(constraints, p.currentToken.Literal)
-		}
-
-		col := ColumnDef{
-			Name:        colName,
-			DataType:    dataType,
-			Constraints: constraints,
-		}
-		stmt.Columns = append(stmt.Columns, col)
-
-		if p.peekToken.Type == RPAREN {
-			break
-		}
-		if !p.expectPeek(COMMA) {
-			return nil, fmt.Errorf("expected comma or right paren")
-		}
-		p.nextToken()
-	}
-
-	return stmt, nil
-}
-
-func (p *Parser) parseDropTable() (*DropTableStmt, error) {
-	stmt := &DropTableStmt{BaseNode: BaseNode{nodeType: DROP_TABLE}}
-
-	// Parse TABLE keyword
-	if !p.expectPeek(TABLE) {
-		return nil, fmt.Errorf("expected TABLE after DROP")
-	}
-
-	// Parse table name
-	if !p.expectPeek(IDENT) {
-		return nil, fmt.Errorf("expected table name")
-	}
-	stmt.TableName = p.currentToken.Literal
-
-	return stmt, nil
-}
-
+// parseInsert 解析INSERT语句
 func (p *Parser) parseInsert() (*InsertStmt, error) {
-	stmt := &InsertStmt{BaseNode: BaseNode{nodeType: INSERT}}
+	stmt := &InsertStmt{}
 
-	// Parse INTO keyword
-	if !p.expectPeek(INTO) {
-		return nil, fmt.Errorf("expected INTO after INSERT")
+	// 解析INTO
+	if !p.expectPeek(TOK_INTO) {
+		return nil, fmt.Errorf("expected INTO")
 	}
 
-	// Parse table name
-	if !p.expectPeek(IDENT) {
+	// 解析表名
+	if !p.expectPeek(TOK_IDENT) {
 		return nil, fmt.Errorf("expected table name")
 	}
 	stmt.Table = p.currentToken.Literal
 
-	// Parse optional column list
-	if p.peekToken.Type == LPAREN {
+	// 解析列名列表
+	if p.peekTokenIs(TOK_LPAREN) {
 		p.nextToken()
-		stmt.Columns = make([]string, 0)
-		for {
-			if !p.expectPeek(IDENT) {
-				return nil, fmt.Errorf("expected column name")
-			}
-			stmt.Columns = append(stmt.Columns, p.currentToken.Literal)
-
-			if p.peekToken.Type == RPAREN {
-				p.nextToken()
-				break
-			}
-			if !p.expectPeek(COMMA) {
-				return nil, fmt.Errorf("expected , or ) after column name")
-			}
+		columns, err := p.parseIdentList()
+		if err != nil {
+			return nil, err
 		}
+		stmt.Columns = columns
 	}
 
-	// Parse VALUES keyword
-	if !p.expectPeek(VALUES) {
+	// 解析VALUES
+	if !p.expectPeek(TOK_VALUES) {
 		return nil, fmt.Errorf("expected VALUES")
 	}
 
-	// Parse value list
-	if !p.expectPeek(LPAREN) {
-		return nil, fmt.Errorf("expected ( after VALUES")
+	// 解析值列表
+	if !p.expectPeek(TOK_LPAREN) {
+		return nil, fmt.Errorf("expected (")
 	}
-
-	stmt.Values = make([]Expression, 0)
-	for {
-		p.nextToken()
-		if p.currentToken.Type == RPAREN {
-			break
-		}
-
-		expr, err := p.parseExpression(LOWEST)
-		if err != nil {
-			return nil, err
-		}
-		stmt.Values = append(stmt.Values, expr)
-
-		if p.peekToken.Type == RPAREN {
-			p.nextToken()
-			break
-		}
-		if !p.expectPeek(COMMA) {
-			return nil, fmt.Errorf("expected , or ) after value")
-		}
+	values, err := p.parseExpressionList()
+	if err != nil {
+		return nil, err
 	}
+	stmt.Values = values
 
 	return stmt, nil
 }
 
+// parseUpdate 解析UPDATE语句
 func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 	stmt := &UpdateStmt{
-		BaseNode: BaseNode{nodeType: UPDATE},
-		Set:      make(map[string]Expression),
+		Set: make(map[string]Expression),
 	}
 
-	// Parse table name
-	if !p.expectPeek(IDENT) {
+	// 解析表名
+	if !p.expectPeek(TOK_IDENT) {
 		return nil, fmt.Errorf("expected table name")
 	}
 	stmt.Table = p.currentToken.Literal
 
-	// Parse SET keyword
-	if !p.expectPeek(SET) {
+	// 解析SET
+	if !p.expectPeek(TOK_SET) {
 		return nil, fmt.Errorf("expected SET")
 	}
 
-	// Parse set assignments
+	// 解析赋值列表
 	for {
-		if !p.expectPeek(IDENT) {
+		if !p.expectPeek(TOK_IDENT) {
 			return nil, fmt.Errorf("expected column name")
 		}
 		column := p.currentToken.Literal
 
-		if !p.expectPeek(EQ) {
-			return nil, fmt.Errorf("expected = after column name")
+		if !p.expectPeek(TOK_EQ) {
+			return nil, fmt.Errorf("expected =")
 		}
 
 		p.nextToken()
@@ -678,15 +208,14 @@ func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 		}
 		stmt.Set[column] = value
 
-		if p.peekToken.Type != COMMA {
+		if !p.peekTokenIs(TOK_COMMA) {
 			break
 		}
 		p.nextToken()
 	}
 
-	// Parse optional WHERE clause
-	if p.peekToken.Type == WHERE {
-		p.nextToken()
+	// 解析WHERE子句
+	if p.peekTokenIs(TOK_WHERE) {
 		p.nextToken()
 		where, err := p.parseExpression(LOWEST)
 		if err != nil {
@@ -698,23 +227,23 @@ func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 	return stmt, nil
 }
 
+// parseDelete 解析DELETE语句
 func (p *Parser) parseDelete() (*DeleteStmt, error) {
-	stmt := &DeleteStmt{BaseNode: BaseNode{nodeType: DELETE}}
+	stmt := &DeleteStmt{}
 
-	// Parse FROM keyword
-	if !p.expectPeek(FROM) {
-		return nil, fmt.Errorf("expected FROM after DELETE")
+	// 解析FROM
+	if !p.expectPeek(TOK_FROM) {
+		return nil, fmt.Errorf("expected FROM")
 	}
 
-	// Parse table name
-	if !p.expectPeek(IDENT) {
+	// 解析表名
+	if !p.expectPeek(TOK_IDENT) {
 		return nil, fmt.Errorf("expected table name")
 	}
 	stmt.Table = p.currentToken.Literal
 
-	// Parse optional WHERE clause
-	if p.peekToken.Type == WHERE {
-		p.nextToken()
+	// 解析WHERE子句
+	if p.peekTokenIs(TOK_WHERE) {
 		p.nextToken()
 		where, err := p.parseExpression(LOWEST)
 		if err != nil {
@@ -726,6 +255,332 @@ func (p *Parser) parseDelete() (*DeleteStmt, error) {
 	return stmt, nil
 }
 
-func (p *Parser) parseShowTables() (*ShowTablesStmt, error) {
-	return &ShowTablesStmt{BaseNode: BaseNode{nodeType: SHOW_TABLES}}, nil
+// 表达式优先级
+const (
+	LOWEST      = iota
+	EQUALS      // ==
+	LESSGREATER // > or <
+	SUM         // +
+	PRODUCT     // *
+	PREFIX      // -X or !X
+	CALL        // myFunction(X)
+)
+
+var precedences = map[TokenType]int{
+	TOK_EQ:       EQUALS,
+	TOK_NEQ:      EQUALS,
+	TOK_LT:       LESSGREATER,
+	TOK_GT:       LESSGREATER,
+	TOK_LTE:      LESSGREATER,
+	TOK_GTE:      LESSGREATER,
+	TOK_PLUS:     SUM,
+	TOK_MINUS:    SUM,
+	TOK_MULTIPLY: PRODUCT,
+	TOK_DIVIDE:   PRODUCT,
+	TOK_LPAREN:   CALL,
+}
+
+// parseExpression 解析表达式
+func (p *Parser) parseExpression(precedence int) (Expression, error) {
+	prefix := p.prefixParseFns(p.currentToken.Type)
+	if prefix == nil {
+		return nil, fmt.Errorf("no prefix parse function for %s", p.currentToken.Type)
+	}
+
+	leftExp := prefix()
+
+	for !p.peekTokenIs(TOK_SEMICOLON) && precedence < p.peekPrecedence() {
+		infix := p.infixParseFns(p.peekToken.Type)
+		if infix == nil {
+			return leftExp, nil
+		}
+
+		p.nextToken()
+		leftExp = infix(leftExp)
+	}
+
+	return leftExp, nil
+}
+
+// 辅助方法
+
+func (p *Parser) nextToken() {
+	p.currentToken = p.peekToken
+	p.peekToken = p.lexer.NextToken()
+}
+
+func (p *Parser) currentTokenIs(t TokenType) bool {
+	return p.currentToken.Type == t
+}
+
+func (p *Parser) peekTokenIs(t TokenType) bool {
+	return p.peekToken.Type == t
+}
+
+func (p *Parser) expectPeek(t TokenType) bool {
+	if p.peekTokenIs(t) {
+		p.nextToken()
+		return true
+	}
+	p.peekError(t)
+	return false
+}
+
+func (p *Parser) peekError(t TokenType) {
+	msg := fmt.Sprintf("expected next token to be %s, got %s instead",
+		t, p.peekToken.Type)
+	p.errors = append(p.errors, msg)
+}
+
+func (p *Parser) Errors() []string {
+	return p.errors
+}
+
+// prefixParseFns 返回前缀表达式解析函数
+func (p *Parser) prefixParseFns(tokenType TokenType) func() Expression {
+	switch tokenType {
+	case TOK_IDENT:
+		return p.parseIdentifier
+	case TOK_STRING, TOK_NUMBER:
+		return p.parseLiteral
+	case TOK_MINUS:
+		return p.parsePrefixExpression
+	case TOK_LPAREN:
+		return p.parseGroupedExpression
+	default:
+		return nil
+	}
+}
+
+// infixParseFns 返回中缀表达式解析函数
+func (p *Parser) infixParseFns(tokenType TokenType) func(Expression) Expression {
+	switch tokenType {
+	case TOK_PLUS, TOK_MINUS, TOK_MULTIPLY, TOK_DIVIDE:
+		return p.parseBinaryExpression
+	case TOK_EQ, TOK_NEQ, TOK_LT, TOK_GT, TOK_LTE, TOK_GTE:
+		return p.parseComparisonExpression
+	default:
+		return nil
+	}
+}
+
+// 具体的解析函数实现...
+
+// parseCreate 解析CREATE语句
+func (p *Parser) parseCreate() (*CreateTableStmt, error) {
+	stmt := &CreateTableStmt{}
+
+	// 期望下一个token是TABLE
+	if !p.expectPeek(TOK_TABLE) {
+		return nil, fmt.Errorf("expected TABLE after CREATE")
+	}
+
+	// 解析表名
+	if !p.expectPeek(TOK_IDENT) {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.TableName = p.currentToken.Literal
+
+	// 解析列定义
+	if !p.expectPeek(TOK_LPAREN) {
+		return nil, fmt.Errorf("expected (")
+	}
+
+	columns, err := p.parseColumnDefs()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Columns = columns
+
+	return stmt, nil
+}
+
+// parseColumnDefs 解析列定义
+func (p *Parser) parseColumnDefs() ([]ColumnDef, error) {
+	var columns []ColumnDef
+
+	for {
+		if p.peekTokenIs(TOK_RPAREN) {
+			p.nextToken()
+			break
+		}
+
+		col, err := p.parseColumnDef()
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, col)
+
+		if !p.peekTokenIs(TOK_COMMA) {
+			if !p.expectPeek(TOK_RPAREN) {
+				return nil, fmt.Errorf("expected , or )")
+			}
+			break
+		}
+		p.nextToken()
+	}
+
+	return columns, nil
+}
+
+// parseColumnDef 解析单个列定义
+func (p *Parser) parseColumnDef() (ColumnDef, error) {
+	var col ColumnDef
+
+	if !p.expectPeek(TOK_IDENT) {
+		return col, fmt.Errorf("expected column name")
+	}
+	col.Name = p.currentToken.Literal
+
+	if !p.expectPeek(TOK_IDENT) {
+		return col, fmt.Errorf("expected data type")
+	}
+	col.DataType = p.currentToken.Literal
+
+	// 检查是否有NOT NULL约束
+	if p.peekTokenIs(TOK_IDENT) {
+		p.nextToken()
+		if p.currentToken.Literal == "NOT" {
+			if !p.expectPeek(TOK_IDENT) || p.currentToken.Literal != "NULL" {
+				return col, fmt.Errorf("expected NULL after NOT")
+			}
+			col.NotNull = true
+		}
+	}
+
+	return col, nil
+}
+
+// parseIdentifier 解析标识符
+func (p *Parser) parseIdentifier() Expression {
+	return &Identifier{Name: p.currentToken.Literal}
+}
+
+// parseLiteral 解析字面量
+func (p *Parser) parseLiteral() Expression {
+	return &Literal{
+		Value: p.currentToken.Literal,
+		Type:  string(p.currentToken.Type),
+	}
+}
+
+// parsePrefixExpression 解析前缀表达式
+func (p *Parser) parsePrefixExpression() Expression {
+	expression := &BinaryExpr{
+		Operator: p.currentToken.Literal,
+	}
+
+	p.nextToken()
+	right, err := p.parseExpression(PREFIX)
+	if err != nil {
+		return nil
+	}
+	expression.Right = right
+
+	return expression
+}
+
+// parseGroupedExpression 解析括号表达式
+func (p *Parser) parseGroupedExpression() Expression {
+	p.nextToken()
+	exp, err := p.parseExpression(LOWEST)
+	if err != nil {
+		return nil
+	}
+
+	if !p.expectPeek(TOK_RPAREN) {
+		return nil
+	}
+
+	return exp
+}
+
+// parseBinaryExpression 解析二元表达式
+func (p *Parser) parseBinaryExpression(left Expression) Expression {
+	expression := &BinaryExpr{
+		Left:     left,
+		Operator: p.currentToken.Literal,
+	}
+
+	precedence := p.curPrecedence()
+	p.nextToken()
+	right, err := p.parseExpression(precedence)
+	if err != nil {
+		return nil
+	}
+	expression.Right = right
+
+	return expression
+}
+
+// parseComparisonExpression 解析比较表达式
+func (p *Parser) parseComparisonExpression(left Expression) Expression {
+	expression := &ComparisonExpr{
+		Left:     left,
+		Operator: p.currentToken.Literal,
+	}
+
+	precedence := p.curPrecedence()
+	p.nextToken()
+	right, err := p.parseExpression(precedence)
+	if err != nil {
+		return nil
+	}
+	expression.Right = right
+
+	return expression
+}
+
+// peekPrecedence 获取下一个token的优先级
+func (p *Parser) peekPrecedence() int {
+	if p, ok := precedences[p.peekToken.Type]; ok {
+		return p
+	}
+	return LOWEST
+}
+
+// curPrecedence 获取当前token的优先级
+func (p *Parser) curPrecedence() int {
+	if p, ok := precedences[p.currentToken.Type]; ok {
+		return p
+	}
+	return LOWEST
+}
+
+// 添加详细的错误类型
+type ParseError struct {
+	Message  string
+	Line     int
+	Column   int
+	Token    Token
+	Expected string
+}
+
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("syntax error at line %d, column %d: %s (got %s, expected %s)",
+		e.Line, e.Column, e.Message, e.Token.Literal, e.Expected)
+}
+
+// 添加表达式验证
+func (p *Parser) validateExpression(expr Expression) error {
+	switch e := expr.(type) {
+	case *BinaryExpr:
+		if err := p.validateBinaryOperator(e.Operator); err != nil {
+			return err
+		}
+		if err := p.validateExpression(e.Left); err != nil {
+			return err
+		}
+		return p.validateExpression(e.Right)
+
+	case *ComparisonExpr:
+		if err := p.validateComparisonOperator(e.Operator); err != nil {
+			return err
+		}
+		if err := p.validateExpression(e.Left); err != nil {
+			return err
+		}
+		return p.validateExpression(e.Right)
+	}
+	return nil
 }

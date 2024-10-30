@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -14,126 +15,79 @@ import (
 	"github.com/yyun543/minidb/internal/executor"
 )
 
+// Server 表示数据库服务器
 type Server struct {
-	listener    net.Listener
-	executor    *executor.Executor
-	connections sync.WaitGroup
-	maxConns    int
-	connCount   int32
-	ctx         context.Context
-	cancel      context.CancelFunc
+	listener    net.Listener       // TCP监听器
+	executor    *executor.Executor // SQL执行器
+	connections sync.WaitGroup     // 活动连接计数
+	maxConns    int                // 最大连接数
+	connCount   int32              // 当前连接数
+	ctx         context.Context    // 用于优雅关闭
+	cancel      context.CancelFunc // 取消函数
+	addr        string             // 服务器地址
 }
 
-func NewServer(address string, executor *executor.Executor) (*Server, error) {
-	listener, err := net.Listen("tcp", address)
+// NewServer 创建新的服务器实例
+func NewServer(ctx context.Context, addr string, maxConns int, executor *executor.Executor) (*Server, error) {
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start server: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 
 	return &Server{
 		listener: listener,
 		executor: executor,
 		ctx:      ctx,
 		cancel:   cancel,
+		maxConns: maxConns,
+		addr:     addr,
 	}, nil
 }
 
+// Start 启动服务器
 func (s *Server) Start() error {
 	defer s.listener.Close()
 
-	fmt.Printf("MiniDB server listening on %s\n", s.listener.Addr())
+	// 启动连接清理goroutine
+	go s.cleanupConnections()
 
-	go s.acceptConnections()
-
-	<-s.ctx.Done()
-	return nil
-}
-
-func (s *Server) acceptConnections() {
-	for {
-		conn, err := s.listener.Accept()
-		if err != nil {
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-				fmt.Printf("Accept error: %v\n", err)
-				continue
-			}
-		}
-
-		s.connections.Add(1)
-		go s.handleConnection(conn)
-	}
-}
-
-func (s *Server) handleConnection(conn net.Conn) {
-	if atomic.LoadInt32(&s.connCount) >= int32(s.maxConns) {
-		conn.Close()
-		return
-	}
-	atomic.AddInt32(&s.connCount, 1)
-	defer atomic.AddInt32(&s.connCount, -1)
-
-	defer func() {
-		conn.Close()
-		s.connections.Done()
-	}()
-
-	// 设置连接超时
-	conn.SetDeadline(time.Now().Add(time.Hour))
-
-	reader := bufio.NewReader(conn)
-	fmt.Fprintf(conn, "Welcome to MiniDB! Enter your SQL query or type 'exit' to quit.\n")
+	log.Printf("Server listening on %s", s.addr)
 
 	for {
 		select {
 		case <-s.ctx.Done():
-			return
+			return nil
 		default:
-			fmt.Fprintf(conn, "minidb> ")
-			query, err := reader.ReadString('\n')
+			conn, err := s.listener.Accept()
 			if err != nil {
-				if err != io.EOF {
-					fmt.Printf("Read error: %v\n", err)
+				if strings.Contains(err.Error(), "use of closed network connection") {
+					return nil
 				}
-				return
-			}
-
-			query = strings.TrimSpace(query)
-			if query == "" {
+				log.Printf("Accept error: %v", err)
 				continue
 			}
 
-			if strings.ToLower(query) == "exit" || strings.ToLower(query) == "quit" {
-				fmt.Fprintf(conn, "Bye!\n")
-				return
-			}
-
-			// 重置连接超时
-			conn.SetDeadline(time.Now().Add(time.Hour))
-
-			// 执行查询
-			result, err := s.executor.Execute(query)
-			if err != nil {
-				fmt.Fprintf(conn, "Error: %v\n", err)
+			// 检查连接数限制
+			if s.connCount >= int32(s.maxConns) {
+				conn.Close()
+				log.Printf("Connection rejected: max connections reached")
 				continue
 			}
 
-			fmt.Fprintf(conn, "%s\n", result)
+			// 处理新连接
+			atomic.AddInt32(&s.connCount, 1)
+			s.connections.Add(1)
+			go s.handleConnection(conn)
 		}
 	}
 }
 
-func (s *Server) Stop() error {
+// Stop 优雅关闭服务器
+func (s *Server) Stop(ctx context.Context) error {
 	s.cancel()
-
-	// 关闭监听器
-	if err := s.listener.Close(); err != nil {
-		return fmt.Errorf("failed to close listener: %v", err)
-	}
+	s.listener.Close()
 
 	// 等待所有连接处理完成
 	done := make(chan struct{})
@@ -145,11 +99,86 @@ func (s *Server) Stop() error {
 	select {
 	case <-done:
 		return nil
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("timeout waiting for connections to close")
+	case <-ctx.Done():
+		return fmt.Errorf("shutdown timeout")
 	}
 }
 
+// handleConnection 处理单个客户端连接
+func (s *Server) handleConnection(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in connection handler: %v", r)
+		}
+		conn.Close()
+		s.connections.Done()
+		atomic.AddInt32(&s.connCount, -1)
+	}()
+
+	reader := bufio.NewReader(conn)
+
+	for {
+		// 设置读取超时
+		conn.SetReadDeadline(time.Now().Add(time.Minute))
+
+		// 读取命令
+		command, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Read error: %v", err)
+			}
+			return
+		}
+
+		// 处理命令
+		command = strings.TrimSpace(command)
+		if command == "" {
+			continue
+		}
+
+		// 处理退出命令
+		if strings.ToLower(command) == "quit" || strings.ToLower(command) == "exit" {
+			return
+		}
+
+		// 执行SQL命令
+		result, err := s.executor.Execute(command)
+		if err != nil {
+			result = fmt.Sprintf("Error: %v", err)
+		}
+
+		// 发送响应
+		response := fmt.Sprintf("%s\n", result)
+		if _, err := conn.Write([]byte(response)); err != nil {
+			log.Printf("Write error: %v", err)
+			return
+		}
+	}
+}
+
+// cleanupConnections 定期清理空闲连接
+func (s *Server) cleanupConnections() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			// 这里可以添加空闲连接清理逻辑
+			log.Printf("Active connections: %d", atomic.LoadInt32(&s.connCount))
+		}
+	}
+}
+
+// Client 表示数据库客户端
+type Client struct {
+	conn   net.Conn
+	config ClientConfig
+}
+
+// ClientConfig 客户端配置
 type ClientConfig struct {
 	Address    string
 	Timeout    time.Duration
@@ -157,24 +186,14 @@ type ClientConfig struct {
 	RetryDelay time.Duration
 }
 
-type Client struct {
-	conn   net.Conn
-	config ClientConfig
-}
-
+// NewClient 创建新的客户端实例
 func NewClient(config ClientConfig) *Client {
-	if config.Timeout == 0 {
-		config.Timeout = 30 * time.Second
+	return &Client{
+		config: config,
 	}
-	if config.MaxRetries == 0 {
-		config.MaxRetries = 3
-	}
-	if config.RetryDelay == 0 {
-		config.RetryDelay = time.Second
-	}
-	return &Client{config: config}
 }
 
+// Connect 连接到服务器
 func (c *Client) Connect() error {
 	var err error
 	for i := 0; i < c.config.MaxRetries; i++ {
@@ -187,6 +206,7 @@ func (c *Client) Connect() error {
 	return fmt.Errorf("failed to connect after %d retries: %v", c.config.MaxRetries, err)
 }
 
+// Execute 执行SQL命令
 func (c *Client) Execute(query string) (string, error) {
 	if c.conn == nil {
 		return "", fmt.Errorf("not connected")
@@ -210,6 +230,7 @@ func (c *Client) Execute(query string) (string, error) {
 	return strings.TrimSpace(response), nil
 }
 
+// Close 关闭客户端连接
 func (c *Client) Close() error {
 	if c.conn != nil {
 		return c.conn.Close()

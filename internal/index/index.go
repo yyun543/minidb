@@ -1,35 +1,137 @@
 package index
 
 import (
+	"strings"
 	"sync"
 )
 
+// Index 表示单个索引的数据结构
 type Index struct {
-	data map[string][]int // 值到行号的映射
-	mu   sync.RWMutex
+	name   string           // 索引名称
+	table  string           // 表名
+	column string           // 列名
+	values map[string][]int // 索引数据: 值 -> 行ID列表
+	mu     sync.RWMutex     // 用于并发控制的读写锁
 }
 
-func NewIndex() *Index {
-	return &Index{
-		data: make(map[string][]int),
+// Manager 管理数据库中的所有索引
+type Manager struct {
+	indexes map[string]*Index // 所有索引的映射表 (表名.列名 -> 索引)
+	mu      sync.RWMutex      // 用于并发控制的读写锁
+}
+
+// NewManager 创建新的索引管理器
+func NewManager() *Manager {
+	return &Manager{
+		indexes: make(map[string]*Index),
 	}
 }
 
+// CreateIndex 创建新索引
+func (m *Manager) CreateIndex(table, column string) *Index {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := makeKey(table, column)
+	if idx, exists := m.indexes[key]; exists {
+		return idx
+	}
+
+	idx := &Index{
+		name:   key,
+		table:  table,
+		column: column,
+		values: make(map[string][]int),
+	}
+	m.indexes[key] = idx
+	return idx
+}
+
+// GetIndex 获取指定的索引
+func (m *Manager) GetIndex(table, column string) (*Index, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	idx, exists := m.indexes[makeKey(table, column)]
+	return idx, exists
+}
+
+// DropIndex 删除索引
+func (m *Manager) DropIndex(table, column string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.indexes, makeKey(table, column))
+}
+
+// FindBestIndex 为查询选择最合适的索引
+func (m *Manager) FindBestIndex(table string, where string) *Index {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// 简化的索引选择逻辑
+	// 实际实现应该分析WHERE子句并选择最优索引
+	for key, idx := range m.indexes {
+		if strings.HasPrefix(key, table+".") && strings.Contains(where, idx.column) {
+			return idx
+		}
+	}
+	return nil
+}
+
+// GetTableIndexes 获取表的所有索引
+func (m *Manager) GetTableIndexes(table string) []*Index {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var result []*Index
+	for _, idx := range m.indexes {
+		if idx.table == table {
+			result = append(result, idx)
+		}
+	}
+	return result
+}
+
+// Index 方法
+
+// Add 向索引添加一个值
 func (idx *Index) Add(value string, rowID int) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	if _, exists := idx.data[value]; !exists {
-		idx.data[value] = make([]int, 0)
+	if _, exists := idx.values[value]; !exists {
+		idx.values[value] = make([]int, 0)
 	}
-	idx.data[value] = append(idx.data[value], rowID)
+	idx.values[value] = append(idx.values[value], rowID)
 }
 
+// Remove 从索引中移除一个值
+func (idx *Index) Remove(value string, rowID int) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if rows, exists := idx.values[value]; exists {
+		newRows := make([]int, 0, len(rows)-1)
+		for _, id := range rows {
+			if id != rowID {
+				newRows = append(newRows, id)
+			}
+		}
+		if len(newRows) == 0 {
+			delete(idx.values, value)
+		} else {
+			idx.values[value] = newRows
+		}
+	}
+}
+
+// Find 在索引中查找值对应的行ID
 func (idx *Index) Find(value string) []int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	if rows, exists := idx.data[value]; exists {
+	if rows, exists := idx.values[value]; exists {
 		result := make([]int, len(rows))
 		copy(result, rows)
 		return result
@@ -37,60 +139,44 @@ func (idx *Index) Find(value string) []int {
 	return nil
 }
 
-func (idx *Index) Remove(value string, rowID int) {
+// Update 更新索引中的值
+func (idx *Index) Update(oldValue, newValue string, rowID int) {
+	idx.Remove(oldValue, rowID)
+	idx.Add(newValue, rowID)
+}
+
+// Clear 清空索引
+func (idx *Index) Clear() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	idx.values = make(map[string][]int)
+}
 
-	if rows, exists := idx.data[value]; exists {
-		newRows := make([]int, 0)
-		for _, id := range rows {
-			if id != rowID {
-				newRows = append(newRows, id)
-			}
+// 辅助函数
+
+// makeKey 生成索引的键名
+func makeKey(table, column string) string {
+	return table + "." + column
+}
+
+// 用于范围查询的数据结构
+type IndexRange struct {
+	Start     string
+	End       string
+	Inclusive bool
+}
+
+// FindRange 在索引中执行范围查询
+func (idx *Index) FindRange(r IndexRange) []int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	var result []int
+	for value, rows := range idx.values {
+		if (r.Start == "" || value >= r.Start) &&
+			(r.End == "" || (r.Inclusive && value <= r.End) || (!r.Inclusive && value < r.End)) {
+			result = append(result, rows...)
 		}
-		if len(newRows) == 0 {
-			delete(idx.data, value)
-		} else {
-			idx.data[value] = newRows
-		}
 	}
-}
-
-type IndexManager struct {
-	indexes map[string]*Index // 表名.列名 到索引的映射
-	mu      sync.RWMutex
-}
-
-func NewIndexManager() *IndexManager {
-	return &IndexManager{
-		indexes: make(map[string]*Index),
-	}
-}
-
-func (im *IndexManager) CreateIndex(tableName, columnName string) *Index {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-
-	key := tableName + "." + columnName
-	if _, exists := im.indexes[key]; !exists {
-		im.indexes[key] = NewIndex()
-	}
-	return im.indexes[key]
-}
-
-func (im *IndexManager) GetIndex(tableName, columnName string) (*Index, bool) {
-	im.mu.RLock()
-	defer im.mu.RUnlock()
-
-	key := tableName + "." + columnName
-	idx, exists := im.indexes[key]
-	return idx, exists
-}
-
-func (im *IndexManager) DropIndex(tableName, columnName string) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-
-	key := tableName + "." + columnName
-	delete(im.indexes, key)
+	return result
 }

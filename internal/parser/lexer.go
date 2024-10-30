@@ -2,164 +2,50 @@ package parser
 
 import (
 	"fmt"
-	"strings"
+	"unicode"
 )
 
-type TokenType int
-
-const (
-	ILLEGAL TokenType = iota
-	EOF
-	WS
-
-	// 标识符和字面量
-	IDENT  // 表名、列名等
-	STRING // 字符串字面量
-	NUMBER // 数字字面量
-
-	// 关键字
-	SELECT
-	INSERT
-	UPDATE
-	DELETE
-	CREATE
-	DROP
-	TABLE
-	FROM
-	WHERE
-	SET
-	INTO
-	VALUES
-	AND
-	OR
-	JOIN
-	LEFT
-	RIGHT
-	INNER
-	ON
-	GROUP
-	BY
-	HAVING
-	ORDER
-	ASC
-	DESC
-	LIMIT
-	OFFSET
-	AS
-	LIKE
-	IN
-	NOT
-	NULL
-	IS
-	TRUE
-	FALSE
-
-	// 运算符和分隔符
-	COMMA     // ,
-	SEMICOLON // ;
-	LPAREN    // (
-	RPAREN    // )
-	EQ        // =
-	NEQ       // !=
-	LT        // <
-	GT        // >
-	LTE       // <=
-	GTE       // >=
-	PLUS      // +
-	MINUS     // -
-	MULTIPLY  // *
-	DIVIDE    // /
-	MOD       // %
-	DOT       // .
-)
-
-var keywords = map[string]TokenType{
-	"select": SELECT,
-	"insert": INSERT,
-	"update": UPDATE,
-	"delete": DELETE,
-	"create": CREATE,
-	"drop":   DROP,
-	"table":  TABLE,
-	"from":   FROM,
-	"where":  WHERE,
-	"set":    SET,
-	"into":   INTO,
-	"values": VALUES,
-	"and":    AND,
-	"or":     OR,
-	"join":   JOIN,
-	"left":   LEFT,
-	"right":  RIGHT,
-	"inner":  INNER,
-	"on":     ON,
-	"group":  GROUP,
-	"by":     BY,
-	"having": HAVING,
-	"order":  ORDER,
-	"asc":    ASC,
-	"desc":   DESC,
-	"limit":  LIMIT,
-	"offset": OFFSET,
-	"as":     AS,
-	"like":   LIKE,
-	"in":     IN,
-	"not":    NOT,
-	"null":   NULL,
-	"is":     IS,
-	"true":   TRUE,
-	"false":  FALSE,
-}
-
-type Token struct {
-	Type    TokenType
-	Literal string
-	Line    int
-	Column  int
-}
-
-func (t Token) String() string {
-	return fmt.Sprintf("Token{Type: %v, Literal: %q, Line: %d, Column: %d}", t.Type, t.Literal, t.Line, t.Column)
-}
-
+// Lexer 词法分析器
 type Lexer struct {
-	input      string
-	pos        int  // 当前位置
-	readPos    int  // 下一个要读取的位置
-	ch         byte // 当前字符
-	line       int  // 当前行号
-	column     int  // 当前列号
-	lastColumn int  // 上一个token的列号
+	input   string // 输入的SQL字符串
+	pos     int    // 当前位置
+	readPos int    // 下一个要读取的位置
+	ch      byte   // 当前字符
+	line    int    // 当前行号
+	column  int    // 当前列号
 }
 
+// NewLexer 创建新的词法分析器
 func NewLexer(input string) *Lexer {
 	l := &Lexer{
 		input:  input,
 		line:   1,
 		column: 0,
 	}
-	l.readChar()
+	l.readChar() // 读取第一个字符
 	return l
 }
 
+// readChar 读取下一个字符
 func (l *Lexer) readChar() {
 	if l.readPos >= len(l.input) {
-		l.ch = 0
+		l.ch = 0 // EOF
 	} else {
 		l.ch = l.input[l.readPos]
 	}
 	l.pos = l.readPos
 	l.readPos++
 
+	// 更新行号和列号
 	if l.ch == '\n' {
 		l.line++
-		l.lastColumn = l.column
 		l.column = 0
 	} else {
 		l.column++
 	}
 }
 
+// peekChar 查看下一个字符但不移动位置
 func (l *Lexer) peekChar() byte {
 	if l.readPos >= len(l.input) {
 		return 0
@@ -167,86 +53,85 @@ func (l *Lexer) peekChar() byte {
 	return l.input[l.readPos]
 }
 
+// NextToken 获取下一个token
 func (l *Lexer) NextToken() Token {
-	var tok Token
-
 	l.skipWhitespace()
 
-	// 记录token的起始位置
+	var tok Token
 	tok.Line = l.line
 	tok.Column = l.column
+	tok.Offset = l.pos
 
 	switch l.ch {
+	// 单字符token
 	case '=':
-		tok = l.newToken(EQ, string(l.ch))
-	case ',':
-		tok = l.newToken(COMMA, string(l.ch))
-	case ';':
-		tok = l.newToken(SEMICOLON, string(l.ch))
-	case '(':
-		tok = l.newToken(LPAREN, string(l.ch))
-	case ')':
-		tok = l.newToken(RPAREN, string(l.ch))
+		tok = l.newToken(TOK_EQ, string(l.ch))
 	case '+':
-		tok = l.newToken(PLUS, string(l.ch))
+		tok = l.newToken(TOK_PLUS, string(l.ch))
 	case '-':
-		tok = l.newToken(MINUS, string(l.ch))
+		tok = l.newToken(TOK_MINUS, string(l.ch))
 	case '*':
-		tok = l.newToken(MULTIPLY, string(l.ch))
+		tok = l.newToken(TOK_MULTIPLY, string(l.ch))
 	case '/':
-		if l.peekChar() == '/' {
-			l.skipSingleLineComment()
-			return l.NextToken()
-		} else if l.peekChar() == '*' {
-			l.skipMultiLineComment()
-			return l.NextToken()
-		}
-		tok = l.newToken(DIVIDE, string(l.ch))
-	case '%':
-		tok = l.newToken(MOD, string(l.ch))
+		tok = l.newToken(TOK_DIVIDE, string(l.ch))
+	case '(':
+		tok = l.newToken(TOK_LPAREN, string(l.ch))
+	case ')':
+		tok = l.newToken(TOK_RPAREN, string(l.ch))
+	case ',':
+		tok = l.newToken(TOK_COMMA, string(l.ch))
+	case ';':
+		tok = l.newToken(TOK_SEMICOLON, string(l.ch))
 	case '.':
-		tok = l.newToken(DOT, string(l.ch))
+		tok = l.newToken(TOK_DOT, string(l.ch))
+
+	// 双字符token
 	case '<':
 		if l.peekChar() == '=' {
 			ch := l.ch
 			l.readChar()
-			tok = l.newToken(LTE, string(ch)+string(l.ch))
+			tok = Token{Type: TOK_LTE, Literal: string(ch) + string(l.ch)}
 		} else {
-			tok = l.newToken(LT, string(l.ch))
+			tok = l.newToken(TOK_LT, string(l.ch))
 		}
 	case '>':
 		if l.peekChar() == '=' {
 			ch := l.ch
 			l.readChar()
-			tok = l.newToken(GTE, string(ch)+string(l.ch))
+			tok = Token{Type: TOK_GTE, Literal: string(ch) + string(l.ch)}
 		} else {
-			tok = l.newToken(GT, string(l.ch))
+			tok = l.newToken(TOK_GT, string(l.ch))
 		}
 	case '!':
 		if l.peekChar() == '=' {
 			ch := l.ch
 			l.readChar()
-			tok = l.newToken(NEQ, string(ch)+string(l.ch))
+			tok = Token{Type: TOK_NEQ, Literal: string(ch) + string(l.ch)}
 		} else {
-			tok = l.newToken(ILLEGAL, string(l.ch))
+			tok = l.newToken(TOK_ILLEGAL, string(l.ch))
 		}
+
+	// 字符串
 	case '"', '\'':
-		tok.Type = STRING
+		tok.Type = TOK_STRING
 		tok.Literal = l.readString(l.ch)
+
+	// EOF
 	case 0:
+		tok.Type = TOK_EOF
 		tok.Literal = ""
-		tok.Type = EOF
+
 	default:
 		if isLetter(l.ch) {
 			tok.Literal = l.readIdentifier()
-			tok.Type = lookupIdent(tok.Literal)
+			tok.Type = LookupIdent(tok.Literal)
 			return tok
 		} else if isDigit(l.ch) {
+			tok.Type = TOK_NUMBER
 			tok.Literal = l.readNumber()
-			tok.Type = NUMBER
 			return tok
 		} else {
-			tok = l.newToken(ILLEGAL, string(l.ch))
+			tok = l.newToken(TOK_ILLEGAL, string(l.ch))
 		}
 	}
 
@@ -254,37 +139,38 @@ func (l *Lexer) NextToken() Token {
 	return tok
 }
 
-func (l *Lexer) skipWhitespace() {
-	for l.ch == ' ' || l.ch == '\t' || l.ch == '\n' || l.ch == '\r' {
-		l.readChar()
+// 辅助方法
+
+// newToken 创建新token
+func (l *Lexer) newToken(tokenType TokenType, literal string) Token {
+	return Token{
+		Type:    tokenType,
+		Literal: literal,
+		Line:    l.line,
+		Column:  l.column,
+		Offset:  l.pos,
 	}
 }
 
-func (l *Lexer) skipSingleLineComment() {
-	l.readChar() // 跳过第二个 /
-	for l.ch != '\n' && l.ch != 0 {
+// readIdentifier 读取标识符
+func (l *Lexer) readIdentifier() string {
+	position := l.pos
+	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
 		l.readChar()
 	}
-	if l.ch == '\n' {
-		l.readChar()
-	}
+	return l.input[position:l.pos]
 }
 
-func (l *Lexer) skipMultiLineComment() {
-	l.readChar() // 跳过 *
-	for {
-		if l.ch == 0 {
-			return
-		}
-		if l.ch == '*' && l.peekChar() == '/' {
-			l.readChar() // 跳过 *
-			l.readChar() // 跳过 /
-			return
-		}
+// readNumber 读取数字
+func (l *Lexer) readNumber() string {
+	position := l.pos
+	for isDigit(l.ch) || l.ch == '.' {
 		l.readChar()
 	}
+	return l.input[position:l.pos]
 }
 
+// readString 读取字符串
 func (l *Lexer) readString(quote byte) string {
 	position := l.pos + 1
 	for {
@@ -292,58 +178,29 @@ func (l *Lexer) readString(quote byte) string {
 		if l.ch == quote || l.ch == 0 {
 			break
 		}
-		if l.ch == '\\' {
-			l.readChar() // 跳过转义字符
-		}
-	}
-	if l.ch == 0 {
-		return l.input[position:l.pos]
 	}
 	return l.input[position:l.pos]
 }
 
-func (l *Lexer) readIdentifier() string {
-	position := l.pos
-	for isLetter(l.ch) || isDigit(l.ch) {
+// skipWhitespace 跳过空白字符
+func (l *Lexer) skipWhitespace() {
+	for l.ch == ' ' || l.ch == '\t' || l.ch == '\n' || l.ch == '\r' {
 		l.readChar()
 	}
-	return l.input[position:l.pos]
 }
 
-func (l *Lexer) readNumber() string {
-	position := l.pos
-	for isDigit(l.ch) {
-		l.readChar()
-	}
-	if l.ch == '.' && isDigit(l.peekChar()) {
-		l.readChar() // 读取小数点
-		for isDigit(l.ch) {
-			l.readChar()
-		}
-	}
-	return l.input[position:l.pos]
-}
-
-func (l *Lexer) newToken(tokenType TokenType, literal string) Token {
-	return Token{
-		Type:    tokenType,
-		Literal: literal,
-		Line:    l.line,
-		Column:  l.column,
-	}
-}
-
+// isLetter 判断是否是字母
 func isLetter(ch byte) bool {
-	return 'a' <= ch && ch <= 'z' || 'A' <= ch && ch <= 'Z' || ch == '_'
+	return unicode.IsLetter(rune(ch))
 }
 
+// isDigit 判断是否是数字
 func isDigit(ch byte) bool {
-	return '0' <= ch && ch <= '9'
+	return unicode.IsDigit(rune(ch))
 }
 
-func lookupIdent(ident string) TokenType {
-	if tok, ok := keywords[strings.ToLower(ident)]; ok {
-		return tok
-	}
-	return IDENT
+// String 返回Token的字符串表示
+func (t Token) String() string {
+	return fmt.Sprintf("Token{Type: %v, Literal: %q, Line: %d, Column: %d}",
+		t.Type, t.Literal, t.Line, t.Column)
 }

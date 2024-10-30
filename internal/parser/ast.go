@@ -5,64 +5,33 @@ import (
 	"strings"
 )
 
-// NodeType 定义AST节点类型
-type NodeType int
-
-const (
-	// 语句类型
-	CREATE_TABLE NodeType = iota
-	DROP_TABLE
-	SHOW_TABLES
-	SELECT
-	INSERT
-	UPDATE
-	DELETE
-
-	// 表达式类型
-	IDENTIFIER // 标识符(表名、列名等)
-	STRING_LIT // 字符串字面量
-	NUMBER_LIT // 数字字面量
-	COMPARISON // 比较表达式
-	AND        // AND表达式
-	OR         // OR表达式
-	FUNCTION   // 函数调用
-)
-
-// JoinType 定义JOIN类型
-type JoinType int
-
-const (
-	NO_JOIN JoinType = iota
-	INNER_JOIN
-	LEFT_JOIN
-	RIGHT_JOIN
-)
-
-// Node 接口定义AST节点的基本行为
+// Node 表示AST中的节点接口
 type Node interface {
-	Type() NodeType
-	String() string
+	String() string // 用于调试和显示
 }
 
-// Statement 接口定义语句节点
+// Statement 表示SQL语句接口
 type Statement interface {
 	Node
-	statementNode()
+	statementNode() // 标记方法
 }
 
-// Expression 接口定义表达式节点
+// Expression 表示表达式接口
 type Expression interface {
 	Node
-	expressionNode()
+	expressionNode() // 标记方法
 }
 
-// BaseNode 提供基础节点实现
+// BaseNode 所有节点的基础结构
 type BaseNode struct {
-	nodeType NodeType
+	pos Position // 位置信息
 }
 
-func (n BaseNode) Type() NodeType {
-	return n.nodeType
+// Position 表示源代码中的位置
+type Position struct {
+	Line   int
+	Column int
+	Offset int
 }
 
 // CreateTableStmt 表示CREATE TABLE语句
@@ -73,60 +42,32 @@ type CreateTableStmt struct {
 }
 
 type ColumnDef struct {
-	Name        string
-	DataType    string
-	Constraints []string
+	Name     string
+	DataType string
+	NotNull  bool
 }
 
 func (s *CreateTableStmt) statementNode() {}
 func (s *CreateTableStmt) String() string {
 	cols := make([]string, len(s.Columns))
 	for i, col := range s.Columns {
-		constraints := ""
-		if len(col.Constraints) > 0 {
-			constraints = " " + strings.Join(col.Constraints, " ")
+		constraint := ""
+		if col.NotNull {
+			constraint = " NOT NULL"
 		}
-		cols[i] = fmt.Sprintf("%s %s%s", col.Name, col.DataType, constraints)
+		cols[i] = fmt.Sprintf("%s %s%s", col.Name, col.DataType, constraint)
 	}
 	return fmt.Sprintf("CREATE TABLE %s (%s)", s.TableName, strings.Join(cols, ", "))
-}
-
-// DropTableStmt 表示DROP TABLE语句
-type DropTableStmt struct {
-	BaseNode
-	TableName string
-}
-
-func (s *DropTableStmt) statementNode() {}
-func (s *DropTableStmt) String() string {
-	return fmt.Sprintf("DROP TABLE %s", s.TableName)
-}
-
-// ShowTablesStmt 表示SHOW TABLES语句
-type ShowTablesStmt struct {
-	BaseNode
-}
-
-func (s *ShowTablesStmt) statementNode() {}
-func (s *ShowTablesStmt) String() string {
-	return "SHOW TABLES"
 }
 
 // SelectStmt 表示SELECT语句
 type SelectStmt struct {
 	BaseNode
-	Fields     []Expression
-	From       string
-	Where      Expression
-	JoinType   JoinType
-	JoinTable  string
-	JoinOn     Expression
-	GroupBy    []string
-	Having     Expression
-	OrderBy    []OrderByExpr
-	Limit      *int
-	Offset     *int
-	IsAnalytic bool
+	Fields  []Expression  // 选择的字段
+	Table   string        // FROM子句
+	Where   Expression    // WHERE子句
+	OrderBy []OrderByExpr // ORDER BY子句
+	Limit   *int          // LIMIT子句
 }
 
 type OrderByExpr struct {
@@ -136,64 +77,27 @@ type OrderByExpr struct {
 
 func (s *SelectStmt) statementNode() {}
 func (s *SelectStmt) String() string {
-	var parts []string
+	parts := []string{fmt.Sprintf("SELECT %s", expressionsToString(s.Fields))}
+	parts = append(parts, fmt.Sprintf("FROM %s", s.Table))
 
-	// SELECT clause
-	fields := make([]string, len(s.Fields))
-	for i, f := range s.Fields {
-		fields[i] = f.String()
-	}
-	parts = append(parts, fmt.Sprintf("SELECT %s", strings.Join(fields, ", ")))
-
-	// FROM clause
-	parts = append(parts, fmt.Sprintf("FROM %s", s.From))
-
-	// JOIN clause
-	if s.JoinType != NO_JOIN {
-		switch s.JoinType {
-		case INNER_JOIN:
-			parts = append(parts, fmt.Sprintf("JOIN %s ON %s", s.JoinTable, s.JoinOn.String()))
-		case LEFT_JOIN:
-			parts = append(parts, fmt.Sprintf("LEFT JOIN %s ON %s", s.JoinTable, s.JoinOn.String()))
-		case RIGHT_JOIN:
-			parts = append(parts, fmt.Sprintf("RIGHT JOIN %s ON %s", s.JoinTable, s.JoinOn.String()))
-		}
-	}
-
-	// WHERE clause
 	if s.Where != nil {
 		parts = append(parts, fmt.Sprintf("WHERE %s", s.Where.String()))
 	}
 
-	// GROUP BY clause
-	if len(s.GroupBy) > 0 {
-		parts = append(parts, fmt.Sprintf("GROUP BY %s", strings.Join(s.GroupBy, ", ")))
-	}
-
-	// HAVING clause
-	if s.Having != nil {
-		parts = append(parts, fmt.Sprintf("HAVING %s", s.Having.String()))
-	}
-
-	// ORDER BY clause
 	if len(s.OrderBy) > 0 {
-		orderBy := make([]string, len(s.OrderBy))
+		orders := make([]string, len(s.OrderBy))
 		for i, o := range s.OrderBy {
 			dir := "ASC"
 			if !o.Ascending {
 				dir = "DESC"
 			}
-			orderBy[i] = fmt.Sprintf("%s %s", o.Expr.String(), dir)
+			orders[i] = fmt.Sprintf("%s %s", o.Expr.String(), dir)
 		}
-		parts = append(parts, fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+		parts = append(parts, fmt.Sprintf("ORDER BY %s", strings.Join(orders, ", ")))
 	}
 
-	// LIMIT and OFFSET
 	if s.Limit != nil {
 		parts = append(parts, fmt.Sprintf("LIMIT %d", *s.Limit))
-		if s.Offset != nil {
-			parts = append(parts, fmt.Sprintf("OFFSET %d", *s.Offset))
-		}
 	}
 
 	return strings.Join(parts, " ")
@@ -209,19 +113,15 @@ type InsertStmt struct {
 
 func (s *InsertStmt) statementNode() {}
 func (s *InsertStmt) String() string {
-	values := make([]string, len(s.Values))
-	for i, v := range s.Values {
-		values[i] = v.String()
-	}
 	if len(s.Columns) > 0 {
 		return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 			s.Table,
 			strings.Join(s.Columns, ", "),
-			strings.Join(values, ", "))
+			expressionsToString(s.Values))
 	}
 	return fmt.Sprintf("INSERT INTO %s VALUES (%s)",
 		s.Table,
-		strings.Join(values, ", "))
+		expressionsToString(s.Values))
 }
 
 // UpdateStmt 表示UPDATE语句
@@ -261,6 +161,8 @@ func (s *DeleteStmt) String() string {
 	return result
 }
 
+// 表达式节点
+
 // Identifier 表示标识符
 type Identifier struct {
 	BaseNode
@@ -274,10 +176,24 @@ func (e *Identifier) String() string  { return e.Name }
 type Literal struct {
 	BaseNode
 	Value string
+	Type  string // 可以是 "string", "number", "boolean" 等
 }
 
 func (e *Literal) expressionNode() {}
 func (e *Literal) String() string  { return e.Value }
+
+// BinaryExpr 表示二元表达式
+type BinaryExpr struct {
+	BaseNode
+	Left     Expression
+	Operator string
+	Right    Expression
+}
+
+func (e *BinaryExpr) expressionNode() {}
+func (e *BinaryExpr) String() string {
+	return fmt.Sprintf("(%s %s %s)", e.Left.String(), e.Operator, e.Right.String())
+}
 
 // ComparisonExpr 表示比较表达式
 type ComparisonExpr struct {
@@ -308,15 +224,13 @@ func (e *FunctionExpr) String() string {
 	return fmt.Sprintf("%s(%s)", e.Name, strings.Join(args, ", "))
 }
 
-// BinaryExpr 表示二元表达式
-type BinaryExpr struct {
-	BaseNode
-	Left     Expression
-	Operator string
-	Right    Expression
-}
+// 辅助函数
 
-func (e *BinaryExpr) expressionNode() {}
-func (e *BinaryExpr) String() string {
-	return fmt.Sprintf("(%s %s %s)", e.Left.String(), e.Operator, e.Right.String())
+// expressionsToString 将表达式列表转换为字符串
+func expressionsToString(exprs []Expression) string {
+	parts := make([]string, len(exprs))
+	for i, expr := range exprs {
+		parts[i] = expr.String()
+	}
+	return strings.Join(parts, ", ")
 }

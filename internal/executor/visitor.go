@@ -2,282 +2,179 @@ package executor
 
 import (
 	"fmt"
-	"strings"
 
-	"github.com/yyun543/minidb/internal/cache"
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/storage"
 )
 
-type QueryExecutor struct {
+// QueryVisitor 实现SQL语句的访问者模式
+type QueryVisitor struct {
 	storage *storage.Engine
-	cache   *cache.Cache
 }
 
-func NewQueryExecutor(storage *storage.Engine, cache *cache.Cache) *QueryExecutor {
-	return &QueryExecutor{
-		storage: storage,
-		cache:   cache,
-	}
+// NewQueryVisitor 创建新的查询访问者
+func NewQueryVisitor(storage *storage.Engine) *QueryVisitor {
+	return &QueryVisitor{storage: storage}
 }
 
-func (e *QueryExecutor) VisitCreateTable(stmt *parser.CreateTableStmt) interface{} {
-	schema := make(storage.Row)
+// VisitCreateTable 处理CREATE TABLE语句
+func (v *QueryVisitor) VisitCreateTable(stmt *parser.CreateTableStmt) interface{} {
+	// 构建表结构
+	schema := make(storage.Schema)
 	for _, col := range stmt.Columns {
-		schema[col.Name] = col.DataType
-	}
-
-	err := e.storage.CreateTable(stmt.TableName, schema)
-	if err != nil {
-		return fmt.Errorf("failed to create table: %v", err)
-	}
-	return fmt.Sprintf("Table %s created successfully", stmt.TableName)
-}
-
-func (e *QueryExecutor) VisitDropTable(stmt *parser.DropTableStmt) interface{} {
-	err := e.storage.DropTable(stmt.TableName)
-	if err != nil {
-		return fmt.Errorf("failed to drop table: %v", err)
-	}
-	return fmt.Sprintf("Table %s dropped successfully", stmt.TableName)
-}
-
-func (e *QueryExecutor) VisitShowTables(stmt *parser.ShowTablesStmt) interface{} {
-	tables := e.storage.GetTables()
-	if len(tables) == 0 {
-		return "No tables"
-	}
-	return fmt.Sprintf("Tables:\n%s", strings.Join(tables, "\n"))
-}
-
-func (e *QueryExecutor) VisitSelect(stmt *parser.SelectStmt) interface{} {
-	// 检查缓存
-	cacheKey := stmt.String()
-	if result, ok := e.cache.Get(cacheKey); ok {
-		return result
-	}
-
-	// 获取字段名
-	fields := make([]string, len(stmt.Fields))
-	for i, field := range stmt.Fields {
-		if ident, ok := field.(*parser.Identifier); ok {
-			fields[i] = ident.Name
+		schema[col.Name] = storage.Column{
+			Type:     col.DataType,
+			Nullable: !col.NotNull,
 		}
 	}
 
-	// 构建WHERE子句
+	// 创建表
+	err := v.storage.CreateTable(stmt.TableName, schema)
+	if err != nil {
+		return fmt.Errorf("failed to create table: %v", err)
+	}
+
+	return fmt.Sprintf("Table %s created successfully", stmt.TableName)
+}
+
+// VisitSelect 处理SELECT语句
+func (v *QueryVisitor) VisitSelect(stmt *parser.SelectStmt) interface{} {
+	// 处理查询字段
+	fields := v.processSelectFields(stmt.Fields)
+
+	// 处理WHERE条件
 	where := ""
 	if stmt.Where != nil {
-		where = e.buildWhereClause(stmt.Where)
+		where = v.processWhereClause(stmt.Where)
 	}
 
 	// 执行查询
-	rows, err := e.storage.Select(stmt.From, fields, where, stmt.IsAnalytic)
+	rows, err := v.storage.Select(stmt.Table, fields, where)
 	if err != nil {
 		return fmt.Errorf("select failed: %v", err)
 	}
 
-	// 处理JOIN
-	if stmt.JoinType != parser.NO_JOIN {
-		rows, err = e.processJoin(rows, stmt)
-		if err != nil {
-			return fmt.Errorf("join failed: %v", err)
-		}
-	}
-
-	// 处理GROUP BY
-	if len(stmt.GroupBy) > 0 {
-		rows, err = e.processGroupBy(rows, stmt)
-		if err != nil {
-			return fmt.Errorf("group by failed: %v", err)
-		}
-	}
-
 	// 处理ORDER BY
 	if len(stmt.OrderBy) > 0 {
-		rows, err = e.processOrderBy(rows, stmt)
-		if err != nil {
-			return fmt.Errorf("order by failed: %v", err)
-		}
+		rows = v.processOrderBy(rows, stmt.OrderBy)
 	}
 
-	// 处理LIMIT和OFFSET
+	// 处理LIMIT
 	if stmt.Limit != nil {
-		limit := *stmt.Limit
-		offset := 0
-		if stmt.Offset != nil {
-			offset = *stmt.Offset
-		}
-		if offset < len(rows) {
-			end := offset + limit
-			if end > len(rows) {
-				end = len(rows)
-			}
-			rows = rows[offset:end]
-		} else {
-			rows = []storage.Row{}
-		}
+		rows = v.processLimit(rows, *stmt.Limit)
 	}
 
-	result := formatTable(fields, rows)
-
-	// 缓存结果
-	e.cache.Set(cacheKey, result)
-
-	return result
+	return formatResults(rows)
 }
 
-func (e *QueryExecutor) VisitInsert(stmt *parser.InsertStmt) interface{} {
-	values := make([]string, len(stmt.Values))
-	for i, val := range stmt.Values {
-		if lit, ok := val.(*parser.Literal); ok {
-			values[i] = lit.Value
-		}
+// VisitInsert 处理INSERT语句
+func (v *QueryVisitor) VisitInsert(stmt *parser.InsertStmt) interface{} {
+	// 验证列和值的数量是否匹配
+	if len(stmt.Columns) != len(stmt.Values) {
+		return fmt.Errorf("column count doesn't match value count")
 	}
 
-	err := e.storage.Insert(stmt.Table, values)
+	// 构建要插入的数据
+	data := make(map[string]string)
+	for i, col := range stmt.Columns {
+		data[col] = stmt.Values[i].String()
+	}
+
+	// 执行插入
+	err := v.storage.Insert(stmt.Table, data)
 	if err != nil {
 		return fmt.Errorf("insert failed: %v", err)
 	}
-	return "1 row inserted"
+
+	return "Insert successful"
 }
 
-func (e *QueryExecutor) VisitUpdate(stmt *parser.UpdateStmt) interface{} {
-	// 构建SET和WHERE子句
-	for col, val := range stmt.Set {
-		if lit, ok := val.(*parser.Literal); ok {
-			where := ""
-			if stmt.Where != nil {
-				where = e.buildWhereClause(stmt.Where)
-			}
-			count, err := e.storage.Update(stmt.Table, col, lit.Value, where)
-			if err != nil {
-				return fmt.Errorf("update failed: %v", err)
-			}
-			return fmt.Sprintf("%d rows updated", count)
-		}
+// VisitUpdate 处理UPDATE语句
+func (v *QueryVisitor) VisitUpdate(stmt *parser.UpdateStmt) interface{} {
+	// 处理SET子句
+	updates := make(map[string]string)
+	for col, expr := range stmt.Set {
+		updates[col] = expr.String()
 	}
-	return fmt.Errorf("invalid update statement")
-}
 
-func (e *QueryExecutor) VisitDelete(stmt *parser.DeleteStmt) interface{} {
+	// 处理WHERE条件
 	where := ""
 	if stmt.Where != nil {
-		where = e.buildWhereClause(stmt.Where)
+		where = v.processWhereClause(stmt.Where)
 	}
 
-	count, err := e.storage.Delete(stmt.Table, where)
+	// 执行更新
+	count, err := v.storage.Update(stmt.Table, updates, where)
+	if err != nil {
+		return fmt.Errorf("update failed: %v", err)
+	}
+
+	return fmt.Sprintf("%d rows updated", count)
+}
+
+// VisitDelete 处理DELETE语句
+func (v *QueryVisitor) VisitDelete(stmt *parser.DeleteStmt) interface{} {
+	// 处理WHERE条件
+	where := ""
+	if stmt.Where != nil {
+		where = v.processWhereClause(stmt.Where)
+	}
+
+	// 执行删除
+	count, err := v.storage.Delete(stmt.Table, where)
 	if err != nil {
 		return fmt.Errorf("delete failed: %v", err)
 	}
+
 	return fmt.Sprintf("%d rows deleted", count)
 }
 
-func (e *QueryExecutor) VisitIdentifier(node *parser.Identifier) interface{} {
-	return node.Name
-}
+// 辅助方法
 
-func (e *QueryExecutor) VisitLiteral(node *parser.Literal) interface{} {
-	return node.Value
-}
-
-func (e *QueryExecutor) VisitComparison(node *parser.ComparisonExpr) interface{} {
-	left := e.visitNode(node.Left)
-	right := e.visitNode(node.Right)
-	return fmt.Sprintf("%v %s %v", left, node.Operator, right)
-}
-
-func (e *QueryExecutor) VisitFunction(node *parser.FunctionExpr) interface{} {
-	args := make([]string, len(node.Args))
-	for i, arg := range node.Args {
-		args[i] = fmt.Sprintf("%v", e.visitNode(arg))
+// processSelectFields 处理SELECT字段列表
+func (v *QueryVisitor) processSelectFields(fields []parser.Expression) []string {
+	result := make([]string, len(fields))
+	for i, field := range fields {
+		result[i] = field.String()
 	}
-	return fmt.Sprintf("%s(%s)", node.Name, strings.Join(args, ", "))
-}
-
-func (e *QueryExecutor) visitNode(node parser.Node) interface{} {
-	switch n := node.(type) {
-	case *parser.Identifier:
-		return e.VisitIdentifier(n)
-	case *parser.Literal:
-		return e.VisitLiteral(n)
-	case *parser.ComparisonExpr:
-		return e.VisitComparison(n)
-	case *parser.FunctionExpr:
-		return e.VisitFunction(n)
-	default:
-		return fmt.Errorf("unknown node type: %T", node)
-	}
-}
-
-func (e *QueryExecutor) buildWhereClause(expr parser.Expression) string {
-	if expr == nil {
-		return ""
-	}
-	return fmt.Sprintf("%v", e.visitNode(expr))
-}
-
-func (e *QueryExecutor) processJoin(rows []storage.Row, stmt *parser.SelectStmt) ([]storage.Row, error) {
-	if stmt.JoinTable == "" {
-		return rows, nil
-	}
-
-	rightRows, err := e.storage.Select(stmt.JoinTable, []string{"*"}, "", false)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]storage.Row, 0)
-	for _, leftRow := range rows {
-		for _, rightRow := range rightRows {
-			if e.evaluateJoinCondition(leftRow, rightRow, stmt.JoinOn) {
-				mergedRow := make(storage.Row)
-				// 合并左右表行
-				for k, v := range leftRow {
-					mergedRow[k] = v
-				}
-				for k, v := range rightRow {
-					mergedRow[stmt.JoinTable+"."+k] = v
-				}
-				result = append(result, mergedRow)
-			}
-		}
-	}
-	return result, nil
-}
-
-func (e *QueryExecutor) processGroupBy(rows []storage.Row, stmt *parser.SelectStmt) ([]storage.Row, error) {
-	if len(stmt.GroupBy) == 0 {
-		return rows, nil
-	}
-
-	// 按GROUP BY字段分组
-	groups := make(map[string][]storage.Row)
-	for _, row := range rows {
-		key := makeGroupKey(row, stmt.GroupBy)
-		groups[key] = append(groups[key], row)
-	}
-
-	// 处理每个分组
-	result := make([]storage.Row, 0)
-	for _, group := range groups {
-		aggregatedRow := aggregateGroup(group, stmt.Fields)
-		result = append(result, aggregatedRow)
-	}
-
-	return result, nil
-}
-
-func makeGroupKey(row storage.Row, groupBy []string) string {
-	parts := make([]string, len(groupBy))
-	for i, col := range groupBy {
-		parts[i] = row[col]
-	}
-	return strings.Join(parts, "|")
-}
-
-func aggregateGroup(group []storage.Row, fields []parser.Expression) storage.Row {
-	result := make(storage.Row)
-	// ... 实现聚合函数
 	return result
+}
+
+// processWhereClause 处理WHERE子句
+func (v *QueryVisitor) processWhereClause(expr parser.Expression) string {
+	switch e := expr.(type) {
+	case *parser.ComparisonExpr:
+		return fmt.Sprintf("%s %s %s",
+			e.Left.String(),
+			e.Operator,
+			e.Right.String())
+	case *parser.BinaryExpr:
+		return fmt.Sprintf("(%s %s %s)",
+			v.processWhereClause(e.Left),
+			e.Operator,
+			v.processWhereClause(e.Right))
+	default:
+		return expr.String()
+	}
+}
+
+// processOrderBy 处理ORDER BY子句
+func (v *QueryVisitor) processOrderBy(rows []storage.Row, orderBy []parser.OrderByExpr) []storage.Row {
+	// 简化的排序实现
+	// 实际实现应该使用sort.Slice并处理多个排序键
+	return rows
+}
+
+// processLimit 处理LIMIT子句
+func (v *QueryVisitor) processLimit(rows []storage.Row, limit int) []storage.Row {
+	if limit > len(rows) {
+		return rows
+	}
+	return rows[:limit]
+}
+
+// VisitChildren 访问子节点
+func (v *QueryVisitor) VisitChildren(node parser.Node) interface{} {
+	// 默认的子节点访问实现
+	return nil
 }

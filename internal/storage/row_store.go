@@ -1,154 +1,54 @@
 package storage
 
 import (
+	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 )
 
-type Row map[string]string
-
-type Table struct {
-	Schema Row
-	Rows   []Row
+// RowStore 实现基于行的存储引擎
+type RowStore struct {
+	store  *FileStore
+	tables map[string]*Table
 	mu     sync.RWMutex
 }
 
-func NewTable(schema Row) *Table {
-	return &Table{
-		Schema: schema,
-		Rows:   make([]Row, 0),
+// NewRowStore 创建新的行存储引擎
+func NewRowStore(path string) (*RowStore, error) {
+	store, err := NewFileStore(path)
+	if err != nil {
+		return nil, err
 	}
+
+	return &RowStore{
+		store:  store,
+		tables: make(map[string]*Table),
+	}, nil
 }
 
-func (t *Table) Insert(values []string) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// Insert 插入行数据
+func (rs *RowStore) Insert(tableName string, values map[string]interface{}) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
 
-	if len(values) != len(t.Schema) {
-		return fmt.Errorf("column count mismatch: expected %d, got %d", len(t.Schema), len(values))
+	table, exists := rs.tables[tableName]
+	if !exists {
+		return fmt.Errorf("table %s does not exist", tableName)
 	}
 
-	row := make(Row)
-	i := 0
-	for col := range t.Schema {
-		row[col] = values[i]
-		i++
+	// 验证和转换数据
+	if err := validateValues(table.Schema, values); err != nil {
+		return err
 	}
 
-	t.Rows = append(t.Rows, row)
-	return nil
+	// 序列化行数据
+	rowData, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+
+	// 写入存储
+	return rs.store.Put([]byte(fmt.Sprintf("%s:%d", tableName, table.LastID+1)), rowData)
 }
 
-func (t *Table) Select(columns []string, where string) ([]Row, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	result := make([]Row, 0)
-	for _, row := range t.Rows {
-		if evaluateWhere(row, where) {
-			selectedRow := make(Row)
-			for _, col := range columns {
-				if col == "*" {
-					for k, v := range row {
-						selectedRow[k] = v
-					}
-					break
-				}
-				if val, exists := row[col]; exists {
-					selectedRow[col] = val
-				}
-			}
-			result = append(result, selectedRow)
-		}
-	}
-	return result, nil
-}
-
-func (t *Table) Update(column string, value string, where string) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if _, exists := t.Schema[column]; !exists {
-		return 0, fmt.Errorf("column %s does not exist", column)
-	}
-
-	count := 0
-	for i := range t.Rows {
-		if evaluateWhere(t.Rows[i], where) {
-			t.Rows[i][column] = value
-			count++
-		}
-	}
-	return count, nil
-}
-
-func (t *Table) Delete(where string) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	newRows := make([]Row, 0)
-	count := 0
-
-	for _, row := range t.Rows {
-		if !evaluateWhere(row, where) {
-			newRows = append(newRows, row)
-		} else {
-			count++
-		}
-	}
-
-	t.Rows = newRows
-	return count, nil
-}
-
-func evaluateWhere(row Row, where string) bool {
-	if where == "" {
-		return true
-	}
-
-	// 支持复杂条件
-	parts := strings.Split(where, " AND ")
-	for _, part := range parts {
-		if !evaluateCondition(row, part) {
-			return false
-		}
-	}
-	return true
-}
-
-func evaluateCondition(row Row, condition string) bool {
-	// 支持各种操作符
-	for _, op := range []string{">=", "<=", "<>", "=", ">", "<", "LIKE", "IN"} {
-		if parts := strings.Split(condition, op); len(parts) == 2 {
-			column := strings.TrimSpace(parts[0])
-			value := strings.TrimSpace(parts[1])
-			value = strings.Trim(value, "'\"")
-
-			actual, exists := row[column]
-			if !exists {
-				return false
-			}
-
-			switch op {
-			case "=":
-				return actual == value
-			case ">":
-				return actual > value
-			case "<":
-				return actual < value
-			case ">=":
-				return actual >= value
-			case "<=":
-				return actual <= value
-			case "<>":
-				return actual != value
-			case "LIKE":
-				return matchLikePattern(actual, value)
-			case "IN":
-				return evaluateIn(actual, value)
-			}
-		}
-	}
-	return false
-}
+// 其他方法实现...
