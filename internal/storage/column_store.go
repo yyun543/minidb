@@ -3,6 +3,8 @@ package storage
 import (
 	"fmt"
 	"sync"
+
+	"github.com/yyun543/minidb/internal/parser"
 )
 
 // ColumnStore 实现基于列的存储引擎
@@ -21,9 +23,10 @@ type ColumnTable struct {
 
 // Column 列数据
 type Column struct {
-	Name   string
-	Type   string
-	Values []interface{}
+	Name     string
+	Type     string
+	Values   []interface{}
+	Nullable bool
 }
 
 // NewColumnStore 创建新的列存储引擎
@@ -82,7 +85,10 @@ func (cs *ColumnStore) Select(tableName string, columns []string, where string) 
 	}
 
 	// 获取满足条件的行索引
-	rowIndices := cs.evaluateWhere(table, where)
+	rowIndices, err := cs.evaluateWhere(table, where)
+	if err != nil {
+		return nil, err
+	}
 
 	// 构建结果集
 	var result []Row
@@ -103,3 +109,61 @@ func (cs *ColumnStore) Select(tableName string, columns []string, where string) 
 }
 
 // 其他方法实现...
+
+// evaluateWhere 的替代实现
+func (cs *ColumnStore) evaluateWhere(table *ColumnTable, where string) ([]int, error) {
+	if where == "" {
+		// 处理空WHERE条件的情况
+		return cs.getAllRowIndices(table), nil
+	}
+
+	// 直接解析WHERE表达式
+	p := parser.NewParser(where)
+	expr, err := p.ParseWhereExpression()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse WHERE condition: %v", err)
+	}
+
+	return cs.evaluateExpression(table, expr)
+}
+
+// getAllRowIndices 返回所有行的索引
+func (cs *ColumnStore) getAllRowIndices(table *ColumnTable) []int {
+	var rowCount int
+	// 获取第一个列的长度作为行数
+	for _, col := range table.Columns {
+		rowCount = len(col.Values)
+		break
+	}
+	return makeSequence(rowCount)
+}
+
+// 辅助函数：生成序列
+func makeSequence(n int) []int {
+	result := make([]int, n)
+	for i := 0; i < n; i++ {
+		result[i] = i
+	}
+	return result
+}
+
+func (cs *ColumnStore) evaluateExpression(table *ColumnTable, expr parser.Expression) ([]int, error) {
+	switch e := expr.(type) {
+	case *parser.ComparisonExpr:
+		return cs.evaluateComparison(table, e)
+	case *parser.BinaryExpr:
+		return cs.evaluateBinary(table, e)
+	default:
+		return nil, fmt.Errorf("unsupported expression type: %T", expr)
+	}
+}
+
+func (cs *ColumnStore) evaluateComparison(table *ColumnTable, expr *parser.ComparisonExpr) ([]int, error) {
+	// TODO 实现比较逻辑
+	return nil, nil
+}
+
+func (cs *ColumnStore) evaluateBinary(table *ColumnTable, expr *parser.BinaryExpr) ([]int, error) {
+	// TODO 实现二元运算逻辑
+	return nil, nil
+}

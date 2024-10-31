@@ -584,3 +584,121 @@ func (p *Parser) validateExpression(expr Expression) error {
 	}
 	return nil
 }
+
+// parseExpressionList 解析表达式列表
+func (p *Parser) parseExpressionList() ([]Expression, error) {
+	var expressions []Expression
+
+	for {
+		expr, err := p.parseExpression(LOWEST)
+		if err != nil {
+			return nil, err
+		}
+		expressions = append(expressions, expr)
+
+		if !p.peekTokenIs(TOK_COMMA) {
+			break
+		}
+		p.nextToken()
+	}
+
+	return expressions, nil
+}
+
+// parseOrderBy 解析ORDER BY子句
+func (p *Parser) parseOrderBy() ([]OrderByExpr, error) {
+	var orderBy []OrderByExpr
+
+	for {
+		expr, err := p.parseExpression(LOWEST)
+		if err != nil {
+			return nil, err
+		}
+
+		ascending := true
+		if p.peekTokenIs(TOK_DESC) {
+			ascending = false
+			p.nextToken()
+		}
+
+		orderBy = append(orderBy, OrderByExpr{
+			Expr:      expr,
+			Ascending: ascending,
+		})
+
+		if !p.peekTokenIs(TOK_COMMA) {
+			break
+		}
+		p.nextToken()
+	}
+
+	return orderBy, nil
+}
+
+// validateBinaryOperator 验证二元运算符
+func (p *Parser) validateBinaryOperator(operator string) error {
+	validOperators := map[string]bool{
+		"+": true,
+		"-": true,
+		"*": true,
+		"/": true,
+	}
+
+	if !validOperators[operator] {
+		return fmt.Errorf("invalid binary operator: %s", operator)
+	}
+	return nil
+}
+
+// validateComparisonOperator 验证比较运算符
+func (p *Parser) validateComparisonOperator(operator string) error {
+	validOperators := map[string]bool{
+		"=":  true,
+		"!=": true,
+		"<":  true,
+		">":  true,
+		"<=": true,
+		">=": true,
+	}
+
+	if !validOperators[operator] {
+		return fmt.Errorf("invalid comparison operator: %s", operator)
+	}
+	return nil
+}
+
+// parseIdentList 解析标识符列表
+func (p *Parser) parseIdentList() ([]string, error) {
+	var identifiers []string
+
+	// 解析第一个标识符
+	if !p.expectPeek(TOK_IDENT) {
+		return nil, fmt.Errorf("expected identifier, got %s", p.peekToken.Type)
+	}
+	identifiers = append(identifiers, p.currentToken.Literal)
+
+	// 解析后续的标识符
+	for p.peekTokenIs(TOK_COMMA) {
+		p.nextToken() // 跳过逗号
+		if !p.expectPeek(TOK_IDENT) {
+			return nil, fmt.Errorf("expected identifier after comma, got %s", p.peekToken.Type)
+		}
+		identifiers = append(identifiers, p.currentToken.Literal)
+	}
+
+	// 检查右括号
+	if !p.expectPeek(TOK_RPAREN) {
+		return nil, fmt.Errorf("expected ), got %s", p.peekToken.Type)
+	}
+
+	return identifiers, nil
+}
+
+// ParseWhereExpression 专门用于解析WHERE条件表达式
+func (p *Parser) ParseWhereExpression() (Expression, error) {
+	expr, err := p.parseExpression(LOWEST)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse WHERE expression: %v", err)
+	}
+	return expr, nil
+}

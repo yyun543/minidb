@@ -3,9 +3,13 @@ package storage
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
+	"log"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/yyun543/minidb/internal/parser"
 )
 
 // Row 表示表中的一行数据
@@ -14,12 +18,7 @@ type Row struct {
 	Data    map[string]interface{} // 列数据
 	Created time.Time              // 创建时间
 	Updated time.Time              // 更新时间
-}
-
-// Column 表示表的列定义
-type Column struct {
-	Type     string // 数据类型
-	Nullable bool   // 是否可为空
+	Values  map[string]interface{}
 }
 
 // Schema 表示表结构
@@ -111,25 +110,15 @@ type Engine struct {
 	columnStore *ColumnStore // OLAP列存储
 	tables      map[string]*Table
 	mu          sync.RWMutex
+	metrics     Metrics
 }
 
-// NewEngine 创建新的混合存储引擎
-func NewEngine() (*Engine, error) {
-	rowStore, err := NewRowStore("data/row_store.db")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create row store: %v", err)
-	}
-
-	columnStore, err := NewColumnStore("data/column_store.db")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create column store: %v", err)
-	}
-
+// NewEngine 创建新的存储引擎
+func NewEngine() *Engine {
 	return &Engine{
-		rowStore:    rowStore,
-		columnStore: columnStore,
-		tables:      make(map[string]*Table),
-	}, nil
+		tables:  make(map[string]*Table),
+		metrics: Metrics{},
+	}
 }
 
 // CreateTable 创建新表
@@ -164,40 +153,127 @@ func (e *Engine) DropTable(name string) error {
 
 // Insert 插入数据
 func (e *Engine) Insert(tableName string, values map[string]interface{}) error {
-	tx, err := e.Begin()
-	if err != nil {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	table, exists := e.tables[tableName]
+	if !exists {
+		return fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	// 验证数据
+	if err := validateValues(table.Schema, values); err != nil {
 		return err
 	}
 
-	err = tx.Insert(tableName, values)
-	if err != nil {
-		tx.Rollback()
-		return err
+	// 生成新的行ID
+	table.LastID++
+	rowID := table.LastID
+
+	// 创建新行
+	now := time.Now()
+	row := Row{
+		ID:      rowID,
+		Data:    values,
+		Created: now,
+		Updated: now,
 	}
 
-	return tx.Commit()
+	table.Rows[rowID] = row
+	return nil
 }
 
-// Select 智能选择存储引擎执行查询
+// Select 实现查询操作
 func (e *Engine) Select(tableName string, columns []string, where string) ([]Row, error) {
-	// 分析查询特征，选择合适的存储引擎
-	if isAnalyticalQuery(columns, where) {
-		// OLAP查询使用列存储
-		return e.columnStore.Select(tableName, columns, where)
-	} else {
-		// OLTP查询使用行存储
-		return e.rowStore.Select(tableName, columns, where)
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	table, exists := e.tables[tableName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", tableName)
 	}
+
+	// 如果没有指定列，返回所有列
+	if len(columns) == 0 || (len(columns) == 1 && columns[0] == "*") {
+		columns = make([]string, 0, len(table.Schema))
+		for col := range table.Schema {
+			columns = append(columns, col)
+		}
+	}
+
+	// 验证列是否存在
+	for _, col := range columns {
+		if _, exists := table.Schema[col]; !exists && col != "*" {
+			return nil, fmt.Errorf("column %s does not exist", col)
+		}
+	}
+
+	var result []Row
+	// 简单的WHERE条件处理
+	for _, row := range table.Rows {
+		if evaluateWhereCondition(row, where) {
+			// 只选择指定的列
+			selectedRow := Row{
+				ID:      row.ID,
+				Data:    make(map[string]interface{}),
+				Created: row.Created,
+				Updated: row.Updated,
+			}
+			for _, col := range columns {
+				if col == "*" {
+					selectedRow.Data = row.Data
+					break
+				}
+				selectedRow.Data[col] = row.Data[col]
+			}
+			result = append(result, selectedRow)
+		}
+	}
+
+	return result, nil
 }
 
-// isAnalyticalQuery 判断是否是分析型查询
-func isAnalyticalQuery(columns []string, where string) bool {
-	// 简单判断逻辑，实际应该更复杂
-	// 1. 是否包含聚合函数
-	// 2. 是否查询大量列
-	// 3. 是否有复杂的WHERE条件
-	// 4. 是否包含GROUP BY
-	return len(columns) > 5 || strings.Contains(where, "GROUP BY")
+// evaluateWhereCondition 评估WHERE条件
+func evaluateWhereCondition(row Row, where string) bool {
+	if where == "" {
+		return true
+	}
+	// TODO: 实现WHERE条件解析和评估
+	// 这里需要实现一个简单的条件解析器
+	return true
+}
+
+// validateSchema 验证表结构
+func validateSchema(schema Schema) error {
+	if len(schema) == 0 {
+		return fmt.Errorf("empty schema")
+	}
+
+	for colName, col := range schema {
+		if colName == "" {
+			return fmt.Errorf("empty column name")
+		}
+		if err := validateColumnType(col.Type); err != nil {
+			return fmt.Errorf("invalid column %s: %v", colName, err)
+		}
+	}
+	return nil
+}
+
+// validateColumnType 验证列类型
+func validateColumnType(colType string) error {
+	validTypes := map[string]bool{
+		"string": true,
+		"int":    true,
+		"float":  true,
+		"bool":   true,
+		"date":   true,
+	}
+
+	if !validTypes[colType] {
+		return fmt.Errorf("unsupported type: %s", colType)
+	}
+	return nil
 }
 
 // Update 更新数据
@@ -211,7 +287,7 @@ func (e *Engine) Update(tableName string, values map[string]interface{}, where s
 	}
 
 	// 验证数据类型
-	if err := e.validateValues(table.Schema, values); err != nil {
+	if err := validateValues(table.Schema, values); err != nil {
 		return 0, err
 	}
 
@@ -238,6 +314,34 @@ func (e *Engine) Update(tableName string, values map[string]interface{}, where s
 	}
 
 	return updateCount, nil
+}
+
+// evaluateWhere 评估WHERE条件
+func (e *Engine) evaluateWhere(row Row, where string) bool {
+	if where == "" {
+		return true
+	}
+
+	// 解析WHERE条件
+	p := parser.NewParser(where)
+	expr, err := p.ParseWhereExpression()
+	if err != nil {
+		return false
+	}
+
+	return e.evaluateExpression(row, expr)
+}
+
+// evaluateExpression 评估表达式
+func (e *Engine) evaluateExpression(row Row, expr parser.Expression) bool {
+	switch e := expr.(type) {
+	case *parser.ComparisonExpr:
+		return e.evaluateComparison(row)
+	case *parser.BinaryExpr:
+		return e.evaluateBinary(row)
+	default:
+		return false
+	}
 }
 
 // Delete 删除数据
@@ -271,57 +375,133 @@ func (e *Engine) Delete(tableName string, where string) (int, error) {
 
 // 辅助方法
 
-// validateValues 验证数据类型
-func (e *Engine) validateValues(schema Schema, values map[string]interface{}) error {
-	for col, val := range values {
-		colDef, exists := schema[col]
-		if !exists {
-			return fmt.Errorf("column %s does not exist", col)
-		}
-
-		if val == nil && !colDef.Nullable {
-			return fmt.Errorf("column %s cannot be null", col)
-		}
-
-		if val != nil {
-			if err := e.validateType(colDef.Type, val); err != nil {
-				return fmt.Errorf("invalid value for column %s: %v", col, err)
+// validateValues 验证数据值是否符合schema定义
+func validateValues(schema Schema, values map[string]interface{}) error {
+	// 1. 检查必需字段
+	for colName, colDef := range schema {
+		if !colDef.Nullable {
+			if value, exists := values[colName]; !exists || value == nil {
+				return fmt.Errorf("column '%s' cannot be null", colName)
 			}
 		}
 	}
+
+	// 2. 检查提供的值是否都在schema中定义
+	for colName := range values {
+		if _, exists := schema[colName]; !exists {
+			return fmt.Errorf("column '%s' is not defined in schema", colName)
+		}
+	}
+
+	// 3. 验证每个值的类型
+	for colName, value := range values {
+		colDef := schema[colName]
+
+		// 如果值为nil且允许为空，则跳过类型检查
+		if value == nil {
+			if colDef.Nullable {
+				continue
+			}
+			return fmt.Errorf("column '%s' cannot be null", colName)
+		}
+
+		if err := validateType(colDef.Type, value); err != nil {
+			return fmt.Errorf("invalid value for column '%s': %v", colName, err)
+		}
+	}
+
 	return nil
 }
 
-// validateType 验证数据类型
-func (e *Engine) validateType(expectedType string, value interface{}) error {
-	switch expectedType {
-	case "string":
+// validateType 验证单个值的类型
+func validateType(expectedType string, value interface{}) error {
+	switch DataType(expectedType) {
+	case TypeString:
 		if _, ok := value.(string); !ok {
 			return fmt.Errorf("expected string, got %T", value)
 		}
-	case "int":
-		if _, ok := value.(int); !ok {
-			return fmt.Errorf("expected int, got %T", value)
+
+	case TypeInt:
+		switch v := value.(type) {
+		case int, int32, int64:
+			// 这些类型都是可接受的
+		case float64:
+			// 检查是否为整数
+			if v != float64(int64(v)) {
+				return fmt.Errorf("expected integer, got float")
+			}
+		case string:
+			// 尝试转换字符串为整数
+			if _, err := strconv.ParseInt(v, 10, 64); err != nil {
+				return fmt.Errorf("cannot convert string '%s' to integer", v)
+			}
+		default:
+			return fmt.Errorf("expected integer, got %T", value)
 		}
-	case "float":
-		if _, ok := value.(float64); !ok {
+
+	case TypeFloat:
+		switch v := value.(type) {
+		case float32, float64:
+			// 这些类型都是可接受的
+		case int, int32, int64:
+			// 整数可以自动转换为浮点数
+		case string:
+			// 尝试转换字符串为浮点数
+			if _, err := strconv.ParseFloat(v, 64); err != nil {
+				return fmt.Errorf("cannot convert string '%s' to float", v)
+			}
+		default:
 			return fmt.Errorf("expected float, got %T", value)
 		}
-	case "bool":
-		if _, ok := value.(bool); !ok {
-			return fmt.Errorf("expected bool, got %T", value)
-		}
-	default:
-		return fmt.Errorf("unsupported type: %s", expectedType)
-	}
-	return nil
-}
 
-// evaluateWhere 评估WHERE条件
-func (e *Engine) evaluateWhere(row Row, condition string) bool {
-	// 简化的WHERE条件评估
-	// 实际实现应该解析和评估复杂的条件表达式
-	return true
+	case TypeBool:
+		switch v := value.(type) {
+		case bool:
+			// 直接是布尔类型
+		case string:
+			// 尝试转换字符串为布尔值
+			if _, err := strconv.ParseBool(v); err != nil {
+				return fmt.Errorf("cannot convert string '%s' to boolean", v)
+			}
+		case int:
+			// 只允许0和1
+			if v != 0 && v != 1 {
+				return fmt.Errorf("integer value for boolean must be 0 or 1")
+			}
+		default:
+			return fmt.Errorf("expected boolean, got %T", value)
+		}
+
+	case TypeDateTime:
+		switch v := value.(type) {
+		case time.Time:
+			// 直接是时间类型
+		case string:
+			// 尝试解析多种常见的时间格式
+			layouts := []string{
+				time.RFC3339,
+				"2006-01-02 15:04:05",
+				"2006-01-02",
+			}
+			valid := false
+			for _, layout := range layouts {
+				if _, err := time.Parse(layout, v); err == nil {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				return fmt.Errorf("cannot parse '%s' as datetime", v)
+			}
+		default:
+			return fmt.Errorf("expected datetime, got %T", value)
+		}
+
+	default:
+		return fmt.Errorf("unsupported data type: %s", expectedType)
+	}
+
+	return nil
 }
 
 // Backup 创建数据库备份
@@ -342,24 +522,10 @@ func (e *Engine) Restore(data []byte) error {
 
 // RowStore 行存储引擎
 type RowStore struct {
-	path string
+	path   string
+	tables map[string]*Table
+
 	// ... 其他字段
-}
-
-// NewRowStore 创建新的行存储引擎
-func NewRowStore(path string) (*RowStore, error) {
-	return &RowStore{path: path}, nil
-}
-
-// ColumnStore 列存储引擎
-type ColumnStore struct {
-	path string
-	// ... 其他字段
-}
-
-// NewColumnStore 创建新的列存储引擎
-func NewColumnStore(path string) (*ColumnStore, error) {
-	return &ColumnStore{path: path}, nil
 }
 
 // 添加事务支持
@@ -394,7 +560,7 @@ func (tx *Transaction) Insert(tableName string, values map[string]interface{}) e
 	}
 
 	// 验证数据
-	if err := tx.engine.validateValues(table.Schema, values); err != nil {
+	if err := validateValues(table.Schema, values); err != nil {
 		return err
 	}
 
@@ -454,4 +620,94 @@ func (b *Batch) Execute() error {
 	}
 
 	return tx.Commit()
+}
+
+// Transaction 实现事务接口
+func (tx *Transaction) Commit() error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+
+	// 将变更应用到存储引擎
+	for tableName, rows := range tx.changes {
+		table := tx.engine.tables[tableName]
+		for _, row := range rows {
+			table.Rows[row.ID] = row
+		}
+	}
+
+	return nil
+}
+
+func (tx *Transaction) Rollback() error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+
+	// 清空未提交的变更
+	tx.changes = make(map[string][]Row)
+	return nil
+}
+
+// GetRow 获取指定行
+func (e *Engine) GetRow(tableName string, id int) (Row, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	table, exists := e.tables[tableName]
+	if !exists {
+		return Row{}, fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	row, exists := table.Rows[id]
+	if !exists {
+		return Row{}, fmt.Errorf("row %d does not exist", id)
+	}
+
+	return row, nil
+}
+
+// Error types
+var (
+	ErrTableNotFound    = fmt.Errorf("table not found")
+	ErrColumnNotFound   = fmt.Errorf("column not found")
+	ErrDuplicateTable   = fmt.Errorf("table already exists")
+	ErrInvalidSchema    = fmt.Errorf("invalid schema")
+	ErrTransactionError = fmt.Errorf("transaction error")
+)
+
+// logError 记录错误信息
+func (e *Engine) logError(operation string, err error) {
+	log.Printf("Error during %s: %v", operation, err)
+}
+
+// wrapError 包装错误信息
+func wrapError(err error, msg string) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", msg, err)
+}
+
+// Metrics 存储引擎指标
+type Metrics struct {
+	QueryCount       int64
+	InsertCount      int64
+	UpdateCount      int64
+	DeleteCount      int64
+	CacheHitCount    int64
+	CacheMissCount   int64
+	TransactionCount int64
+	ErrorCount       int64
+	mu               sync.RWMutex
+}
+
+// incrementMetric 增加指标计数
+func (m *Metrics) incrementMetric(metric *int64) {
+	atomic.AddInt64(metric, 1)
+}
+
+// GetMetrics 获取当前指标
+func (e *Engine) GetMetrics() Metrics {
+	e.metrics.mu.RLock()
+	defer e.metrics.mu.RUnlock()
+	return e.metrics
 }

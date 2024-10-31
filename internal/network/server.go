@@ -48,7 +48,12 @@ func NewServer(ctx context.Context, addr string, maxConns int, executor *executo
 
 // Start 启动服务器
 func (s *Server) Start() error {
-	defer s.listener.Close()
+	defer func(listener net.Listener) {
+		err := listener.Close()
+		if err != nil {
+
+		}
+	}(s.listener)
 
 	// 启动连接清理goroutine
 	go s.cleanupConnections()
@@ -71,7 +76,10 @@ func (s *Server) Start() error {
 
 			// 检查连接数限制
 			if s.connCount >= int32(s.maxConns) {
-				conn.Close()
+				err := conn.Close()
+				if err != nil {
+					return err
+				}
 				log.Printf("Connection rejected: max connections reached")
 				continue
 			}
@@ -87,7 +95,10 @@ func (s *Server) Start() error {
 // Stop 优雅关闭服务器
 func (s *Server) Stop(ctx context.Context) error {
 	s.cancel()
-	s.listener.Close()
+	err := s.listener.Close()
+	if err != nil {
+		return err
+	}
 
 	// 等待所有连接处理完成
 	done := make(chan struct{})
@@ -110,7 +121,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 		if r := recover(); r != nil {
 			log.Printf("Recovered from panic in connection handler: %v", r)
 		}
-		conn.Close()
+		err := conn.Close()
+		if err != nil {
+			return
+		}
 		s.connections.Done()
 		atomic.AddInt32(&s.connCount, -1)
 	}()
@@ -119,7 +133,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	for {
 		// 设置读取超时
-		conn.SetReadDeadline(time.Now().Add(time.Minute))
+		err := conn.SetReadDeadline(time.Now().Add(time.Minute))
+		if err != nil {
+			return
+		}
 
 		// 读取命令
 		command, err := reader.ReadString('\n')
@@ -186,13 +203,6 @@ type ClientConfig struct {
 	RetryDelay time.Duration
 }
 
-// NewClient 创建新的客户端实例
-func NewClient(config ClientConfig) *Client {
-	return &Client{
-		config: config,
-	}
-}
-
 // Connect 连接到服务器
 func (c *Client) Connect() error {
 	var err error
@@ -213,7 +223,10 @@ func (c *Client) Execute(query string) (string, error) {
 	}
 
 	// 设置读写超时
-	c.conn.SetDeadline(time.Now().Add(c.config.Timeout))
+	err := c.conn.SetDeadline(time.Now().Add(c.config.Timeout))
+	if err != nil {
+		return "", err
+	}
 
 	// 发送查询
 	if _, err := fmt.Fprintf(c.conn, "%s\n", query); err != nil {

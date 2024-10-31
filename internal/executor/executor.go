@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/yyun543/minidb/internal/cache"
@@ -158,46 +159,114 @@ func (e *Executor) executeCreate(stmt *parser.CreateTableStmt) (string, error) {
 
 // executeSelect 执行SELECT语句
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (string, error) {
-	// 1. 检查索引是否可用
-	if index := e.findUsableIndex(stmt); index != nil {
-		return e.executeIndexedSelect(stmt, index)
+	// 转换字段列表
+	columns := make([]string, len(stmt.Fields))
+	for i, field := range stmt.Fields {
+		columns[i] = field.String()
 	}
 
-	// 2. 执行普通查询
-	rows, err := e.storage.Select(stmt.Table, stmt.Columns, stmt.Where)
+	// 转换WHERE条件
+	where := ""
+	if stmt.Where != nil {
+		where = stmt.Where.String()
+	}
+
+	rows, err := e.storage.Select(stmt.Table, columns, where)
 	if err != nil {
 		return "", err
 	}
 
-	// 3. 格式化结果
 	return formatResults(rows), nil
 }
 
 // executeInsert 执行INSERT语句
 func (e *Executor) executeInsert(stmt *parser.InsertStmt) (string, error) {
-	err := e.storage.Insert(stmt.Table, stmt.Values)
+	// 转换值为map
+	values := make(map[string]parser.Expression)
+	for i, col := range stmt.Columns {
+		values[col] = stmt.Values[i].String()
+	}
+
+	err := e.storage.Insert(stmt.Table, values)
 	if err != nil {
 		return "", err
 	}
-
-	// 更新索引
-	e.updateIndexes(stmt.Table, stmt.Values)
 
 	return "Insert successful", nil
 }
 
 // executeUpdate 执行UPDATE语句
 func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (string, error) {
-	count, err := e.storage.Update(stmt.Table, stmt.Set, stmt.Where)
+	// 转换更新值为map[string]interface{}
+	values := make(map[string]interface{})
+	for key, expr := range stmt.Values {
+		value, err := extractValue(expr)
+		if err != nil {
+			return "", fmt.Errorf("failed to extract value: %v", err)
+		}
+		values[key] = value
+	}
+
+	// 转换WHERE条件
+	where := ""
+	if stmt.Where != nil {
+		where = stmt.Where.String()
+	}
+
+	// 执行更新
+	count, err := e.storage.Update(stmt.Table, values, where)
 	if err != nil {
 		return "", err
 	}
+
 	return fmt.Sprintf("%d rows updated", count), nil
+}
+
+// extractValue 从表达式中提取值
+func extractValue(expr parser.Expression) (interface{}, error) {
+	switch e := expr.(type) {
+	case *parser.Literal:
+		return convertLiteralValue(e)
+	case *parser.Identifier:
+		return e.Name, nil
+	case *parser.ValueExpression:
+		return e.Value(), nil
+	default:
+		return nil, fmt.Errorf("unsupported expression type: %T", expr)
+	}
+}
+
+// convertLiteralValue 转换字面量值
+func convertLiteralValue(lit *parser.Literal) (interface{}, error) {
+	switch lit.Type {
+	case "string":
+		return lit.Value, nil
+	case "number":
+		// 尝试转换为整数
+		if i, err := strconv.ParseInt(lit.Value, 10, 64); err == nil {
+			return i, nil
+		}
+		// 尝试转换为浮点数
+		if f, err := strconv.ParseFloat(lit.Value, 64); err == nil {
+			return f, nil
+		}
+		return nil, fmt.Errorf("invalid number format: %s", lit.Value)
+	case "boolean":
+		return strconv.ParseBool(lit.Value)
+	default:
+		return lit.Value, nil
+	}
 }
 
 // executeDelete 执行DELETE语句
 func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (string, error) {
-	count, err := e.storage.Delete(stmt.Table, stmt.Where)
+	// 将 Expression 类型的 Where 转换为字符串
+	whereStr := ""
+	if stmt.Where != nil {
+		whereStr = stmt.Where.String()
+	}
+
+	count, err := e.storage.Delete(stmt.Table, whereStr)
 	if err != nil {
 		return "", err
 	}
@@ -235,16 +304,27 @@ func (e *Executor) executeIndexedSelect(stmt *parser.SelectStmt, idx *index.Inde
 }
 
 // 新增辅助函数
-func extractValueFromWhere(where parser.Expression) string {
-	// 简化实现，实际应该解析WHERE子句
-	return ""
+func extractValueFromWhere(expr parser.Expression) (interface{}, error) {
+	switch e := expr.(type) {
+	case *parser.ValueExpression:
+		return e.Value(), nil
+	case *parser.Literal:
+		return e.Value, nil
+	case *parser.Identifier:
+		return e.Name, nil
+	default:
+		return nil, fmt.Errorf("unsupported expression type for value extraction: %T", expr)
+	}
 }
 
 // updateIndexes 更新表的索引
 func (e *Executor) updateIndexes(table string, values []string) {
 	indexes := e.index.GetTableIndexes(table)
 	for _, idx := range indexes {
-		idx.Update(values)
+		err := idx.Update(values)
+		if err != nil {
+			return
+		}
 	}
 }
 

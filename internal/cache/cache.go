@@ -6,23 +6,23 @@ import (
 )
 
 // CacheEntry 表示缓存中的一个条目
-type CacheEntry struct {
+type Entry struct {
 	Value      interface{} // 缓存的值
 	Expiration time.Time   // 过期时间
 }
 
 // Cache 实现了一个简单的内存缓存
 type Cache struct {
-	data map[string]CacheEntry // 存储缓存数据
-	mu   sync.RWMutex          // 读写锁保护并发访问
-	ttl  time.Duration         // 缓存条目的生存时间
+	data map[string]Entry // 存储缓存数据
+	mu   sync.RWMutex     // 读写锁保护并发访问
+	ttl  time.Duration    // 缓存条目的生存时间
 }
 
 // New 创建一个新的缓存实例
 // ttl 参数指定缓存条目的默认生存时间
 func New(ttl time.Duration) *Cache {
 	cache := &Cache{
-		data: make(map[string]CacheEntry),
+		data: make(map[string]Entry),
 		ttl:  ttl,
 	}
 	// 启动后台清理过期条目的goroutine
@@ -35,7 +35,7 @@ func (c *Cache) Set(key string, value interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.data[key] = CacheEntry{
+	c.data[key] = Entry{
 		Value:      value,
 		Expiration: time.Now().Add(c.ttl),
 	}
@@ -73,7 +73,7 @@ func (c *Cache) Delete(key string) {
 func (c *Cache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.data = make(map[string]CacheEntry)
+	c.data = make(map[string]Entry)
 }
 
 // startCleanup 启动定期清理过期条目的goroutine

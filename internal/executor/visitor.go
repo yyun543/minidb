@@ -69,18 +69,13 @@ func (v *QueryVisitor) VisitSelect(stmt *parser.SelectStmt) interface{} {
 
 // VisitInsert 处理INSERT语句
 func (v *QueryVisitor) VisitInsert(stmt *parser.InsertStmt) interface{} {
-	// 验证列和值的数量是否匹配
-	if len(stmt.Columns) != len(stmt.Values) {
-		return fmt.Errorf("column count doesn't match value count")
-	}
-
-	// 构建要插入的数据
-	data := make(map[string]string)
+	// 转换数据类型
+	data := make(map[string]interface{})
 	for i, col := range stmt.Columns {
-		data[col] = stmt.Values[i].String()
+		value := convertToInterface(stmt.Values[i])
+		data[col] = value.Value()
 	}
 
-	// 执行插入
 	err := v.storage.Insert(stmt.Table, data)
 	if err != nil {
 		return fmt.Errorf("insert failed: %v", err)
@@ -91,19 +86,16 @@ func (v *QueryVisitor) VisitInsert(stmt *parser.InsertStmt) interface{} {
 
 // VisitUpdate 处理UPDATE语句
 func (v *QueryVisitor) VisitUpdate(stmt *parser.UpdateStmt) interface{} {
-	// 处理SET子句
-	updates := make(map[string]string)
+	updates := make(map[string]parser.Expression)
 	for col, expr := range stmt.Set {
-		updates[col] = expr.String()
+		updates[col] = convertToInterface(expr)
 	}
 
-	// 处理WHERE条件
 	where := ""
 	if stmt.Where != nil {
 		where = v.processWhereClause(stmt.Where)
 	}
 
-	// 执行更新
 	count, err := v.storage.Update(stmt.Table, updates, where)
 	if err != nil {
 		return fmt.Errorf("update failed: %v", err)
@@ -160,8 +152,12 @@ func (v *QueryVisitor) processWhereClause(expr parser.Expression) string {
 
 // processOrderBy 处理ORDER BY子句
 func (v *QueryVisitor) processOrderBy(rows []storage.Row, orderBy []parser.OrderByExpr) []storage.Row {
-	// 简化的排序实现
-	// 实际实现应该使用sort.Slice并处理多个排序键
+	if len(orderBy) == 0 {
+		return rows
+	}
+
+	// 实现排序逻辑
+	// TODO: 实现多字段排序
 	return rows
 }
 
@@ -175,6 +171,28 @@ func (v *QueryVisitor) processLimit(rows []storage.Row, limit int) []storage.Row
 
 // VisitChildren 访问子节点
 func (v *QueryVisitor) VisitChildren(node parser.Node) interface{} {
-	// 默认的子节点访问实现
-	return nil
+	switch n := node.(type) {
+	case *parser.SelectStmt:
+		return v.VisitSelect(n)
+	case *parser.InsertStmt:
+		return v.VisitInsert(n)
+	case *parser.UpdateStmt:
+		return v.VisitUpdate(n)
+	case *parser.DeleteStmt:
+		return v.VisitDelete(n)
+	default:
+		return nil
+	}
+}
+
+// 添加辅助函数
+func convertToInterface(expr parser.Expression) parser.ExpressionType {
+	switch e := expr.(type) {
+	case *parser.Literal:
+		return parser.NewValueExpression(e.Value, e.Type)
+	case *parser.Identifier:
+		return parser.NewValueExpression(e.Name, "string")
+	default:
+		return parser.NewValueExpression(expr.String(), "string")
+	}
 }

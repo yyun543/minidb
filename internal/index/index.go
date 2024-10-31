@@ -3,6 +3,8 @@ package index
 import (
 	"strings"
 	"sync"
+
+	"github.com/yyun543/minidb/internal/parser"
 )
 
 // Index 表示单个索引的数据结构
@@ -65,14 +67,14 @@ func (m *Manager) DropIndex(table, column string) {
 }
 
 // FindBestIndex 为查询选择最合适的索引
-func (m *Manager) FindBestIndex(table string, where string) *Index {
+func (m *Manager) FindBestIndex(table string, where parser.Expression) *Index {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	// 简化的索引选择逻辑
 	// 实际实现应该分析WHERE子句并选择最优索引
 	for key, idx := range m.indexes {
-		if strings.HasPrefix(key, table+".") && strings.Contains(where, idx.column) {
+		if strings.HasPrefix(key, table+".") && strings.Contains(where.String(), idx.column) {
 			return idx
 		}
 	}
@@ -139,17 +141,50 @@ func (idx *Index) Find(value string) []int {
 	return nil
 }
 
-// Update 更新索引中的值
-func (idx *Index) Update(oldValue, newValue string, rowID int) {
-	idx.Remove(oldValue, rowID)
-	idx.Add(newValue, rowID)
-}
-
 // Clear 清空索引
 func (idx *Index) Clear() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.values = make(map[string][]int)
+}
+
+// Update 批量更新索引
+func (idx *Index) Update(values []string) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	// 清空现有索引
+	idx.Clear()
+
+	// 重建索引
+	for i, value := range values {
+		idx.Add(value, i)
+	}
+
+	return nil
+}
+
+// BatchUpdate 批量更新多个值
+func (idx *Index) BatchUpdate(updates map[int]string) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	for rowID, newValue := range updates {
+		// 找到并删除旧值
+		for value, rows := range idx.values {
+			for i, id := range rows {
+				if id == rowID {
+					// 删除旧值
+					idx.values[value] = append(rows[:i], rows[i+1:]...)
+					break
+				}
+			}
+		}
+		// 添加新值
+		idx.Add(newValue, rowID)
+	}
+
+	return nil
 }
 
 // 辅助函数

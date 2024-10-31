@@ -1,54 +1,50 @@
 package storage
 
 import (
-	"encoding/json"
-	"fmt"
 	"sync"
 )
 
-// RowStore 实现基于行的存储引擎
-type RowStore struct {
-	store  *FileStore
-	tables map[string]*Table
+// RowTable 实现基于行的存储引擎
+type RowTable struct {
+	Name   string
+	Schema Schema
+	Rows   map[int]Row
+	LastID int
 	mu     sync.RWMutex
+	store  *FileStore
 }
 
-// NewRowStore 创建新的行存储引擎
-func NewRowStore(path string) (*RowStore, error) {
-	store, err := NewFileStore(path)
-	if err != nil {
-		return nil, err
+// NewRowTable 创建新的行存储引擎
+func NewRowTable(name string, schema Schema) *RowTable {
+	return &RowTable{
+		Name:   name,
+		Schema: schema,
+		Rows:   make(map[int]Row),
+		LastID: 0,
 	}
-
-	return &RowStore{
-		store:  store,
-		tables: make(map[string]*Table),
-	}, nil
 }
 
 // Insert 插入行数据
-func (rs *RowStore) Insert(tableName string, values map[string]interface{}) error {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-
-	table, exists := rs.tables[tableName]
-	if !exists {
-		return fmt.Errorf("table %s does not exist", tableName)
-	}
+func (rt *RowTable) Insert(values map[string]interface{}) error {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 
 	// 验证和转换数据
-	if err := validateValues(table.Schema, values); err != nil {
+	if err := validateValues(rt.Schema, values); err != nil {
 		return err
 	}
 
-	// 序列化行数据
-	rowData, err := json.Marshal(values)
-	if err != nil {
-		return err
+	// 生成新的行ID
+	rt.LastID++
+	rowID := rt.LastID
+
+	// 创建新行
+	rt.Rows[rowID] = Row{
+		ID:     rowID,
+		Values: values,
 	}
 
-	// 写入存储
-	return rs.store.Put([]byte(fmt.Sprintf("%s:%d", tableName, table.LastID+1)), rowData)
+	return nil
 }
 
 // 其他方法实现...

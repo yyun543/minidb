@@ -56,6 +56,8 @@ const (
 	TOK_ORDER  = "ORDER"
 	TOK_BY     = "BY"
 	TOK_LIMIT  = "LIMIT"
+	TOK_DESC   = "DESC"
+	TOK_ASC    = "ASC"
 )
 
 // keywords 保存所有SQL关键字
@@ -74,6 +76,8 @@ var keywords = map[string]TokenType{
 	"ORDER":  TOK_ORDER,
 	"BY":     TOK_BY,
 	"LIMIT":  TOK_LIMIT,
+	"DESC":   TOK_DESC,
+	"ASC":    TOK_ASC,
 }
 
 // LookupIdent 检查标识符是否是关键字
