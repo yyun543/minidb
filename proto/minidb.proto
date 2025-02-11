@@ -1,0 +1,243 @@
+// Protobuf 定义 (预留分布式扩展/RPC)
+syntax = "proto3";
+
+package minidb;
+
+option go_package = "github.com/yyun543/minidb/proto";
+
+// 数据库服务
+service MiniDB {
+  // 查询服务
+  rpc ExecuteQuery(QueryRequest) returns (QueryResponse) {}
+  
+  // 事务服务
+  rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse) {}
+  rpc CommitTransaction(CommitTransactionRequest) returns (CommitTransactionResponse) {}
+  rpc RollbackTransaction(RollbackTransactionRequest) returns (RollbackTransactionResponse) {}
+  
+  // 元数据服务
+  rpc GetTableMeta(GetTableMetaRequest) returns (GetTableMetaResponse) {}
+  rpc CreateTable(CreateTableRequest) returns (CreateTableResponse) {}
+  rpc DropTable(DropTableRequest) returns (DropTableResponse) {}
+  
+  // 分布式协调服务
+  rpc HeartBeat(HeartBeatRequest) returns (HeartBeatResponse) {}
+  rpc JoinCluster(JoinClusterRequest) returns (JoinClusterResponse) {}
+  rpc LeaveCluster(LeaveClusterRequest) returns (LeaveClusterResponse) {}
+}
+
+// 查询相关消息
+message QueryRequest {
+  string sql = 1;
+  bytes transaction_id = 2;
+  map<string, string> context = 3;
+}
+
+message QueryResponse {
+  repeated Column columns = 1;
+  repeated Row rows = 2;
+  string error = 3;
+}
+
+message Column {
+  string name = 1;
+  DataType type = 2;
+}
+
+message Row {
+  repeated bytes values = 1;
+}
+
+// 事务相关消息
+message BeginTransactionRequest {
+  TransactionMode mode = 1;
+  int32 isolation_level = 2;
+}
+
+message BeginTransactionResponse {
+  bytes transaction_id = 1;
+  string error = 2;
+}
+
+message CommitTransactionRequest {
+  bytes transaction_id = 1;
+}
+
+message CommitTransactionResponse {
+  string error = 1;
+}
+
+message RollbackTransactionRequest {
+  bytes transaction_id = 1;
+}
+
+message RollbackTransactionResponse {
+  string error = 1;
+}
+
+// 元数据相关消息
+message GetTableMetaRequest {
+  string database = 1;
+  string table = 2;
+}
+
+message GetTableMetaResponse {
+  TableMeta meta = 1;
+  string error = 2;
+}
+
+message CreateTableRequest {
+  string database = 1;
+  TableMeta meta = 2;
+}
+
+message CreateTableResponse {
+  string error = 1;
+}
+
+message DropTableRequest {
+  string database = 1;
+  string table = 2;
+}
+
+message DropTableResponse {
+  string error = 1;
+}
+
+// 分布式协调相关消息
+message HeartBeatRequest {
+  string node_id = 1;
+  NodeStatus status = 2;
+}
+
+message HeartBeatResponse {
+  repeated NodeInfo cluster_nodes = 1;
+  map<string, string> cluster_config = 2;
+}
+
+message JoinClusterRequest {
+  string node_id = 1;
+  string address = 2;
+  NodeRole role = 3;
+}
+
+message JoinClusterResponse {
+  bool success = 1;
+  string cluster_id = 2;
+  repeated NodeInfo cluster_nodes = 3;
+  string error = 4;
+}
+
+message LeaveClusterRequest {
+  string node_id = 1;
+}
+
+message LeaveClusterResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// 元数据定义
+message TableMeta {
+  int64 id = 1;
+  string name = 2;
+  repeated ColumnMeta columns = 3;
+  repeated Constraint constraints = 4;
+  repeated IndexMeta indexes = 5;
+  int64 create_time = 6;
+  int64 update_time = 7;
+}
+
+message ColumnMeta {
+  int64 id = 1;
+  string name = 2;
+  DataType type = 3;
+  bool not_null = 4;
+  string default_value = 5;
+  string comment = 6;
+  int64 create_time = 7;
+}
+
+message Constraint {
+  int64 id = 1;
+  string name = 2;
+  ConstraintType type = 3;
+  repeated string columns = 4;
+  string ref_table = 5;
+  repeated string ref_columns = 6;
+}
+
+message IndexMeta {
+  int64 id = 1;
+  string name = 2;
+  repeated string columns = 3;
+  IndexType type = 4;
+  bool unique = 5;
+  int64 create_time = 6;
+}
+
+// 节点相关定义
+message NodeInfo {
+  string node_id = 1;
+  string address = 2;
+  NodeRole role = 3;
+  NodeStatus status = 4;
+  int64 start_time = 5;
+  map<string, string> labels = 6;
+}
+
+// 枚举定义
+enum DataType {
+  UNKNOWN = 0;
+  BOOL = 1;
+  INT8 = 2;
+  INT16 = 3;
+  INT32 = 4;
+  INT64 = 5;
+  UINT8 = 6;
+  UINT16 = 7;
+  UINT32 = 8;
+  UINT64 = 9;
+  FLOAT32 = 10;
+  FLOAT64 = 11;
+  STRING = 12;
+  BYTES = 13;
+  TIMESTAMP = 14;
+  DATE = 15;
+  TIME = 16;
+}
+
+enum ConstraintType {
+  CONSTRAINT_UNKNOWN = 0;
+  PRIMARY = 1;
+  UNIQUE = 2;
+  FOREIGN = 3;
+  CHECK = 4;
+}
+
+enum IndexType {
+  INDEX_UNKNOWN = 0;
+  BTREE = 1;
+  HASH = 2;
+}
+
+enum TransactionMode {
+  MODE_UNKNOWN = 0;
+  READ_WRITE = 1;
+  READ_ONLY = 2;
+}
+
+enum NodeRole {
+  ROLE_UNKNOWN = 0;
+  LEADER = 1;
+  FOLLOWER = 2;
+  LEARNER = 3;
+}
+
+enum NodeStatus {
+  STATUS_UNKNOWN = 0;
+  HEALTHY = 1;
+  UNHEALTHY = 2;
+  JOINING = 3;
+  LEAVING = 4;
+}

@@ -2,703 +2,538 @@ package parser
 
 import (
 	"fmt"
-	"strconv"
+
+	"github.com/antlr4-go/antlr/v4"
 )
 
-// Parser SQL解析器
-type Parser struct {
-	lexer        *Lexer   // 词法分析器
-	currentToken Token    // 当前token
-	peekToken    Token    // 下一个token
-	errors       []string // 解析错误
+// AST节点类型枚举
+type NodeType int
+
+const (
+	SelectNode NodeType = iota
+	CreateTableNode
+	InsertNode
+	UpdateNode
+	DeleteNode
+	JoinNode
+	WhereNode
+	ExpressionNode
+)
+
+// AST节点接口
+type Node interface {
+	Type() NodeType
 }
 
-// NewParser 创建新的解析器
-func NewParser(input string) *Parser {
-	p := &Parser{
-		lexer: NewLexer(input),
+// SQL语句的基础节点结构
+type BaseNode struct {
+	nodeType NodeType
+}
+
+func (n *BaseNode) Type() NodeType {
+	return n.nodeType
+}
+
+// Select语句节点
+type SelectStmt struct {
+	BaseNode
+	Columns []string      // 选择的列
+	From    string        // 表名
+	Joins   []*JoinClause // JOIN子句
+	Where   *WhereClause  // WHERE子句
+	GroupBy []string      // GROUP BY子句
+	OrderBy []string      // ORDER BY子句
+	Limit   int           // LIMIT子句
+}
+
+// JOIN子句节点
+type JoinClause struct {
+	BaseNode
+	JoinType  string // JOIN类型(INNER/LEFT)
+	Table     string // 连接表名
+	Condition Node   // 连接条件
+}
+
+// WHERE子句节点
+type WhereClause struct {
+	BaseNode
+	Condition Node // 条件表达式
+}
+
+// 表达式节点
+type Expression struct {
+	BaseNode
+	Left         Node        // 左操作数
+	Operator     string      // 操作符
+	Right        Node        // 右操作数
+	Value        interface{} // 字面量值
+	FunctionArgs []Node      // 函数参数
+}
+
+// InsertStmt INSERT语句节点
+type InsertStmt struct {
+	BaseNode
+	Table   string   // 表名
+	Columns []string // 列名列表
+	Values  []Node   // 值列表
+}
+
+// UpdateStmt UPDATE语句节点
+type UpdateStmt struct {
+	BaseNode
+	Table       string              // 表名
+	Assignments []*UpdateAssignment // 更新赋值列表
+	Where       *WhereClause        // WHERE子句
+}
+
+// UpdateAssignment 更新赋值
+type UpdateAssignment struct {
+	Column string // 列名
+	Value  Node   // 新值
+}
+
+// DeleteStmt DELETE语句节点
+type DeleteStmt struct {
+	BaseNode
+	Table string       // 表名
+	Where *WhereClause // WHERE子句
+}
+
+// MiniQL访问器实现
+type MiniQLVisitorImpl struct {
+	BaseMiniQLVisitor
+}
+
+// Parse 函数是对外的主要接口
+func Parse(sql string) (Node, error) {
+	// 创建输入流
+	input := antlr.NewInputStream(sql)
+
+	// 创建词法分析器
+	lexer := NewMiniQLLexer(input)
+	lexer.RemoveErrorListeners()
+	lexer.AddErrorListener(antlr.NewDiagnosticErrorListener(true))
+
+	// 创建语法分析器
+	stream := antlr.NewCommonTokenStream(lexer, antlr.TokenDefaultChannel)
+	parser := NewMiniQLParser(stream)
+	parser.RemoveErrorListeners()
+	parser.AddErrorListener(antlr.NewDiagnosticErrorListener(true))
+
+	// 获取语法树
+	tree := parser.Parse()
+
+	// 创建访问器
+	visitor := &MiniQLVisitorImpl{}
+
+	// 访问语法树并构建AST
+	result := visitor.Visit(tree)
+	if result == nil {
+		return nil, fmt.Errorf("解析SQL失败")
 	}
-	// 读取两个token，设置current和peek
-	p.nextToken()
-	p.nextToken()
-	return p
+
+	// 类型断言为Node接口
+	node, ok := result.(Node)
+	if !ok {
+		return nil, fmt.Errorf("无法将解析结果转换为AST节点")
+	}
+
+	return node, nil
 }
 
-// Parse 解析SQL语句
-func (p *Parser) Parse() (Statement, error) {
-	switch p.currentToken.Type {
-	case TOK_SELECT:
-		return p.parseSelect()
-	case TOK_INSERT:
-		return p.parseInsert()
-	case TOK_UPDATE:
-		return p.parseUpdate()
-	case TOK_DELETE:
-		return p.parseDelete()
-	case TOK_CREATE:
-		return p.parseCreate()
+// Visit 实现通用访问方法
+func (v *MiniQLVisitorImpl) Visit(tree antlr.ParseTree) interface{} {
+	switch node := tree.(type) {
+	case *ParseContext:
+		return v.VisitParse(node)
+	case *SqlStatementContext:
+		return v.VisitSqlStatement(node)
 	default:
-		return nil, fmt.Errorf("unexpected token: %s", p.currentToken)
+		return nil
 	}
 }
 
-// parseSelect 解析SELECT语句
-func (p *Parser) parseSelect() (*SelectStmt, error) {
-	stmt := &SelectStmt{}
+// VisitParse 访问根节点
+func (v *MiniQLVisitorImpl) VisitParse(ctx *ParseContext) interface{} {
+	if len(ctx.AllSqlStatement()) > 0 {
+		return v.Visit(ctx.SqlStatement(0))
+	}
+	return nil
+}
 
-	// 检查SELECT后是否有字段
-	if p.peekTokenIs(TOK_FROM) {
-		return nil, &ParseError{
-			Message:  "no fields specified",
-			Line:     p.peekToken.Line,
-			Column:   p.peekToken.Column,
-			Token:    p.peekToken,
-			Expected: "field list",
-		}
+// VisitSqlStatement 访问SQL语句节点
+func (v *MiniQLVisitorImpl) VisitSqlStatement(ctx *SqlStatementContext) interface{} {
+	if ctx.DqlStatement() != nil {
+		return v.Visit(ctx.DqlStatement())
+	}
+	if ctx.DmlStatement() != nil {
+		return v.Visit(ctx.DmlStatement())
+	}
+	if ctx.DdlStatement() != nil {
+		return v.Visit(ctx.DdlStatement())
+	}
+	return nil
+}
+
+// VisitSelectStatement 访问SELECT语句节点
+func (v *MiniQLVisitorImpl) VisitSelectStatement(ctx *SelectStatementContext) interface{} {
+	stmt := &SelectStmt{
+		BaseNode: BaseNode{nodeType: SelectNode},
 	}
 
-	// 解析字段列表
-	fields, err := p.parseExpressionList()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Fields = fields
-
-	// 检查是否有FROM子句
-	if !p.expectPeek(TOK_FROM) {
-		return nil, &ParseError{
-			Message:  "missing FROM clause",
-			Line:     p.currentToken.Line,
-			Column:   p.currentToken.Column,
-			Token:    p.currentToken,
-			Expected: "FROM",
-		}
-	}
-
-	// 添加类型检查
-	for _, field := range stmt.Fields {
-		if err := p.validateExpression(field); err != nil {
-			return nil, err
+	// 解析选择的列
+	for _, item := range ctx.AllSelectItem() {
+		if colName, ok := v.Visit(item).(string); ok {
+			stmt.Columns = append(stmt.Columns, colName)
 		}
 	}
 
 	// 解析FROM子句
-	if !p.expectPeek(TOK_FROM) {
-		return nil, fmt.Errorf("expected FROM")
+	if tableRef := ctx.TableReference(); tableRef != nil {
+		if tableName, ok := v.Visit(tableRef).(string); ok {
+			stmt.From = tableName
+		}
 	}
-	if !p.expectPeek(TOK_IDENT) {
-		return nil, fmt.Errorf("expected table name")
-	}
-	stmt.Table = p.currentToken.Literal
 
 	// 解析WHERE子句
-	if p.peekTokenIs(TOK_WHERE) {
-		p.nextToken()
-		where, err := p.parseExpression(LOWEST)
-		if err != nil {
-			return nil, err
+	if where := ctx.Expression(0); where != nil {
+		if condition, ok := v.Visit(where).(Node); ok {
+			stmt.Where = &WhereClause{
+				BaseNode:  BaseNode{nodeType: WhereNode},
+				Condition: condition,
+			}
 		}
-		stmt.Where = where
 	}
 
-	// 解析ORDER BY子句
-	if p.peekTokenIs(TOK_ORDER) {
-		p.nextToken()
-		if !p.expectPeek(TOK_BY) {
-			return nil, fmt.Errorf("expected BY after ORDER")
-		}
-		orderBy, err := p.parseOrderBy()
-		if err != nil {
-			return nil, err
-		}
-		stmt.OrderBy = orderBy
-	}
-
-	// 解析LIMIT子句
-	if p.peekTokenIs(TOK_LIMIT) {
-		p.nextToken()
-		if !p.expectPeek(TOK_NUMBER) {
-			return nil, fmt.Errorf("expected number after LIMIT")
-		}
-		limit, err := strconv.Atoi(p.currentToken.Literal)
-		if err != nil {
-			return nil, fmt.Errorf("invalid LIMIT value")
-		}
-		stmt.Limit = &limit
-	}
-
-	return stmt, nil
+	return stmt
 }
 
-// parseInsert 解析INSERT语句
-func (p *Parser) parseInsert() (*InsertStmt, error) {
-	stmt := &InsertStmt{}
-
-	// 解析INTO
-	if !p.expectPeek(TOK_INTO) {
-		return nil, fmt.Errorf("expected INTO")
+// VisitExpression 访问表达式节点
+func (v *MiniQLVisitorImpl) VisitBinaryArithExpr(ctx *BinaryArithExprContext) interface{} {
+	expr := &Expression{
+		BaseNode: BaseNode{nodeType: ExpressionNode},
+		Operator: ctx.GetOperator().GetText(),
 	}
 
-	// 解析表名
-	if !p.expectPeek(TOK_IDENT) {
-		return nil, fmt.Errorf("expected table name")
-	}
-	stmt.Table = p.currentToken.Literal
-
-	// 解析列名列表
-	if p.peekTokenIs(TOK_LPAREN) {
-		p.nextToken()
-		columns, err := p.parseIdentList()
-		if err != nil {
-			return nil, err
+	// 解析左操作数
+	if left := ctx.GetLeft(); left != nil {
+		if leftNode, ok := v.Visit(left).(Node); ok {
+			expr.Left = leftNode
 		}
-		stmt.Columns = columns
 	}
 
-	// 解析VALUES
-	if !p.expectPeek(TOK_VALUES) {
-		return nil, fmt.Errorf("expected VALUES")
+	// 解析右操作数
+	if right := ctx.GetRight(); right != nil {
+		if rightNode, ok := v.Visit(right).(Node); ok {
+			expr.Right = rightNode
+		}
+	}
+
+	return expr
+}
+
+// VisitTableReference 访问表引用节点
+func (v *MiniQLVisitorImpl) VisitTableRefBase(ctx *TableRefBaseContext) interface{} {
+	// 获取表名
+	tableName := v.Visit(ctx.TableName()).(string)
+
+	// 处理可选的别名
+	if ctx.Identifier() != nil {
+		// 返回带别名的表引用
+		return fmt.Sprintf("%s AS %s", tableName, ctx.Identifier().GetText())
+	}
+	return tableName
+}
+
+// VisitTableRefJoin 访问JOIN表引用节点
+func (v *MiniQLVisitorImpl) VisitTableRefJoin(ctx *TableRefJoinContext) interface{} {
+	join := &JoinClause{
+		BaseNode: BaseNode{nodeType: JoinNode},
+	}
+
+	// 获取JOIN类型
+	if joinType := ctx.JoinType(); joinType != nil {
+		if joinType.LEFT() != nil {
+			join.JoinType = "LEFT"
+		} else {
+			join.JoinType = "INNER"
+		}
+	} else {
+		join.JoinType = "INNER" // 默认INNER JOIN
+	}
+
+	// 获取右表
+	rightTable := v.Visit(ctx.TableReference(1)).(string)
+	join.Table = rightTable
+
+	// 获取JOIN条件
+	if expr := ctx.Expression(); expr != nil {
+		if condition, ok := v.Visit(expr).(Node); ok {
+			join.Condition = condition
+		}
+	}
+
+	return join
+}
+
+// VisitTableName 访问表名节点
+func (v *MiniQLVisitorImpl) VisitTableName(ctx *TableNameContext) interface{} {
+	return ctx.Identifier().GetText()
+}
+
+// VisitLiteralExpr 访问字面量表达式
+func (v *MiniQLVisitorImpl) VisitLiteralExpr(ctx *LiteralExprContext) interface{} {
+	return &Expression{
+		BaseNode: BaseNode{nodeType: ExpressionNode},
+		Left:     nil,
+		Operator: "LITERAL",
+		Right:    nil,
+		Value:    v.Visit(ctx.Literal()),
+	}
+}
+
+// VisitColumnRefExpr 访问列引用表达式
+func (v *MiniQLVisitorImpl) VisitColumnRefExpr(ctx *ColumnRefExprContext) interface{} {
+	return &Expression{
+		BaseNode: BaseNode{nodeType: ExpressionNode},
+		Left:     nil,
+		Operator: "COLUMN_REF",
+		Right:    nil,
+		Value:    ctx.Identifier().GetText(),
+	}
+}
+
+// VisitQualifiedColumnRef 访问限定列引用表达式
+func (v *MiniQLVisitorImpl) VisitQualifiedColumnRef(ctx *QualifiedColumnRefContext) interface{} {
+	tableName := v.Visit(ctx.TableName()).(string)
+	columnName := ctx.Identifier().GetText()
+	return &Expression{
+		BaseNode: BaseNode{nodeType: ExpressionNode},
+		Left:     nil,
+		Operator: "QUALIFIED_COLUMN_REF",
+		Right:    nil,
+		Value:    fmt.Sprintf("%s.%s", tableName, columnName),
+	}
+}
+
+// VisitComparisonExpr 访问比较表达式
+func (v *MiniQLVisitorImpl) VisitComparisonExpr(ctx *ComparisonExprContext) interface{} {
+	expr := &Expression{
+		BaseNode: BaseNode{nodeType: ExpressionNode},
+		Operator: ctx.COMPARISON_OP().GetText(),
+	}
+
+	// 解析左操作数
+	if leftExpr := ctx.Expression(0); leftExpr != nil {
+		if left, ok := v.Visit(leftExpr).(Node); ok {
+			expr.Left = left
+		}
+	}
+
+	// 解析右操作数
+	if rightExpr := ctx.Expression(1); rightExpr != nil {
+		if right, ok := v.Visit(rightExpr).(Node); ok {
+			expr.Right = right
+		}
+	}
+
+	return expr
+}
+
+// VisitLogicalExpr 访问逻辑表达式
+func (v *MiniQLVisitorImpl) VisitLogicalExpr(ctx *LogicalExprContext) interface{} {
+	var operator string
+	if ctx.AND() != nil {
+		operator = "AND"
+	} else if ctx.OR() != nil {
+		operator = "OR"
+	}
+
+	expr := &Expression{
+		BaseNode: BaseNode{nodeType: ExpressionNode},
+		Operator: operator,
+	}
+
+	// 解析左操作数
+	if leftExpr := ctx.Expression(0); leftExpr != nil {
+		if left, ok := v.Visit(leftExpr).(Node); ok {
+			expr.Left = left
+		}
+	}
+
+	// 解析右操作数
+	if rightExpr := ctx.Expression(1); rightExpr != nil {
+		if right, ok := v.Visit(rightExpr).(Node); ok {
+			expr.Right = right
+		}
+	}
+
+	return expr
+}
+
+// VisitFunctionCall 访问函数调用
+func (v *MiniQLVisitorImpl) VisitFunctionCall(ctx *FunctionCallContext) interface{} {
+	funcName := v.Visit(ctx.FunctionName()).(string)
+
+	expr := &Expression{
+		BaseNode: BaseNode{nodeType: ExpressionNode},
+		Operator: "FUNCTION_CALL",
+		Value:    funcName,
+	}
+
+	// 收集函数参数
+	var args []Node
+	for _, argCtx := range ctx.AllExpression() {
+		if arg, ok := v.Visit(argCtx).(Node); ok {
+			args = append(args, arg)
+		}
+	}
+
+	// 将参数列表存储在FunctionArgs字段中
+	expr.FunctionArgs = args
+
+	return expr
+}
+
+// VisitCreateTable 访问CREATE TABLE语句
+func (v *MiniQLVisitorImpl) VisitCreateTable(ctx *CreateTableContext) interface{} {
+	stmt := &CreateTableStmt{
+		BaseNode:  BaseNode{nodeType: CreateTableNode},
+		TableName: ctx.TableName().GetText(),
+	}
+
+	// 解析列定义
+	for _, colDef := range ctx.AllColumnDef() {
+		if col, ok := v.Visit(colDef).(*ColumnDef); ok {
+			stmt.Columns = append(stmt.Columns, col)
+		}
+	}
+
+	// 解析表约束
+	for _, constraint := range ctx.AllTableConstraint() {
+		if tc, ok := v.Visit(constraint).(*TableConstraint); ok {
+			stmt.Constraints = append(stmt.Constraints, tc)
+		}
+	}
+
+	return stmt
+}
+
+// VisitInsertStatement 访问INSERT语句
+func (v *MiniQLVisitorImpl) VisitInsertStatement(ctx *InsertStatementContext) interface{} {
+	stmt := &InsertStmt{
+		BaseNode: BaseNode{nodeType: InsertNode},
+		Table:    ctx.TableName().GetText(),
+	}
+
+	// 解析列名列表(如果有)
+	if cols := ctx.IdentifierList(); cols != nil {
+		for _, id := range cols.AllIdentifier() {
+			stmt.Columns = append(stmt.Columns, id.GetText())
+		}
 	}
 
 	// 解析值列表
-	if !p.expectPeek(TOK_LPAREN) {
-		return nil, fmt.Errorf("expected (")
+	if valueList := ctx.ValueList(0); valueList != nil {
+		for _, expr := range valueList.AllExpression() {
+			if value, ok := v.Visit(expr).(Node); ok {
+				stmt.Values = append(stmt.Values, value)
+			}
+		}
 	}
-	values, err := p.parseExpressionList()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Values = values
 
-	return stmt, nil
+	return stmt
 }
 
-// parseUpdate 解析UPDATE语句
-func (p *Parser) parseUpdate() (*UpdateStmt, error) {
+// VisitUpdateStatement 访问UPDATE语句
+func (v *MiniQLVisitorImpl) VisitUpdateStatement(ctx *UpdateStatementContext) interface{} {
 	stmt := &UpdateStmt{
-		Set: make(map[string]Expression),
+		BaseNode: BaseNode{nodeType: UpdateNode},
+		Table:    ctx.TableName().GetText(),
 	}
 
-	// 解析表名
-	if !p.expectPeek(TOK_IDENT) {
-		return nil, fmt.Errorf("expected table name")
-	}
-	stmt.Table = p.currentToken.Literal
-
-	// 解析SET
-	if !p.expectPeek(TOK_SET) {
-		return nil, fmt.Errorf("expected SET")
-	}
-
-	// 解析赋值列表
-	for {
-		if !p.expectPeek(TOK_IDENT) {
-			return nil, fmt.Errorf("expected column name")
+	// 解析SET子句
+	for _, assignment := range ctx.AllUpdateAssignment() {
+		if assign, ok := v.Visit(assignment).(*UpdateAssignment); ok {
+			stmt.Assignments = append(stmt.Assignments, assign)
 		}
-		column := p.currentToken.Literal
-
-		if !p.expectPeek(TOK_EQ) {
-			return nil, fmt.Errorf("expected =")
-		}
-
-		p.nextToken()
-		value, err := p.parseExpression(LOWEST)
-		if err != nil {
-			return nil, err
-		}
-		stmt.Set[column] = value
-
-		if !p.peekTokenIs(TOK_COMMA) {
-			break
-		}
-		p.nextToken()
 	}
 
 	// 解析WHERE子句
-	if p.peekTokenIs(TOK_WHERE) {
-		p.nextToken()
-		where, err := p.parseExpression(LOWEST)
-		if err != nil {
-			return nil, err
+	if where := ctx.Expression(); where != nil {
+		if condition, ok := v.Visit(where).(Node); ok {
+			stmt.Where = &WhereClause{
+				BaseNode:  BaseNode{nodeType: WhereNode},
+				Condition: condition,
+			}
 		}
-		stmt.Where = where
 	}
 
-	return stmt, nil
+	return stmt
 }
 
-// parseDelete 解析DELETE语句
-func (p *Parser) parseDelete() (*DeleteStmt, error) {
-	stmt := &DeleteStmt{}
-
-	// 解析FROM
-	if !p.expectPeek(TOK_FROM) {
-		return nil, fmt.Errorf("expected FROM")
+// VisitDeleteStatement 访问DELETE语句
+func (v *MiniQLVisitorImpl) VisitDeleteStatement(ctx *DeleteStatementContext) interface{} {
+	stmt := &DeleteStmt{
+		BaseNode: BaseNode{nodeType: DeleteNode},
+		Table:    ctx.TableName().GetText(),
 	}
-
-	// 解析表名
-	if !p.expectPeek(TOK_IDENT) {
-		return nil, fmt.Errorf("expected table name")
-	}
-	stmt.Table = p.currentToken.Literal
 
 	// 解析WHERE子句
-	if p.peekTokenIs(TOK_WHERE) {
-		p.nextToken()
-		where, err := p.parseExpression(LOWEST)
-		if err != nil {
-			return nil, err
-		}
-		stmt.Where = where
-	}
-
-	return stmt, nil
-}
-
-// 表达式优先级
-const (
-	LOWEST      = iota
-	EQUALS      // ==
-	LESSGREATER // > or <
-	SUM         // +
-	PRODUCT     // *
-	PREFIX      // -X or !X
-	CALL        // myFunction(X)
-)
-
-var precedences = map[TokenType]int{
-	TOK_EQ:       EQUALS,
-	TOK_NEQ:      EQUALS,
-	TOK_LT:       LESSGREATER,
-	TOK_GT:       LESSGREATER,
-	TOK_LTE:      LESSGREATER,
-	TOK_GTE:      LESSGREATER,
-	TOK_PLUS:     SUM,
-	TOK_MINUS:    SUM,
-	TOK_MULTIPLY: PRODUCT,
-	TOK_DIVIDE:   PRODUCT,
-	TOK_LPAREN:   CALL,
-}
-
-// parseExpression 解析表达式
-func (p *Parser) parseExpression(precedence int) (Expression, error) {
-	prefix := p.prefixParseFns(p.currentToken.Type)
-	if prefix == nil {
-		return nil, fmt.Errorf("no prefix parse function for %s", p.currentToken.Type)
-	}
-
-	leftExp := prefix()
-
-	for !p.peekTokenIs(TOK_SEMICOLON) && precedence < p.peekPrecedence() {
-		infix := p.infixParseFns(p.peekToken.Type)
-		if infix == nil {
-			return leftExp, nil
-		}
-
-		p.nextToken()
-		leftExp = infix(leftExp)
-	}
-
-	return leftExp, nil
-}
-
-// 辅助方法
-
-func (p *Parser) nextToken() {
-	p.currentToken = p.peekToken
-	p.peekToken = p.lexer.NextToken()
-}
-
-func (p *Parser) currentTokenIs(t TokenType) bool {
-	return p.currentToken.Type == t
-}
-
-func (p *Parser) peekTokenIs(t TokenType) bool {
-	return p.peekToken.Type == t
-}
-
-func (p *Parser) expectPeek(t TokenType) bool {
-	if p.peekTokenIs(t) {
-		p.nextToken()
-		return true
-	}
-	p.peekError(t)
-	return false
-}
-
-func (p *Parser) peekError(t TokenType) {
-	msg := fmt.Sprintf("expected next token to be %s, got %s instead",
-		t, p.peekToken.Type)
-	p.errors = append(p.errors, msg)
-}
-
-func (p *Parser) Errors() []string {
-	return p.errors
-}
-
-// prefixParseFns 返回前缀表达式解析函数
-func (p *Parser) prefixParseFns(tokenType TokenType) func() Expression {
-	switch tokenType {
-	case TOK_IDENT:
-		return p.parseIdentifier
-	case TOK_STRING, TOK_NUMBER:
-		return p.parseLiteral
-	case TOK_MINUS:
-		return p.parsePrefixExpression
-	case TOK_LPAREN:
-		return p.parseGroupedExpression
-	default:
-		return nil
-	}
-}
-
-// infixParseFns 返回中缀表达式解析函数
-func (p *Parser) infixParseFns(tokenType TokenType) func(Expression) Expression {
-	switch tokenType {
-	case TOK_PLUS, TOK_MINUS, TOK_MULTIPLY, TOK_DIVIDE:
-		return p.parseBinaryExpression
-	case TOK_EQ, TOK_NEQ, TOK_LT, TOK_GT, TOK_LTE, TOK_GTE:
-		return p.parseComparisonExpression
-	default:
-		return nil
-	}
-}
-
-// 具体的解析函数实现...
-
-// parseCreate 解析CREATE语句
-func (p *Parser) parseCreate() (*CreateTableStmt, error) {
-	stmt := &CreateTableStmt{}
-
-	// 期望下一个token是TABLE
-	if !p.expectPeek(TOK_TABLE) {
-		return nil, fmt.Errorf("expected TABLE after CREATE")
-	}
-
-	// 解析表名
-	if !p.expectPeek(TOK_IDENT) {
-		return nil, fmt.Errorf("expected table name")
-	}
-	stmt.TableName = p.currentToken.Literal
-
-	// 解析列定义
-	if !p.expectPeek(TOK_LPAREN) {
-		return nil, fmt.Errorf("expected (")
-	}
-
-	columns, err := p.parseColumnDefs()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Columns = columns
-
-	return stmt, nil
-}
-
-// parseColumnDefs 解析列定义
-func (p *Parser) parseColumnDefs() ([]ColumnDef, error) {
-	var columns []ColumnDef
-
-	for {
-		if p.peekTokenIs(TOK_RPAREN) {
-			p.nextToken()
-			break
-		}
-
-		col, err := p.parseColumnDef()
-		if err != nil {
-			return nil, err
-		}
-		columns = append(columns, col)
-
-		if !p.peekTokenIs(TOK_COMMA) {
-			if !p.expectPeek(TOK_RPAREN) {
-				return nil, fmt.Errorf("expected , or )")
+	if where := ctx.Expression(); where != nil {
+		if condition, ok := v.Visit(where).(Node); ok {
+			stmt.Where = &WhereClause{
+				BaseNode:  BaseNode{nodeType: WhereNode},
+				Condition: condition,
 			}
-			break
-		}
-		p.nextToken()
-	}
-
-	return columns, nil
-}
-
-// parseColumnDef 解析单个列定义
-func (p *Parser) parseColumnDef() (ColumnDef, error) {
-	var col ColumnDef
-
-	if !p.expectPeek(TOK_IDENT) {
-		return col, fmt.Errorf("expected column name")
-	}
-	col.Name = p.currentToken.Literal
-
-	if !p.expectPeek(TOK_IDENT) {
-		return col, fmt.Errorf("expected data type")
-	}
-	col.DataType = p.currentToken.Literal
-
-	// 检查是否有NOT NULL约束
-	if p.peekTokenIs(TOK_IDENT) {
-		p.nextToken()
-		if p.currentToken.Literal == "NOT" {
-			if !p.expectPeek(TOK_IDENT) || p.currentToken.Literal != "NULL" {
-				return col, fmt.Errorf("expected NULL after NOT")
-			}
-			col.NotNull = true
 		}
 	}
 
-	return col, nil
+	return stmt
 }
 
-// parseIdentifier 解析标识符
-func (p *Parser) parseIdentifier() Expression {
-	return &Identifier{Name: p.currentToken.Literal}
-}
-
-// parseLiteral 解析字面量
-func (p *Parser) parseLiteral() Expression {
-	return &Literal{
-		Value: p.currentToken.Literal,
-		Type:  string(p.currentToken.Type),
+// VisitLiteral 访问字面量
+func (v *MiniQLVisitorImpl) VisitLiteral(ctx *LiteralContext) interface{} {
+	if ctx.STRING() != nil {
+		return ctx.STRING().GetText()
 	}
-}
-
-// parsePrefixExpression 解析前缀表达式
-func (p *Parser) parsePrefixExpression() Expression {
-	expression := &BinaryExpr{
-		Operator: p.currentToken.Literal,
+	if ctx.INTEGER() != nil {
+		return ctx.INTEGER().GetText()
 	}
-
-	p.nextToken()
-	right, err := p.parseExpression(PREFIX)
-	if err != nil {
+	if ctx.FLOAT() != nil {
+		return ctx.FLOAT().GetText()
+	}
+	if ctx.NULL() != nil {
 		return nil
-	}
-	expression.Right = right
-
-	return expression
-}
-
-// parseGroupedExpression 解析括号表达式
-func (p *Parser) parseGroupedExpression() Expression {
-	p.nextToken()
-	exp, err := p.parseExpression(LOWEST)
-	if err != nil {
-		return nil
-	}
-
-	if !p.expectPeek(TOK_RPAREN) {
-		return nil
-	}
-
-	return exp
-}
-
-// parseBinaryExpression 解析二元表达式
-func (p *Parser) parseBinaryExpression(left Expression) Expression {
-	expression := &BinaryExpr{
-		Left:     left,
-		Operator: p.currentToken.Literal,
-	}
-
-	precedence := p.curPrecedence()
-	p.nextToken()
-	right, err := p.parseExpression(precedence)
-	if err != nil {
-		return nil
-	}
-	expression.Right = right
-
-	return expression
-}
-
-// parseComparisonExpression 解析比较表达式
-func (p *Parser) parseComparisonExpression(left Expression) Expression {
-	expression := &ComparisonExpr{
-		Left:     left,
-		Operator: p.currentToken.Literal,
-	}
-
-	precedence := p.curPrecedence()
-	p.nextToken()
-	right, err := p.parseExpression(precedence)
-	if err != nil {
-		return nil
-	}
-	expression.Right = right
-
-	return expression
-}
-
-// peekPrecedence 获取下一个token的优先级
-func (p *Parser) peekPrecedence() int {
-	if p, ok := precedences[p.peekToken.Type]; ok {
-		return p
-	}
-	return LOWEST
-}
-
-// curPrecedence 获取当前token的优先级
-func (p *Parser) curPrecedence() int {
-	if p, ok := precedences[p.currentToken.Type]; ok {
-		return p
-	}
-	return LOWEST
-}
-
-// 添加详细的错误类型
-type ParseError struct {
-	Message  string
-	Line     int
-	Column   int
-	Token    Token
-	Expected string
-}
-
-func (e *ParseError) Error() string {
-	return fmt.Sprintf("syntax error at line %d, column %d: %s (got %s, expected %s)",
-		e.Line, e.Column, e.Message, e.Token.Literal, e.Expected)
-}
-
-// 添加表达式验证
-func (p *Parser) validateExpression(expr Expression) error {
-	switch e := expr.(type) {
-	case *BinaryExpr:
-		if err := p.validateBinaryOperator(e.Operator); err != nil {
-			return err
-		}
-		if err := p.validateExpression(e.Left); err != nil {
-			return err
-		}
-		return p.validateExpression(e.Right)
-
-	case *ComparisonExpr:
-		if err := p.validateComparisonOperator(e.Operator); err != nil {
-			return err
-		}
-		if err := p.validateExpression(e.Left); err != nil {
-			return err
-		}
-		return p.validateExpression(e.Right)
 	}
 	return nil
 }
 
-// parseExpressionList 解析表达式列表
-func (p *Parser) parseExpressionList() ([]Expression, error) {
-	var expressions []Expression
-
-	for {
-		expr, err := p.parseExpression(LOWEST)
-		if err != nil {
-			return nil, err
-		}
-		expressions = append(expressions, expr)
-
-		if !p.peekTokenIs(TOK_COMMA) {
-			break
-		}
-		p.nextToken()
-	}
-
-	return expressions, nil
+// VisitIdentifier 访问标识符
+func (v *MiniQLVisitorImpl) VisitIdentifier(ctx *IdentifierContext) interface{} {
+	return ctx.IDENTIFIER().GetText()
 }
 
-// parseOrderBy 解析ORDER BY子句
-func (p *Parser) parseOrderBy() ([]OrderByExpr, error) {
-	var orderBy []OrderByExpr
-
-	for {
-		expr, err := p.parseExpression(LOWEST)
-		if err != nil {
-			return nil, err
-		}
-
-		ascending := true
-		if p.peekTokenIs(TOK_DESC) {
-			ascending = false
-			p.nextToken()
-		}
-
-		orderBy = append(orderBy, OrderByExpr{
-			Expr:      expr,
-			Ascending: ascending,
-		})
-
-		if !p.peekTokenIs(TOK_COMMA) {
-			break
-		}
-		p.nextToken()
-	}
-
-	return orderBy, nil
+// CreateTableStmt CREATE TABLE语句节点
+type CreateTableStmt struct {
+	BaseNode
+	TableName   string             // 表名
+	Columns     []*ColumnDef       // 列定义
+	Constraints []*TableConstraint // 表约束
 }
 
-// validateBinaryOperator 验证二元运算符
-func (p *Parser) validateBinaryOperator(operator string) error {
-	validOperators := map[string]bool{
-		"+": true,
-		"-": true,
-		"*": true,
-		"/": true,
-	}
-
-	if !validOperators[operator] {
-		return fmt.Errorf("invalid binary operator: %s", operator)
-	}
-	return nil
+// ColumnDef 列定义
+type ColumnDef struct {
+	Name     string   // 列名
+	DataType string   // 数据类型
+	Options  []string // 列选项(NOT NULL等)
 }
 
-// validateComparisonOperator 验证比较运算符
-func (p *Parser) validateComparisonOperator(operator string) error {
-	validOperators := map[string]bool{
-		"=":  true,
-		"!=": true,
-		"<":  true,
-		">":  true,
-		"<=": true,
-		">=": true,
-	}
-
-	if !validOperators[operator] {
-		return fmt.Errorf("invalid comparison operator: %s", operator)
-	}
-	return nil
+// TableConstraint 表约束
+type TableConstraint struct {
+	Type       string   // 约束类型(PRIMARY KEY等)
+	Columns    []string // 涉及的列
+	Definition string   // 约束定义
 }
 
-// parseIdentList 解析标识符列表
-func (p *Parser) parseIdentList() ([]string, error) {
-	var identifiers []string
-
-	// 解析第一个标识符
-	if !p.expectPeek(TOK_IDENT) {
-		return nil, fmt.Errorf("expected identifier, got %s", p.peekToken.Type)
-	}
-	identifiers = append(identifiers, p.currentToken.Literal)
-
-	// 解析后续的标识符
-	for p.peekTokenIs(TOK_COMMA) {
-		p.nextToken() // 跳过逗号
-		if !p.expectPeek(TOK_IDENT) {
-			return nil, fmt.Errorf("expected identifier after comma, got %s", p.peekToken.Type)
-		}
-		identifiers = append(identifiers, p.currentToken.Literal)
-	}
-
-	// 检查右括号
-	if !p.expectPeek(TOK_RPAREN) {
-		return nil, fmt.Errorf("expected ), got %s", p.peekToken.Type)
-	}
-
-	return identifiers, nil
-}
-
-// ParseWhereExpression 专门用于解析WHERE条件表达式
-func (p *Parser) ParseWhereExpression() (Expression, error) {
-	expr, err := p.parseExpression(LOWEST)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse WHERE expression: %v", err)
-	}
-	return expr, nil
-}
+// TODO: 其他必要的访问方法实现...
