@@ -1,115 +1,136 @@
 # MiniDB
 
-MiniDB is a lightweight HTAP (Hybrid Transactional/Analytical Processing) database system implemented in Go. It supports both OLTP and OLAP workloads through a hybrid storage engine.
+MiniDB is a lightweight HTAP (Hybrid Transactional/Analytical Processing) database system implemented in Go. It aims to support both OLTP and OLAP workloads efficiently and may be extended to a distributed database in the future.
 
 ## Features
 
 ### Storage Engine
-- Hybrid storage architecture:
-  - Row Store for OLTP workloads
-  - Column Store for OLAP workloads
-- Thread-safe concurrent access with RWMutex
-- Basic transaction support
+
+- Hybrid storage architecture: Currently leveraging in-memory row store with future consideration for column store integration for optimized analytical queries.
+- Thread-safe concurrent access managed with appropriate synchronization primitives.
+- WAL (Write-Ahead Logging) support for basic transaction durability.
 
 ### Query Processing
+
 - SQL Query Support:
   - DDL (Data Definition Language):
-    - CREATE TABLE - Create tables with schema definition
-    - DROP TABLE - Remove existing tables
-    - SHOW TABLES - List all tables
+    - `CREATE TABLE` - Create tables with schema definition
+    - `DROP TABLE` - Remove existing tables
   - DML (Data Manipulation Language):
-    - SELECT - Query data with WHERE, JOIN, GROUP BY clauses
-    - INSERT - Add new records
-    - UPDATE - Modify existing records with WHERE clause
-    - DELETE - Remove records with WHERE clause
-- Query result caching with TTL
-- Basic index support for faster lookups
+    - `SELECT` - Query data with `WHERE`, `JOIN`, `GROUP BY` clauses
+    - `INSERT` - Add new records
+    - `UPDATE` - Modify existing records with `WHERE` clause
+    - `DELETE` - Remove records with `WHERE` clause
+- Basic index support for faster lookups on indexed columns.
 
 ### Network Layer
-- TCP server/client architecture
-- Connection pooling with max connections limit
-- Timeout handling and retry mechanism
-- Graceful shutdown support
+
+- TCP server architecture to handle client connections.
+- Connection handling with basic timeout management.
 
 ### Query Features
-- WHERE clause with comparison operators (=, >, <, >=, <=, <>, LIKE, IN)
-- JOIN operations (INNER JOIN)
-- GROUP BY with basic aggregation
-- Column aliases (AS)
-- LIMIT and OFFSET support
-- Result formatting in table style
+
+- `WHERE` clause with comparison operators (`=`, `>`, `<`, `>=`, `<=`, `<>`, `LIKE`, `IN`)
+- `JOIN` operations (`INNER JOIN`)
+- `GROUP BY` with basic aggregation functions (`COUNT`, `AVG`, `SUM`, `MIN`, `MAX`).
+- Column aliases (`AS`)
 
 ## Project Structure
 
 ```bash
 minidb/
 ├── cmd/
-│   └── minidb/
-│       └── main.go           # Application entry point
+│   └── server/                 # Application entry point
+│       └── main.go             # Starts the server, handles client connections
+│       └── handler.go          # Handles query requests, calls Parser, Optimizer, Executor
 ├── internal/
-│   ├── cache/               # Query result caching
-│   │   └── cache.go
-│   ├── executor/           # SQL execution engine
-│   │   ├── executor.go
-│   │   ├── formatter.go
-│   │   └── visitor.go
-│   ├── index/             # Index management
-│   │   └── index.go
-│   ├── network/           # Network layer
-│   │   └── server.go
-│   ├── parser/            # SQL parser
-│   │   ├── ast.go
-│   │   ├── lexer.go
-│   │   ├── parser.go
-│   │   └── visitor.go
-│   └── storage/           # Storage engine
-│       ├── column_store.go
-│       ├── engine.go
-│       └── row_store.go
+│   ├── catalog/                # Metadata management
+│   │   ├── catalog.go          # Catalog struct, database/table management
+│   │   ├── metadata.go         # TableMeta, ColumnMeta definitions
+│   ├── executor/               # SQL execution engine
+│   │   ├── executor.go         # Receives query plan, drives execution
+│   │   ├── operators/          # Execution operators
+│   │   │   ├── table_scan.go    # Table scan
+│   │   │   ├── filter.go        # Filter
+│   │   │   ├── join.go          # Join (Nested Loop)
+│   │   │   └── aggregate.go     # Aggregate
+│   │   ├── interface.go        # Defines Executor, Operator interfaces
+│   │   └── context.go          # Execution context
+│   ├── optimizer/              # Query optimizer
+│   │   ├── optimizer.go        # Receives AST, drives optimization, generates query plan
+│   │   ├── plan.go             # Query plan (operator tree) definition
+│   ├── parser/                 # SQL parser
+│   │   ├── MiniQL.g4           # ANTLR4 grammar definition
+│   │   ├── gen/                  # ANTLR-generated code
+│   │   │   ├── MiniQLLexer.go
+│   │   │   └── MiniQLParser.go
+│   │   ├── parser.go           # Encapsulates ANTLR parsing, builds AST
+│   │   └── visitor.go          # AST Visitor implementation (syntax checking, etc.)
+│   ├── storage/                # Storage engine
+│   │   ├── memtable.go         # In-memory table
+│   │   ├── wal.go              # WAL (Write-Ahead Log)
+│   │   ├── storage.go          # Defines storage engine interface
+│   │   └── index.go            # Index (BTree)
+│   └── types/                  # Data type system
+│       └── types.go            # Defines data types, conversions, etc.
+├── proto/                      # (Optional) Protobuf definitions (distributed/RPC)
+│   └── minidb.proto
+└── test/
+    ├── catalog_test.go       # Catalog unit tests
+    ├── executor_test.go      # Executor unit tests
+    ├── parser_test.go        # Parser unit tests
+    └── storage_test.go       # Storage unit tests
 ```
 
 ## Current Limitations
 
-- In-memory storage only (no persistence)
-- Basic transaction support (no MVCC)
-- Limited JOIN support (only INNER JOIN)
-- Basic GROUP BY support (limited aggregation functions)
-- No query optimizer
-- No support for foreign keys or constraints
-- No support for prepared statements
-- No authentication/authorization
+- Primarily in-memory storage. Persistence is achieved through WAL but requires explicit recovery.
+- Basic transaction support (no MVCC or snapshot isolation).
+- Limited JOIN support (Nested Loop INNER JOIN only).
+- Basic `GROUP BY` support with limited aggregation functions.
+- No cost-based query optimizer; uses rule-based optimizations.
+- No support for foreign keys or constraints.
+- No support for prepared statements.
+- No built-in authentication/authorization.
 
 ## Future Improvements
 
-1. Storage
-   - Persistent storage
-   - Write-ahead logging
-   - MVCC transaction support
-   - Buffer pool management
+The roadmap for MiniDB includes several exciting enhancements, aiming to improve its functionality, performance, and scalability.  A key consideration is the potential to evolve MiniDB into a distributed database system.
 
-2. Query Processing
-   - Cost-based query optimizer
-   - More JOIN types (LEFT, RIGHT, FULL)
-   - Advanced aggregation functions
-   - Window functions
-   - Subqueries
+1. **Storage:**
+   - Full persistence with snapshotting and recovery mechanisms.
+   - Write-ahead logging enhancements for robust transaction support.
+   - MVCC transaction support for concurrency and isolation.
+   - Buffer pool management for efficient memory utilization.
+   - Columnar storage option for analytic workloads.
 
-3. Features
-   - Authentication and authorization
-   - Prepared statements
-   - Foreign key constraints
-   - Triggers
-   - Views
+2. **Query Processing:**
+   - Cost-based query optimizer for intelligent query plan selection.
+   - Support for more JOIN types (LEFT, RIGHT, FULL).
+   - Advanced aggregation functions (e.g., window functions, percentiles).
+   - Subquery support.
 
-4. Performance
-   - Query plan caching
-   - Better index structures (B+tree)
-   - Statistics collection
-   - Query parallelization
+3. **Features:**
+   - Authentication and authorization mechanisms for secure access.
+   - Prepared statements for parameterized queries.
+   - Foreign key constraints for data integrity.
+   - Triggers for event-driven actions.
+   - Views for simplified query interfaces.
+
+4. **Performance:**
+   - Query plan caching for repeated queries.
+   - Enhanced index structures (e.g., B+tree) for efficient lookups.
+   - Statistics collection for optimizer hints.
+   - Query parallelization for improved throughput.
+
+5. **Distribution:**
+   - Sharding of data across multiple nodes.
+   - Distributed query execution.
+   - Consensus algorithms for data consistency and fault tolerance.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please feel free to submit a Pull Request following established coding conventions and testing guidelines.
 
 ## License
 
@@ -118,15 +139,17 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Usage Examples
 
 ### Starting the Server
+
 ```bash
-# Start server on default port 8086
+# Start server on default port 7205
 ./minidb
 
 # Start server on custom port
-./minidb -port 3306
+./minidb -port 7205
 ```
 
 ### DDL Operations
+
 ```sql
 -- Create a new table
 CREATE TABLE users (
@@ -145,6 +168,7 @@ DROP TABLE users;
 ```
 
 ### DML Operations
+
 ```sql
 -- Insert data
 INSERT INTO users VALUES (1, 'John Doe', 'john@example.com', 25, '2024-01-01');
@@ -162,48 +186,40 @@ SELECT * FROM users WHERE age IN (25, 30);
 SELECT * FROM users WHERE age >= 25 AND age <= 35;
 
 -- JOIN operations
-SELECT u.name, o.order_id, o.amount 
-FROM users u 
+SELECT u.name, o.order_id, o.amount
+FROM users u
 JOIN orders o ON u.id = o.user_id;
 
 -- GROUP BY with aggregation
-SELECT age, COUNT(*) as count 
-FROM users 
+SELECT age, COUNT(*) as count
+FROM users
 GROUP BY age;
 
 -- GROUP BY with HAVING
-SELECT age, COUNT(*) as count 
-FROM users 
-GROUP BY age 
+SELECT age, COUNT(*) as count
+FROM users
+GROUP BY age
 HAVING count > 1;
 
 -- Update data
-UPDATE users 
-SET email = 'john.doe@example.com' 
+UPDATE users
+SET email = 'john.doe@example.com'
 WHERE id = 1;
 
 -- Delete data
-DELETE FROM users 
+DELETE FROM users
 WHERE age < 25;
 ```
 
-### Using Cache
-```sql
--- First query execution (stored in cache)
-SELECT * FROM users WHERE age > 30;
-
--- Subsequent identical queries within TTL will be served from cache
-SELECT * FROM users WHERE age > 30;
-```
-
 ### Using Indexes
+
 ```sql
 -- Queries on indexed columns will be automatically optimized
 SELECT * FROM users WHERE id = 1;
-SELECT * FROM users WHERE email = 'john@example.com';
 ```
 
 ### Formatting Examples
+
 ```sql
 -- Table style output
 SELECT name, age FROM users;
@@ -222,6 +238,7 @@ Empty set
 ```
 
 ### Error Handling Examples
+
 ```sql
 -- Table already exists
 CREATE TABLE users (...);
@@ -237,10 +254,12 @@ Error: syntax error near 'WHERE'
 ```
 
 ### Client Connection Example
+
 ```bash
 # Using telnet
-telnet localhost 8086
+telnet localhost 7205
 
 # Using netcat
-nc localhost 8086
+nc localhost 7205
 ```
+

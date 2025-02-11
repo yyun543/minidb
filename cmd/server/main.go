@@ -10,7 +10,7 @@ import (
 
 const (
 	HOST = "localhost"
-	PORT = "3275"
+	PORT = "7205"
 )
 
 func main() {
