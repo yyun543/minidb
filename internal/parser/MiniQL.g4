@@ -10,6 +10,10 @@ grammar MiniQL;
  * 注意：为了避免关键词和标识符冲突，将关键词定义放在IDENTIFIER前。
  *====================================================*/
 
+// 注释规则（放在最前面，优先级最高）
+SINGLE_LINE_COMMENT: '--' ~[\r\n]* -> skip;
+MULTI_LINE_COMMENT: '/*' .*? '*/' -> skip;
+
 // 关键字
 SELECT: S E L E C T;
 FROM: F R O M;
