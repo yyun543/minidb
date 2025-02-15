@@ -50,7 +50,7 @@ func TestExecutor(t *testing.T) {
 				Table:   "users",
 				Columns: []string{"id", "name"},
 				Values: []parser.Node{
-					&parser.NumberLiteral{Value: "1"},
+					&parser.IntLiteral{Value: 1},
 					&parser.StringLiteral{Value: "test"},
 				},
 			},
@@ -77,7 +77,7 @@ func TestExecutor(t *testing.T) {
 					Condition: &parser.BinaryExpr{
 						Left:     &parser.Identifier{Value: "id"},
 						Operator: "=",
-						Right:    &parser.NumberLiteral{Value: "1"},
+						Right:    &parser.IntLiteral{Value: 1},
 					},
 				},
 			},
@@ -98,7 +98,7 @@ func TestExecutor(t *testing.T) {
 					Condition: &parser.BinaryExpr{
 						Left:     &parser.Identifier{Value: "id"},
 						Operator: "=",
-						Right:    &parser.NumberLiteral{Value: "1"},
+						Right:    &parser.IntLiteral{Value: 1},
 					},
 				},
 			},
@@ -120,7 +120,7 @@ func setupTestDB(t *testing.T, cat *catalog.Catalog) {
 
 	table := &catalog.TableMeta{
 		Name: "users",
-		Columns: []catalog.Column{
+		Columns: []catalog.ColumnMeta{
 			{Name: "id", Type: "INT64", NotNull: true},
 			{Name: "name", Type: "STRING", NotNull: true},
 		},

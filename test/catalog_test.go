@@ -39,7 +39,7 @@ func TestCatalog(t *testing.T) {
 		table := &catalog.TableMeta{
 			ID:   time.Now().UnixNano(),
 			Name: "users",
-			Columns: []catalog.Column{
+			Columns: []catalog.ColumnMeta{
 				{
 					ID:      1,
 					Name:    "id",

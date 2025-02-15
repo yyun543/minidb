@@ -146,7 +146,7 @@ parse
  ;
 
 sqlStatement
- : (ddlStatement | dmlStatement | dqlStatement | dclStatement | utilityStatement) SEMICOLON
+ : (ddlStatement | dmlStatement | dqlStatement | dclStatement | utilityStatement) SEMICOLON?
  ;
 
 // 语句类型定义

@@ -10,6 +10,39 @@ import (
 )
 
 func TestParser(t *testing.T) {
+	// 测试CREATE DATABASE语句解析
+	t.Run("ParseCreateDatabase", func(t *testing.T) {
+		sql := "CREATE DATABASE test_db"
+		stmt, err := parser.Parse(sql)
+		assert.NoError(t, err)
+		assert.NotNil(t, stmt)
+
+		createDbStmt, ok := stmt.(*parser.CreateDatabaseStmt)
+		assert.True(t, ok)
+		assert.Equal(t, "test_db", createDbStmt.Database)
+	})
+
+	// 测试CREATE TABLE语句解析
+	t.Run("ParseCreateTable", func(t *testing.T) {
+		sql := `CREATE TABLE users (
+			id INTEGER NOT NULL PRIMARY KEY,
+			name VARCHAR(255) NOT NULL,
+			age INTEGER,
+			balance DOUBLE,
+			locked BOOLEAN,
+			created_at TIMESTAMP,
+			PRIMARY KEY (id, name)
+		)`
+		stmt, err := parser.Parse(sql)
+		assert.NoError(t, err)
+		assert.NotNil(t, stmt)
+
+		createStmt, ok := stmt.(*parser.CreateTableStmt)
+		assert.True(t, ok)
+		assert.Equal(t, "users", createStmt.Table)
+		assert.Len(t, createStmt.Columns, 6)
+	})
+
 	// 测试SELECT语句解析
 	t.Run("ParseSelect", func(t *testing.T) {
 		sql := "SELECT id, name FROM users WHERE age > 18"
@@ -63,24 +96,5 @@ func TestParser(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, "users", deleteStmt.Table)
 		assert.NotNil(t, deleteStmt.Where)
-	})
-
-	// 测试CREATE TABLE语句解析
-	t.Run("ParseCreateTable", func(t *testing.T) {
-		sql := `
-		CREATE TABLE users (
-			id INT64 NOT NULL PRIMARY KEY,
-			name STRING NOT NULL,
-			age INT32,
-			created_at TIMESTAMP
-		)`
-		stmt, err := parser.Parse(sql)
-		assert.NoError(t, err)
-		assert.NotNil(t, stmt)
-
-		createStmt, ok := stmt.(*parser.CreateTableStmt)
-		assert.True(t, ok)
-		assert.Equal(t, "users", createStmt.Table)
-		assert.Len(t, createStmt.Columns, 4)
 	})
 }
