@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"github.com/yyun543/minidb/internal/parser"
 
 	"github.com/yyun543/minidb/internal/catalog"
 	"github.com/yyun543/minidb/internal/executor/operators"
@@ -97,7 +98,7 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.LogicalPlan, ctx *Context) 
 }
 
 // getResultHeaders 获取结果集列名
-func (e *ExecutorImpl) getResultHeaders(plan *optimizer.LogicalPlan) []string {
+func (e *ExecutorImpl) getResultHeaders(plan *optimizer.LogicalPlan) []*parser.ColumnItem {
 	switch plan.Type {
 	case optimizer.SelectPlan:
 		props := plan.Properties.(*optimizer.SelectProperties)

@@ -32,7 +32,7 @@ type PlanProperties interface {
 
 // SelectProperties SELECT节点属性
 type SelectProperties struct {
-	Columns []string
+	Columns []*parser.ColumnItem
 }
 
 func (p *SelectProperties) Type() PlanType {

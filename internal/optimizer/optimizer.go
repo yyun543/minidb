@@ -82,7 +82,7 @@ func (o *Optimizer) convertSelect(stmt *parser.SelectStmt) *LogicalPlan {
 			Type: JoinPlan,
 			Properties: &JoinProperties{
 				JoinType:  join.JoinType,
-				Table:     join.Table,
+				Table:     join.Right.Table,
 				Condition: join.Condition,
 			},
 		})

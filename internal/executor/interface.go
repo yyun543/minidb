@@ -2,6 +2,7 @@ package executor
 
 import (
 	"github.com/yyun543/minidb/internal/optimizer"
+	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/types"
 )
 
@@ -25,13 +26,13 @@ type Operator interface {
 
 // ResultSet 查询结果集
 type ResultSet struct {
-	headers []string       // 列名
-	rows    []*types.Batch // 数据批次
-	curRow  int            // 当前行
+	headers []*parser.ColumnItem // 列名
+	rows    []*types.Batch       // 数据批次
+	curRow  int                  // 当前行
 }
 
 // Headers 获取结果集列名
-func (rs *ResultSet) Headers() []string {
+func (rs *ResultSet) Headers() []*parser.ColumnItem {
 	return rs.headers
 }
 

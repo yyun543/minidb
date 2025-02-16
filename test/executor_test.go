@@ -24,7 +24,10 @@ func TestExecutor(t *testing.T) {
 		plan := &optimizer.LogicalPlan{
 			Type: optimizer.SelectPlan,
 			Properties: &optimizer.SelectProperties{
-				Columns: []string{"id", "name"},
+				Columns: []*parser.ColumnItem{
+					{Column: "id", Alias: ""},
+					{Column: "name", Alias: ""},
+				},
 			},
 			Children: []*optimizer.LogicalPlan{
 				{

@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/antlr4-go/antlr/v4"
 )
@@ -270,179 +271,903 @@ func (v *MiniQLVisitorImpl) VisitTableConstraint(ctx *TableConstraintContext) in
 	return constraint
 }
 
-// TODO 访问 CreateIndex 语句
+// VisitCreateIndex 访问 CREATE INDEX 语句
 func (v *MiniQLVisitorImpl) VisitCreateIndex(ctx *CreateIndexContext) interface{} {
-	return nil
+	// 创建 CreateIndexStmt 节点
+	stmt := &CreateIndexStmt{
+		BaseNode: BaseNode{nodeType: CreateIndexNode},
+	}
+
+	// 获取索引名
+	if ctx.Identifier() != nil {
+		if result := v.Visit(ctx.Identifier()); result != nil {
+			switch t := result.(type) {
+			case string:
+				stmt.Name = t
+			case *Identifier:
+				stmt.Name = t.Value
+			}
+		}
+	}
+
+	// 获取表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			switch t := result.(type) {
+			case string:
+				stmt.Table = t
+			case *Identifier:
+				stmt.Table = t.Value
+			}
+		}
+	}
+
+	// 获取索引列列表
+	if ctx.IdentifierList() != nil {
+		if result := v.Visit(ctx.IdentifierList()); result != nil {
+			if cols, ok := result.([]string); ok {
+				stmt.Columns = cols
+			}
+		}
+	}
+
+	return stmt
 }
 
-// TODO 访问 DropTable 语句
+// VisitDropTable 访问 DROP TABLE 语句节点
 func (v *MiniQLVisitorImpl) VisitDropTable(ctx *DropTableContext) interface{} {
-	return nil
+	// 创建 DROP TABLE 语句节点
+	stmt := &DropTableStmt{
+		BaseNode: BaseNode{nodeType: DropTableNode},
+	}
+
+	// 获取表名
+	if ctx.TableName() != nil {
+		if tableName := v.Visit(ctx.TableName()); tableName != nil {
+			switch t := tableName.(type) {
+			case string:
+				stmt.Table = t
+			case *Identifier:
+				stmt.Table = t.Value
+			}
+		}
+	}
+
+	return stmt
 }
 
-// TODO 访问 DropDatabase 语句
+// VisitDropDatabase 访问 DROP DATABASE 语句
 func (v *MiniQLVisitorImpl) VisitDropDatabase(ctx *DropDatabaseContext) interface{} {
-	return nil
+	// 创建 DropDatabaseStmt 节点
+	stmt := &DropDatabaseStmt{
+		BaseNode: BaseNode{nodeType: DropDatabaseNode},
+	}
+
+	// 获取数据库名称
+	if ctx.Identifier() != nil {
+		// 直接获取标识符文本值，避免创建中间对象
+		stmt.Database = ctx.Identifier().GetText()
+	}
+
+	return stmt
 }
 
-// TODO 访问 InsertStatement 语句
+// VisitInsertStatement 访问 INSERT 语句节点
 func (v *MiniQLVisitorImpl) VisitInsertStatement(ctx *InsertStatementContext) interface{} {
-	return nil
+	// 创建 InsertStmt 节点
+	stmt := &InsertStmt{
+		BaseNode: BaseNode{nodeType: InsertNode},
+	}
+
+	// 获取表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			stmt.Table = result.(string)
+		}
+	}
+
+	// 获取列名列表（可选）
+	if ctx.IdentifierList() != nil {
+		if result := v.Visit(ctx.IdentifierList()); result != nil {
+			stmt.Columns = result.([]string)
+		}
+	}
+
+	// 获取值列表
+	for _, valueList := range ctx.AllValueList() {
+		if result := v.Visit(valueList); result != nil {
+			// ValueList 返回的是 []Node
+			stmt.Values = result.([]Node)
+		}
+	}
+
+	return stmt
 }
 
-// TODO 访问 UpdateStatement 语句
+// VisitUpdateStatement 访问UPDATE语句节点
 func (v *MiniQLVisitorImpl) VisitUpdateStatement(ctx *UpdateStatementContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 创建UPDATE语句节点
+	stmt := &UpdateStmt{
+		BaseNode: BaseNode{nodeType: UpdateNode},
+	}
+
+	// 获取表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			switch t := result.(type) {
+			case string:
+				stmt.Table = t
+			case *Identifier:
+				stmt.Table = t.Value
+			}
+		}
+	}
+
+	// 处理赋值列表
+	if ctx.AllUpdateAssignment() != nil {
+		assignments := make([]*UpdateAssignment, 0, len(ctx.AllUpdateAssignment()))
+		for _, assignCtx := range ctx.AllUpdateAssignment() {
+			if result := v.Visit(assignCtx); result != nil {
+				if assignment, ok := result.(*UpdateAssignment); ok {
+					assignments = append(assignments, assignment)
+				}
+			}
+		}
+		stmt.Assignments = assignments
+	}
+
+	// 处理WHERE子句
+	if ctx.WHERE() != nil && ctx.Expression() != nil {
+		if result := v.Visit(ctx.Expression()); result != nil {
+			if expr, ok := result.(Node); ok {
+				stmt.Where = &WhereClause{
+					BaseNode:  BaseNode{nodeType: WhereNode},
+					Condition: expr,
+				}
+			}
+		}
+	}
+
+	return stmt
 }
 
-// TODO 访问 DeleteStatement 语句
+// VisitDeleteStatement 访问 DELETE 语句节点
 func (v *MiniQLVisitorImpl) VisitDeleteStatement(ctx *DeleteStatementContext) interface{} {
-	return nil
+	// 创建 DeleteStmt 节点
+	stmt := &DeleteStmt{
+		BaseNode: BaseNode{nodeType: DeleteNode},
+	}
+
+	// 获取表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			switch t := result.(type) {
+			case string:
+				stmt.Table = t
+			case *Identifier:
+				stmt.Table = t.Value
+			}
+		}
+	}
+
+	// 处理 WHERE 子句
+	if ctx.WHERE() != nil && ctx.Expression() != nil {
+		if result := v.Visit(ctx.Expression()); result != nil {
+			if expr, ok := result.(Node); ok {
+				stmt.Where = &WhereClause{
+					BaseNode:  BaseNode{nodeType: WhereNode},
+					Condition: expr,
+				}
+			}
+		}
+	}
+
+	return stmt
 }
 
-// TODO 访问 SelectStatement 语句
+// VisitSelectStatement 访问 SELECT 语句节点
 func (v *MiniQLVisitorImpl) VisitSelectStatement(ctx *SelectStatementContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 创建 SelectStmt 节点
+	stmt := &SelectStmt{
+		BaseNode: BaseNode{nodeType: SelectNode},
+	}
+
+	// 处理 SELECT 列表
+	selectItems := ctx.AllSelectItem()
+	for _, itemCtx := range selectItems {
+		if result := v.Visit(itemCtx); result != nil {
+			switch item := result.(type) {
+			case *SelectItem:
+				// 如果是 SELECT *
+				if item.All {
+					stmt.All = true
+					// TODO 如果是 SELECT table.*
+					continue
+				}
+				// 普通列
+				if colItem, ok := item.Expr.(*ColumnItem); ok {
+					stmt.Columns = append(stmt.Columns, colItem)
+				}
+			case *ColumnItem:
+				stmt.Columns = append(stmt.Columns, item)
+			}
+		}
+	}
+
+	// 处理 FROM 子句
+	if ctx.TableReference() != nil {
+		if result := v.Visit(ctx.TableReference()); result != nil {
+			switch t := result.(type) {
+			case *TableRef:
+				stmt.From = t.Table
+				stmt.Joins = t.Joins
+				stmt.FromAlias = t.Alias
+			}
+		}
+	}
+
+	// 处理 WHERE 子句
+	if ctx.WHERE() != nil && ctx.Expression(0) != nil {
+		if result := v.Visit(ctx.Expression(0)); result != nil {
+			if expr, ok := result.(Node); ok {
+				stmt.Where = &WhereClause{
+					BaseNode:  BaseNode{nodeType: WhereNode},
+					Condition: expr,
+				}
+			}
+		}
+	}
+
+	// 处理 GROUP BY 子句
+	if ctx.GROUP() != nil && ctx.AllGroupByItem() != nil {
+		for _, item := range ctx.AllGroupByItem() {
+			if result := v.Visit(item); result != nil {
+				if expr, ok := result.(Node); ok {
+					stmt.GroupBy = append(stmt.GroupBy, expr)
+				}
+			}
+		}
+	}
+
+	// 处理 HAVING 子句
+	if ctx.HAVING() != nil && ctx.Expression(0) != nil {
+		if result := v.Visit(ctx.Expression(0)); result != nil {
+			if expr, ok := result.(Node); ok {
+				stmt.Having = expr
+			}
+		}
+	}
+
+	// 处理 ORDER BY 子句
+	if ctx.ORDER() != nil && ctx.AllOrderByItem() != nil {
+		for _, item := range ctx.AllOrderByItem() {
+			if result := v.Visit(item); result != nil {
+				if orderItem, ok := result.(*OrderByItem); ok {
+					stmt.OrderBy = append(stmt.OrderBy, orderItem)
+				}
+			}
+		}
+	}
+
+	// 处理 LIMIT 子句
+	if ctx.LIMIT() != nil && ctx.INTEGER_LITERAL() != nil {
+		limit, err := strconv.ParseInt(ctx.INTEGER_LITERAL().GetText(), 10, 64)
+		if err == nil {
+			stmt.Limit = limit
+		}
+	}
+
+	return stmt
 }
 
-// TODO 访问 SelectAll 语句
+// VisitSelectAll 访问 SELECT * 语句
 func (v *MiniQLVisitorImpl) VisitSelectAll(ctx *SelectAllContext) interface{} {
-	return nil
+	item := &SelectItem{
+		All: true,
+	}
+
+	// 如果有表名限定，设置表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			switch t := result.(type) {
+			case string:
+				item.Table = t
+			case *Identifier:
+				item.Table = t.Value
+			}
+		}
+	}
+
+	return item
 }
 
-// TODO 访问 SelectExpr 语句
+// VisitSelectExpr 访问 SELECT 表达式
 func (v *MiniQLVisitorImpl) VisitSelectExpr(ctx *SelectExprContext) interface{} {
-	return nil
+	// 创建SelectItem节点，初始状态未知类型
+	item := &ColumnItem{
+		BaseNode: BaseNode{nodeType: SelectItemNode},
+		Kind:     ColumnItemUnknown,
+	}
+
+	// 处理表达式
+	if ctx.Expression() != nil {
+		if result := v.Visit(ctx.Expression()); result != nil {
+			switch expr := result.(type) {
+			case *ColumnRef:
+				// 如果是列引用，直接设置表和列名
+				item.Column = expr.Column
+				if expr.Table != "" {
+					item.Table = expr.Table
+				}
+				item.Kind = ColumnItemColumn
+			case *FunctionCall:
+				// 如果是函数调用，记录整个函数调用节点
+				item.Expr = expr
+				item.Kind = ColumnItemFunction
+			case *BinaryExpr:
+				// 二元表达式
+				item.Expr = expr
+				item.Kind = ColumnItemExpression
+			case *IntegerLiteral, *FloatLiteral, *StringLiteral, *Literal:
+				// 如果直接是字面量
+				if node, ok := expr.(Node); ok {
+					item.Expr = node
+				}
+				item.Kind = ColumnItemLiteral
+			default:
+				// 其他类型的表达式节点
+				if node, ok := expr.(Node); ok {
+					item.Expr = node
+					item.Kind = ColumnItemExpression
+				}
+			}
+		}
+	}
+
+	// 处理可能的别名
+	if ctx.Identifier() != nil {
+		if result := v.Visit(ctx.Identifier()); result != nil {
+			switch t := result.(type) {
+			case string:
+				item.Alias = t
+			case *Identifier:
+				item.Alias = t.Value
+			}
+		}
+	}
+
+	return item
 }
 
-// TODO 访问 TableRefBase 语句
+// VisitTableRefBase 访问基本表引用
 func (v *MiniQLVisitorImpl) VisitTableRefBase(ctx *TableRefBaseContext) interface{} {
-	return nil
+	tableRef := &TableRef{
+		BaseNode: BaseNode{nodeType: TableRefNode},
+	}
+
+	// 处理表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			switch t := result.(type) {
+			case string:
+				tableRef.Table = t
+			case *Identifier:
+				tableRef.Table = t.Value
+			}
+		}
+	}
+
+	// 处理可选的别名
+	if ctx.Identifier() != nil {
+		if result := v.Visit(ctx.Identifier()); result != nil {
+			switch t := result.(type) {
+			case string:
+				tableRef.Alias = t
+			case *Identifier:
+				tableRef.Alias = t.Value
+			}
+		}
+	}
+
+	return tableRef
 }
 
-// TODO 访问 TableRefJoin 语句
-func (v *MiniQLVisitorImpl) VisitTableRefJoin(ctx *TableRefJoinContext) interface{} {
-	return nil
+// VisitTableReference 访问表引用节点
+func (v *MiniQLVisitorImpl) VisitTableReference(ctx *TableReferenceContext) interface{} {
+	if ctx == nil {
+		return nil
+	}
+
+	// 处理基本表引用（无JOIN）
+	if len(ctx.GetChildren()) == 1 {
+		return v.Visit(ctx.TableReferenceAtom())
+	}
+
+	// 处理带JOIN的表引用
+	baseRef := &TableRef{
+		BaseNode: BaseNode{nodeType: TableRefNode},
+	}
+
+	// 获取左表信息
+	if result := v.Visit(ctx.TableReference()); result != nil {
+		if leftRef, ok := result.(*TableRef); ok {
+			baseRef.Table = leftRef.Table
+			baseRef.Alias = leftRef.Alias
+			baseRef.Joins = leftRef.Joins
+		}
+	}
+
+	// 构建JOIN信息
+	join := &JoinClause{
+		BaseNode: BaseNode{nodeType: JoinNode},
+	}
+
+	// 设置JOIN类型
+	if ctx.JoinType() != nil {
+		if joinType := v.Visit(ctx.JoinType()); joinType != nil {
+			join.JoinType = joinType.(string)
+		}
+	} else {
+		join.JoinType = "INNER" // 默认为INNER JOIN
+	}
+
+	// 获取右表信息
+	if result := v.Visit(ctx.TableReferenceAtom()); result != nil {
+		if rightRef, ok := result.(*TableRef); ok {
+			join.Right = rightRef
+		}
+	}
+
+	// 设置JOIN条件
+	if ctx.Expression() != nil {
+		if result := v.Visit(ctx.Expression()); result != nil {
+			if expr, ok := result.(Node); ok {
+				join.Condition = expr
+			}
+		}
+	}
+
+	// 将新的JOIN添加到JOIN列表中
+	baseRef.Joins = append(baseRef.Joins, join)
+
+	return baseRef
 }
 
-// TODO 访问 TableRefSubquery 语句
+// VisitTableRefSubquery 访问子查询表引用
 func (v *MiniQLVisitorImpl) VisitTableRefSubquery(ctx *TableRefSubqueryContext) interface{} {
-	return nil
+	tableRef := &TableRef{
+		BaseNode: BaseNode{nodeType: TableRefNode},
+	}
+
+	// 处理子查询
+	if ctx.SelectStatement() != nil {
+		if result := v.Visit(ctx.SelectStatement()); result != nil {
+			if subquery, ok := result.(*SelectStmt); ok {
+				tableRef.Subquery = subquery
+			}
+		}
+	}
+
+	// 处理别名（必须有）
+	if ctx.Identifier() != nil {
+		if result := v.Visit(ctx.Identifier()); result != nil {
+			switch t := result.(type) {
+			case string:
+				tableRef.Alias = t
+			case *Identifier:
+				tableRef.Alias = t.Value
+			}
+		}
+	}
+
+	return tableRef
 }
 
-// TODO 访问 JoinType 语句
+// VisitJoinType 访问连接类型
 func (v *MiniQLVisitorImpl) VisitJoinType(ctx *JoinTypeContext) interface{} {
-	return nil
+	if ctx.INNER() != nil {
+		return "INNER"
+	}
+	if ctx.LEFT() != nil {
+		return "LEFT"
+	}
+	if ctx.RIGHT() != nil {
+		return "RIGHT"
+	}
+	if ctx.FULL() != nil {
+		return "FULL"
+	}
+	return "INNER" // 默认为内连接
 }
 
-// TODO 访问 PrimaryExpression 语句
+// VisitPrimaryExpression 访问基本表达式
 func (v *MiniQLVisitorImpl) VisitPrimaryExpression(ctx *PrimaryExpressionContext) interface{} {
-	return nil
+	return v.Visit(ctx.PrimaryExpr())
 }
 
-// TODO 访问 OrExpression 语句
+// VisitOrExpression 访问OR表达式
 func (v *MiniQLVisitorImpl) VisitOrExpression(ctx *OrExpressionContext) interface{} {
-	return nil
+	left := v.Visit(ctx.Expression(0))
+	right := v.Visit(ctx.Expression(1))
+
+	return &BinaryExpr{
+		BaseNode: BaseNode{nodeType: LogicalExprNode},
+		Left:     left.(Node),
+		Operator: "OR",
+		Right:    right.(Node),
+	}
 }
 
-// TODO 访问 AndExpression 语句
+// VisitAndExpression 访问AND表达式
 func (v *MiniQLVisitorImpl) VisitAndExpression(ctx *AndExpressionContext) interface{} {
-	return nil
+	left := v.Visit(ctx.Expression(0))
+	right := v.Visit(ctx.Expression(1))
+
+	return &BinaryExpr{
+		BaseNode: BaseNode{nodeType: LogicalExprNode},
+		Left:     left.(Node),
+		Operator: "AND",
+		Right:    right.(Node),
+	}
 }
 
-// TODO 访问 InExpression 语句
+// VisitInExpression 访问IN表达式
 func (v *MiniQLVisitorImpl) VisitInExpression(ctx *InExpressionContext) interface{} {
-	return nil
+	left := v.Visit(ctx.Expression())
+	values := v.Visit(ctx.ValueList()).([]Node)
+	operator := "IN"
+	if ctx.NOT() != nil {
+		operator = "NOT IN"
+	}
+
+	return &InExpr{
+		BaseNode: BaseNode{nodeType: InExprNode},
+		Left:     left.(Node),
+		Operator: operator,
+		Values:   values,
+	}
 }
 
-// TODO 访问 LikeExpression 语句
+// VisitLikeExpression 访问LIKE表达式
 func (v *MiniQLVisitorImpl) VisitLikeExpression(ctx *LikeExpressionContext) interface{} {
-	return nil
+	left := v.Visit(ctx.Expression(0))
+	right := v.Visit(ctx.Expression(1))
+	operator := "LIKE"
+	if ctx.NOT() != nil {
+		operator = "NOT LIKE"
+	}
+
+	return &BinaryExpr{
+		BaseNode: BaseNode{nodeType: LikeExprNode},
+		Left:     left.(Node),
+		Operator: operator,
+		Right:    right.(Node),
+	}
 }
 
-// TODO 访问 ComparisonExpression 语句
+// VisitComparisonExpression 访问比较表达式
 func (v *MiniQLVisitorImpl) VisitComparisonExpression(ctx *ComparisonExpressionContext) interface{} {
-	return nil
+	left := v.Visit(ctx.Expression(0))
+	right := v.Visit(ctx.Expression(1))
+	operator := v.Visit(ctx.ComparisonOperator()).(string)
+
+	return &BinaryExpr{
+		BaseNode: BaseNode{nodeType: ComparisonExprNode},
+		Left:     left.(Node),
+		Operator: operator,
+		Right:    right.(Node),
+	}
 }
 
-// TODO 访问 LiteralExpr 语句
+// VisitLiteralExpr 访问字面量表达式
 func (v *MiniQLVisitorImpl) VisitLiteralExpr(ctx *LiteralExprContext) interface{} {
+	if ctx.Literal() != nil {
+		return v.Visit(ctx.Literal())
+	}
 	return nil
 }
 
-// TODO 访问 ColumnRefExpr 语句
+// VisitColumnRefExpr 访问列引用表达式
 func (v *MiniQLVisitorImpl) VisitColumnRefExpr(ctx *ColumnRefExprContext) interface{} {
+	if ctx.ColumnRef() != nil {
+		return v.Visit(ctx.ColumnRef())
+	}
 	return nil
 }
 
-// TODO 访问 FunctionCallExpr 语句
+// VisitFunctionCallExpr 访问函数调用表达式
 func (v *MiniQLVisitorImpl) VisitFunctionCallExpr(ctx *FunctionCallExprContext) interface{} {
+	if ctx.FunctionCall() != nil {
+		return v.Visit(ctx.FunctionCall())
+	}
 	return nil
 }
 
-// TODO 访问 ParenExpr 语句
+// VisitParenExpr 访问括号表达式
 func (v *MiniQLVisitorImpl) VisitParenExpr(ctx *ParenExprContext) interface{} {
+	// 对于括号表达式，我们直接返回内部表达式的结果
+	// 因为括号只影响优先级，不需要在AST中体现
+	if ctx.Expression() != nil {
+		return v.Visit(ctx.Expression())
+	}
 	return nil
 }
 
-// TODO 访问 ComparisonOperator 语句
+// VisitComparisonOperator 访问比较运算符
 func (v *MiniQLVisitorImpl) VisitComparisonOperator(ctx *ComparisonOperatorContext) interface{} {
-	return nil
+	return ctx.GetText()
 }
 
-// TODO 访问 ColumnRef 语句
+// VisitColumnRef 访问列引用
 func (v *MiniQLVisitorImpl) VisitColumnRef(ctx *ColumnRefContext) interface{} {
-	return nil
+	var tableName, columnName string
+
+	// 处理限定列名 (table.column)
+	if ctx.GetChildCount() == 3 {
+		tableName = ctx.Identifier(0).GetText()
+		columnName = ctx.Identifier(1).GetText()
+	} else {
+		columnName = ctx.Identifier(0).GetText()
+	}
+
+	return &ColumnRef{
+		BaseNode: BaseNode{nodeType: ColumnRefNode},
+		Table:    tableName,
+		Column:   columnName,
+	}
 }
 
-// TODO 访问 UpdateAssignment 语句
+// VisitUpdateAssignment 访问UPDATE赋值表达式节点
 func (v *MiniQLVisitorImpl) VisitUpdateAssignment(ctx *UpdateAssignmentContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	assignment := &UpdateAssignment{
+		BaseNode: BaseNode{nodeType: UpdateAssignmentNode},
+	}
+
+	// 获取列名
+	if ctx.Identifier() != nil {
+		if result := v.Visit(ctx.Identifier()); result != nil {
+			switch t := result.(type) {
+			case string:
+				assignment.Column = t
+			case *Identifier:
+				assignment.Column = t.Value
+			}
+		}
+	}
+
+	// 获取表达式值
+	if ctx.Expression() != nil {
+		if result := v.Visit(ctx.Expression()); result != nil {
+			if expr, ok := result.(Node); ok {
+				assignment.Value = expr
+			}
+		}
+	}
+
+	return assignment
 }
 
-// TODO 访问 GroupByItem 语句
+// VisitGroupByItem 访问 GROUP BY 项
 func (v *MiniQLVisitorImpl) VisitGroupByItem(ctx *GroupByItemContext) interface{} {
+	if ctx == nil {
+		return nil
+	}
+
+	// 直接返回表达式节点，不需要额外包装
+	// GROUP BY 子句中的表达式通常是列引用或函数调用
+	if ctx.Expression() != nil {
+		return v.Visit(ctx.Expression())
+	}
+
 	return nil
 }
 
-// TODO 访问 OrderByItem 语句
+// VisitOrderByItem 访问 ORDER BY 项
 func (v *MiniQLVisitorImpl) VisitOrderByItem(ctx *OrderByItemContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 创建 OrderByItem 节点
+	orderByItem := &OrderByItem{
+		BaseNode: BaseNode{nodeType: OrderByItemNode},
+	}
+
+	// 处理表达式
+	if ctx.Expression() != nil {
+		if result := v.Visit(ctx.Expression()); result != nil {
+			if expr, ok := result.(Node); ok {
+				orderByItem.Expr = expr
+			}
+		}
+	}
+
+	// 处理排序方向
+	if ctx.DESC() != nil {
+		orderByItem.Direction = "DESC"
+	} else {
+		// ASC 是默认值，即使没有显式指定 ASC 也使用升序
+		orderByItem.Direction = "ASC"
+	}
+
+	return orderByItem
 }
 
-// TODO 访问 FunctionCall 语句
+// VisitFunctionCall 访问函数调用
 func (v *MiniQLVisitorImpl) VisitFunctionCall(ctx *FunctionCallContext) interface{} {
-	return nil
+	funcName := ctx.Identifier().GetText()
+	var args []Node
+
+	// 处理参数
+	if ctx.ASTERISK() != nil {
+		args = append(args, &Asterisk{BaseNode: BaseNode{nodeType: AsteriskNode}})
+	} else {
+		for _, expr := range ctx.AllExpression() {
+			if arg := v.Visit(expr); arg != nil {
+				args = append(args, arg.(Node))
+			}
+		}
+	}
+
+	return &FunctionCall{
+		BaseNode: BaseNode{nodeType: FunctionCallNode},
+		Name:     funcName,
+		Args:     args,
+	}
 }
 
-// TODO 访问 PartitionMethod 语句
+// VisitPartitionMethod 访问分区方法节点
 func (v *MiniQLVisitorImpl) VisitPartitionMethod(ctx *PartitionMethodContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 创建分区方法节点
+	partition := &PartitionMethod{
+		BaseNode: BaseNode{nodeType: PartitionMethodNode},
+	}
+
+	// 处理分区类型
+	if ctx.HASH() != nil {
+		partition.Type = "HASH"
+	} else if ctx.RANGE() != nil {
+		partition.Type = "RANGE"
+	}
+
+	// 处理分区键列
+	if ctx.IdentifierList() != nil {
+		if result := v.Visit(ctx.IdentifierList()); result != nil {
+			if columns, ok := result.([]string); ok {
+				partition.Columns = columns
+			}
+		}
+	}
+
+	// TODO 处理分区数量（仅用于 HASH 分区）
+	/*if ctx.INTEGER_LITERAL() != nil {
+		if num, err := strconv.ParseInt(ctx.INTEGER_LITERAL().GetText(), 10, 64); err == nil {
+			partition.PartitionNum = int(num)
+		}
+	}*/
+
+	return partition
 }
 
-// TODO 访问 TransactionStatement 语句
+// VisitTransactionStatement 访问事务语句节点
 func (v *MiniQLVisitorImpl) VisitTransactionStatement(ctx *TransactionStatementContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 创建事务语句节点
+	stmt := &TransactionStmt{
+		BaseNode: BaseNode{nodeType: TransactionNode},
+	}
+
+	// 根据具体的事务命令设置类型
+	switch {
+	case ctx.START() != nil || ctx.TRANSACTION() != nil:
+		stmt.Type = "BEGIN"
+	case ctx.COMMIT() != nil:
+		stmt.Type = "COMMIT"
+	case ctx.ROLLBACK() != nil:
+		stmt.Type = "ROLLBACK"
+	default:
+		return nil
+	}
+
+	// 直接返回事务语句节点，无需额外的中间对象
+	return stmt
 }
 
-// TODO 访问 UseStatement 语句
+// VisitUseStatement 访问 USE 语句节点
 func (v *MiniQLVisitorImpl) VisitUseStatement(ctx *UseStatementContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 获取数据库名
+	var dbName string
+	if ctx.Identifier() != nil {
+		if result := v.Visit(ctx.Identifier()); result != nil {
+			dbName = result.(string)
+		}
+	}
+
+	// 更新当前数据库
+	v.currentDatabase = dbName
+
+	// 返回 UseStmt 节点
+	return &UseStmt{
+		BaseNode: BaseNode{nodeType: UseNode},
+		Database: dbName,
+	}
 }
 
-// TODO 访问 ShowDatabases 语句
+// VisitShowDatabases 访问 SHOW DATABASES 语句
 func (v *MiniQLVisitorImpl) VisitShowDatabases(ctx *ShowDatabasesContext) interface{} {
-	return nil
+	// 直接返回 ShowDatabasesStmt 节点，无需任何中间对象
+	return &ShowDatabasesStmt{
+		BaseNode: BaseNode{nodeType: ShowDatabasesNode},
+	}
 }
 
-// TODO 访问 ShowTables 语句
+// VisitShowTables 访问 SHOW TABLES 语句节点
 func (v *MiniQLVisitorImpl) VisitShowTables(ctx *ShowTablesContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 检查是否已选择数据库
+	if v.currentDatabase == "" {
+		// 这里可以返回错误，但由于接口限制，我们返回一个特殊的节点
+		return &ErrorStmt{
+			BaseNode: BaseNode{nodeType: ErrorNode},
+			Message:  "No database selected",
+		}
+	}
+
+	// 返回 ShowTablesStmt 节点
+	return &ShowTablesStmt{
+		BaseNode: BaseNode{nodeType: ShowTablesNode},
+		Database: v.currentDatabase,
+	}
 }
 
-// TODO 访问 ExplainStatement 语句
+// VisitExplainStatement 访问 EXPLAIN 语句节点
 func (v *MiniQLVisitorImpl) VisitExplainStatement(ctx *ExplainStatementContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 创建 EXPLAIN 语句节点
+	stmt := &ExplainStmt{
+		BaseNode: BaseNode{nodeType: ExplainNode},
+	}
+
+	// 获取要解释的查询语句
+	// EXPLAIN 后面只能跟 SELECT 语句
+	if ctx.SelectStatement() != nil {
+		if result := v.Visit(ctx.SelectStatement()); result != nil {
+			if query, ok := result.(Node); ok {
+				stmt.Query = query
+			}
+		}
+	}
+
+	return stmt
 }
 
 // VisitIdentifierList 访问标识符列表
@@ -459,9 +1184,26 @@ func (v *MiniQLVisitorImpl) VisitIdentifierList(ctx *IdentifierListContext) inte
 	return identifiers
 }
 
-// TODO 访问 ValueList 语句
+// VisitValueList 访问值列表节点
 func (v *MiniQLVisitorImpl) VisitValueList(ctx *ValueListContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 直接构建值节点列表，无需中间对象
+	values := make([]Node, 0, len(ctx.AllLiteral()))
+
+	// 遍历所有字面量
+	for _, literalCtx := range ctx.AllLiteral() {
+		if result := v.Visit(literalCtx); result != nil {
+			// 确保返回的是 Node 类型
+			if node, ok := result.(Node); ok {
+				values = append(values, node)
+			}
+		}
+	}
+
+	return values
 }
 
 // VisitTableName 访问表名节点
@@ -510,7 +1252,35 @@ func (v *MiniQLVisitorImpl) VisitDataType(ctx *DataTypeContext) interface{} {
 	return nil
 }
 
-// TODO 访问 Literal 语句
+// VisitLiteral 访问字面量节点
 func (v *MiniQLVisitorImpl) VisitLiteral(ctx *LiteralContext) interface{} {
-	return nil
+	if ctx == nil {
+		return nil
+	}
+
+	// 根据字面量类型创建对应的节点
+	switch {
+	case ctx.INTEGER_LITERAL() != nil:
+		val, _ := strconv.ParseInt(ctx.INTEGER_LITERAL().GetText(), 10, 64)
+		return &IntegerLiteral{
+			BaseNode: BaseNode{nodeType: IntegerLiteralNode},
+			Value:    val,
+		}
+	case ctx.FLOAT_LITERAL() != nil:
+		val, _ := strconv.ParseFloat(ctx.FLOAT_LITERAL().GetText(), 64)
+		return &FloatLiteral{
+			BaseNode: BaseNode{nodeType: FloatLiteralNode},
+			Value:    val,
+		}
+	case ctx.STRING_LITERAL() != nil:
+		// 去除字符串两端的引号
+		text := ctx.STRING_LITERAL().GetText()
+		value := text[1 : len(text)-1]
+		return &StringLiteral{
+			BaseNode: BaseNode{nodeType: StringLiteralNode},
+			Value:    value,
+		}
+	default:
+		return nil
+	}
 }

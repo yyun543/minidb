@@ -251,9 +251,13 @@ selectItem
 
 // 表引用
 tableReference
- : tableName (AS? identifier)?                                       #tableRefBase
- | LEFT_PAREN selectStatement RIGHT_PAREN AS? identifier            #tableRefSubquery
- | tableReference joinType? JOIN tableReference ON expression        #tableRefJoin
+ : tableReferenceAtom
+ | tableReference joinType? JOIN tableReferenceAtom ON expression
+ ;
+
+tableReferenceAtom
+ : tableName ( AS? identifier )?                                      #tableRefBase
+ | LEFT_PAREN selectStatement RIGHT_PAREN AS? identifier             #tableRefSubquery
  ;
 
 // JOIN类型

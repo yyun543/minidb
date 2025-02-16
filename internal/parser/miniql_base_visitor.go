@@ -92,11 +92,11 @@ func (v *BaseMiniQLVisitor) VisitSelectExpr(ctx *SelectExprContext) interface{} 
 	return v.VisitChildren(ctx)
 }
 
-func (v *BaseMiniQLVisitor) VisitTableRefBase(ctx *TableRefBaseContext) interface{} {
+func (v *BaseMiniQLVisitor) VisitTableReference(ctx *TableReferenceContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
-func (v *BaseMiniQLVisitor) VisitTableRefJoin(ctx *TableRefJoinContext) interface{} {
+func (v *BaseMiniQLVisitor) VisitTableRefBase(ctx *TableRefBaseContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 

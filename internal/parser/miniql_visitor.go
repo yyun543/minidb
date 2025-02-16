@@ -71,11 +71,11 @@ type MiniQLVisitor interface {
 	// Visit a parse tree produced by MiniQLParser#selectExpr.
 	VisitSelectExpr(ctx *SelectExprContext) interface{}
 
+	// Visit a parse tree produced by MiniQLParser#tableReference.
+	VisitTableReference(ctx *TableReferenceContext) interface{}
+
 	// Visit a parse tree produced by MiniQLParser#tableRefBase.
 	VisitTableRefBase(ctx *TableRefBaseContext) interface{}
-
-	// Visit a parse tree produced by MiniQLParser#tableRefJoin.
-	VisitTableRefJoin(ctx *TableRefJoinContext) interface{}
 
 	// Visit a parse tree produced by MiniQLParser#tableRefSubquery.
 	VisitTableRefSubquery(ctx *TableRefSubqueryContext) interface{}
