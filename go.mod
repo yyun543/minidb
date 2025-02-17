@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/bwmarrin/snowflake v0.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/goccy/go-json v0.10.3 // indirect
 	github.com/google/flatbuffers v24.3.25+incompatible // indirect

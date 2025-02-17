@@ -2,14 +2,13 @@ package executor
 
 import (
 	"github.com/yyun543/minidb/internal/optimizer"
-	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/types"
 )
 
 // Executor 执行器接口
 type Executor interface {
 	// Execute 执行查询计划并返回结果集
-	Execute(plan *optimizer.LogicalPlan) (*ResultSet, error)
+	Execute(plan *optimizer.Plan) (*ResultSet, error)
 }
 
 // Operator 算子接口
@@ -26,13 +25,18 @@ type Operator interface {
 
 // ResultSet 查询结果集
 type ResultSet struct {
-	headers []*parser.ColumnItem // 列名
-	rows    []*types.Batch       // 数据批次
-	curRow  int                  // 当前行
+	headers []string       // 列名
+	rows    []*types.Batch // 数据批次
+	curRow  int            // 当前行
+}
+
+// Batches 返回结果集中的数据批次
+func (rs *ResultSet) Batches() []*types.Batch {
+	return rs.rows
 }
 
 // Headers 获取结果集列名
-func (rs *ResultSet) Headers() []*parser.ColumnItem {
+func (rs *ResultSet) Headers() []string {
 	return rs.headers
 }
 

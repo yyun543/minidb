@@ -1,19 +1,19 @@
 package operators
 
 import (
-	"github.com/yyun543/minidb/internal/parser"
+	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/types"
 )
 
 // Filter 过滤算子
 type Filter struct {
-	condition parser.Node // 过滤条件
-	child     Operator    // Use local Operator interface
-	ctx       interface{} // Use interface{} instead of *executor.Context
+	condition optimizer.Expression // 过滤条件
+	child     Operator             // Use local Operator interface
+	ctx       interface{}          // Use interface{} instead of *executor.Context
 }
 
 // NewFilter 创建过滤算子
-func NewFilter(condition parser.Node, child Operator, ctx interface{}) *Filter {
+func NewFilter(condition optimizer.Expression, child Operator, ctx interface{}) *Filter {
 	return &Filter{
 		condition: condition,
 		child:     child,

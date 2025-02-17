@@ -2,11 +2,11 @@ package executor
 
 import (
 	"fmt"
-	"github.com/yyun543/minidb/internal/parser"
 
 	"github.com/yyun543/minidb/internal/catalog"
 	"github.com/yyun543/minidb/internal/executor/operators"
 	"github.com/yyun543/minidb/internal/optimizer"
+	"github.com/yyun543/minidb/internal/session"
 	"github.com/yyun543/minidb/internal/types"
 )
 
@@ -23,9 +23,9 @@ func NewExecutor(cat *catalog.Catalog) *ExecutorImpl {
 }
 
 // Execute 执行查询计划
-func (e *ExecutorImpl) Execute(plan *optimizer.LogicalPlan) (*ResultSet, error) {
+func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	// 创建执行上下文
-	ctx := NewContext(e.catalog)
+	ctx := NewContext(e.catalog, sess)
 
 	// 构建执行算子树
 	op, err := e.buildOperator(plan, ctx)
@@ -66,7 +66,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.LogicalPlan) (*ResultSet, error) 
 }
 
 // buildOperator 根据计划节点构建算子
-func (e *ExecutorImpl) buildOperator(plan *optimizer.LogicalPlan, ctx *Context) (operators.Operator, error) {
+func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operators.Operator, error) {
 	switch plan.Type {
 	case optimizer.TableScanPlan:
 		props := plan.Properties.(*optimizer.TableScanProperties)
@@ -98,11 +98,19 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.LogicalPlan, ctx *Context) 
 }
 
 // getResultHeaders 获取结果集列名
-func (e *ExecutorImpl) getResultHeaders(plan *optimizer.LogicalPlan) []*parser.ColumnItem {
+func (e *ExecutorImpl) getResultHeaders(plan *optimizer.Plan) []string {
 	switch plan.Type {
 	case optimizer.SelectPlan:
 		props := plan.Properties.(*optimizer.SelectProperties)
-		return props.Columns
+		columns := make([]string, len(props.Columns))
+		for i, col := range props.Columns {
+			if col.Table != "" {
+				columns[i] = fmt.Sprintf("%s.%s", col.Table, col.Column)
+			} else {
+				columns[i] = col.Column
+			}
+		}
+		return columns
 	default:
 		return nil
 	}

@@ -1,21 +1,21 @@
 package operators
 
 import (
-	"github.com/yyun543/minidb/internal/parser"
+	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/types"
 )
 
 // Join 连接算子
 type Join struct {
-	joinType  string      // 连接类型
-	condition parser.Node // 连接条件
-	left      Operator    // 左子算子
-	right     Operator    // 右子算子
+	joinType  string               // 连接类型
+	condition optimizer.Expression // 连接条件
+	left      Operator             // 左子算子
+	right     Operator             // 右子算子
 	ctx       interface{}
 }
 
 // NewJoin 创建连接算子
-func NewJoin(joinType string, condition parser.Node, left, right Operator, ctx interface{}) *Join {
+func NewJoin(joinType string, condition optimizer.Expression, left, right Operator, ctx interface{}) *Join {
 	return &Join{
 		joinType:  joinType,
 		condition: condition,

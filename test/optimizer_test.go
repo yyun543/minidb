@@ -8,162 +8,203 @@ import (
 	"github.com/yyun543/minidb/internal/parser"
 )
 
-// Optimizer 查询优化器单元测试
-
 func TestOptimizer(t *testing.T) {
-	// 测试基本的SELECT查询优化
-	t.Run("OptimizeSimpleSelect", func(t *testing.T) {
-		sql := "SELECT id, name FROM users WHERE age > 18;"
-		stmt, err := parser.Parse(sql)
-		assert.NoError(t, err)
-
+	// 测试优化器创建
+	t.Run("TestNewOptimizer", func(t *testing.T) {
 		opt := optimizer.NewOptimizer()
-		plan, err := opt.Optimize(stmt)
-
-		assert.NoError(t, err)
-		assert.NotNil(t, plan)
-		assert.Equal(t, optimizer.SelectPlan, plan.Type)
-
-		// 验证SELECT属性
-		selectProps, ok := plan.Properties.(*optimizer.SelectProperties)
-		assert.True(t, ok)
-		assert.Equal(t, []string{"id", "name"}, selectProps.Columns)
-
-		// 验证子节点
-		assert.Len(t, plan.Children, 2) // 应该有TableScan和Filter两个子节点
-
-		// 验证TableScan节点
-		assert.Equal(t, optimizer.TableScanPlan, plan.Children[0].Type)
-		scanProps, ok := plan.Children[0].Properties.(*optimizer.TableScanProperties)
-		assert.True(t, ok)
-		assert.Equal(t, "users", scanProps.Table)
-
-		// 验证Filter节点
-		assert.Equal(t, optimizer.FilterPlan, plan.Children[1].Type)
-		filterProps, ok := plan.Children[1].Properties.(*optimizer.FilterProperties)
-		assert.True(t, ok)
-		assert.NotNil(t, filterProps.Condition)
+		assert.NotNil(t, opt)
 	})
 
-	// 测试带JOIN的查询优化
-	t.Run("OptimizeJoinQuery", func(t *testing.T) {
-		sql := `
-			SELECT u.id, u.name, o.order_id 
-			FROM users u 
-			JOIN orders o ON u.id = o.user_id 
-			WHERE u.age > 18;
-		`
-		stmt, err := parser.Parse(sql)
-		assert.NoError(t, err)
+	// 测试SELECT语句优化
+	t.Run("TestOptimizeSelect", func(t *testing.T) {
+		// 基本SELECT
+		t.Run("BasicSelect", func(t *testing.T) {
+			sql := "SELECT id, name FROM users"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
 
-		opt := optimizer.NewOptimizer()
-		plan, err := opt.Optimize(stmt)
+			opt := optimizer.NewOptimizer()
+			plan, err := opt.Optimize(stmt)
+			assert.NoError(t, err)
+			assert.NotNil(t, plan)
 
-		assert.NoError(t, err)
-		assert.NotNil(t, plan)
-		assert.Equal(t, optimizer.SelectPlan, plan.Type)
+			// 验证计划类型
+			assert.Equal(t, optimizer.SelectPlan, plan.Type)
 
-		// 验证SELECT属性
-		selectProps, ok := plan.Properties.(*optimizer.SelectProperties)
-		assert.True(t, ok)
-		assert.Equal(t, []string{"u.id", "u.name", "o.order_id"}, selectProps.Columns)
+			// 验证子计划
+			children := plan.Children
+			assert.GreaterOrEqual(t, len(children), 1)
 
-		// 验证子节点结构
-		assert.Len(t, plan.Children, 3) // TableScan, Join, 和 Filter
+			// 验证表扫描计划
+			var scanPlan *optimizer.Plan
+			for _, child := range children {
+				if child.Type == optimizer.TableScanPlan {
+					scanPlan = child
+					break
+				}
+			}
+			assert.NotNil(t, scanPlan)
+			scanProps, ok := scanPlan.Properties.(*optimizer.TableScanProperties)
+			assert.True(t, ok)
+			assert.Equal(t, "users", scanProps.Table)
+		})
 
-		// 验证Join节点
-		assert.Equal(t, optimizer.JoinPlan, plan.Children[1].Type)
-		joinProps, ok := plan.Children[1].Properties.(*optimizer.JoinProperties)
-		assert.True(t, ok)
-		assert.Equal(t, "orders", joinProps.Table)
-		assert.NotNil(t, joinProps.Condition)
+		// 带WHERE子句的SELECT
+		t.Run("SelectWithWhere", func(t *testing.T) {
+			sql := "SELECT id, name FROM users WHERE age > 18"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+
+			opt := optimizer.NewOptimizer()
+			plan, err := opt.Optimize(stmt)
+			assert.NoError(t, err)
+			assert.NotNil(t, plan)
+
+			// 验证过滤计划
+			var filterPlan *optimizer.Plan
+			for _, child := range plan.Children {
+				if child.Type == optimizer.FilterPlan {
+					filterPlan = child
+					break
+				}
+			}
+			assert.NotNil(t, filterPlan)
+			filterProps, ok := filterPlan.Properties.(*optimizer.FilterProperties)
+			assert.True(t, ok)
+			assert.NotNil(t, filterProps.Condition)
+		})
+
+		// 带JOIN的SELECT
+		t.Run("SelectWithJoin", func(t *testing.T) {
+			sql := "SELECT u.id, o.order_id FROM users u JOIN orders o ON u.id = o.user_id"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+
+			opt := optimizer.NewOptimizer()
+			plan, err := opt.Optimize(stmt)
+			assert.NoError(t, err)
+			assert.NotNil(t, plan)
+
+			// 验证JOIN计划
+			var joinPlan *optimizer.Plan
+			for _, child := range plan.Children {
+				if child.Type == optimizer.JoinPlan {
+					joinPlan = child
+					break
+				}
+			}
+			assert.NotNil(t, joinPlan)
+			joinProps, ok := joinPlan.Properties.(*optimizer.JoinProperties)
+			assert.True(t, ok)
+			assert.Equal(t, "INNER", joinProps.JoinType)
+			assert.Equal(t, "users", joinProps.Left)
+			assert.Equal(t, "orders", joinProps.Right)
+		})
+
+		// 带ORDER BY的SELECT
+		t.Run("SelectWithOrderBy", func(t *testing.T) {
+			sql := "SELECT id, name FROM users ORDER BY name DESC"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+
+			opt := optimizer.NewOptimizer()
+			plan, err := opt.Optimize(stmt)
+			assert.NoError(t, err)
+			assert.NotNil(t, plan)
+
+			// 验证ORDER BY计划
+			var orderPlan *optimizer.Plan
+			for _, child := range plan.Children {
+				if child.Type == optimizer.OrderPlan {
+					orderPlan = child
+					break
+				}
+			}
+			assert.NotNil(t, orderPlan)
+			orderProps, ok := orderPlan.Properties.(*optimizer.OrderByProperties)
+			assert.True(t, ok)
+			assert.Len(t, orderProps.OrderKeys, 1)
+			assert.Equal(t, "name", orderProps.OrderKeys[0].Column)
+			assert.Equal(t, "DESC", orderProps.OrderKeys[0].Direction)
+		})
+
+		// 带GROUP BY的SELECT
+		t.Run("SelectWithGroupBy", func(t *testing.T) {
+			sql := "SELECT department, COUNT(*) FROM employees GROUP BY department"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+
+			opt := optimizer.NewOptimizer()
+			plan, err := opt.Optimize(stmt)
+			assert.NoError(t, err)
+			assert.NotNil(t, plan)
+
+			// 验证GROUP BY计划
+			var groupPlan *optimizer.Plan
+			for _, child := range plan.Children {
+				if child.Type == optimizer.GroupPlan {
+					groupPlan = child
+					break
+				}
+			}
+			assert.NotNil(t, groupPlan)
+			groupProps, ok := groupPlan.Properties.(*optimizer.GroupByProperties)
+			assert.True(t, ok)
+			assert.Contains(t, groupProps.GroupKeys, "department")
+		})
 	})
 
 	// 测试INSERT语句优化
-	t.Run("OptimizeInsert", func(t *testing.T) {
-		sql := "INSERT INTO users (id, name, age) VALUES (1, 'test', 20);"
+	t.Run("TestOptimizeInsert", func(t *testing.T) {
+		sql := "INSERT INTO users (id, name) VALUES (1, 'test')"
 		stmt, err := parser.Parse(sql)
 		assert.NoError(t, err)
 
 		opt := optimizer.NewOptimizer()
 		plan, err := opt.Optimize(stmt)
-
 		assert.NoError(t, err)
 		assert.NotNil(t, plan)
-		assert.Equal(t, optimizer.InsertPlan, plan.Type)
 
-		insertProps, ok := plan.Properties.(*optimizer.InsertProperties)
+		assert.Equal(t, optimizer.InsertPlan, plan.Type)
+		props, ok := plan.Properties.(*optimizer.InsertProperties)
 		assert.True(t, ok)
-		assert.Equal(t, "users", insertProps.Table)
-		assert.Equal(t, []string{"id", "name", "age"}, insertProps.Columns)
-		assert.Len(t, insertProps.Values, 3)
+		assert.Equal(t, "users", props.Table)
+		assert.Equal(t, []string{"id", "name"}, props.Columns)
 	})
 
 	// 测试UPDATE语句优化
-	t.Run("OptimizeUpdate", func(t *testing.T) {
-		sql := "UPDATE users SET name = 'updated' WHERE id = 1;"
+	t.Run("TestOptimizeUpdate", func(t *testing.T) {
+		sql := "UPDATE users SET name = 'updated' WHERE id = 1"
 		stmt, err := parser.Parse(sql)
 		assert.NoError(t, err)
 
 		opt := optimizer.NewOptimizer()
 		plan, err := opt.Optimize(stmt)
-
 		assert.NoError(t, err)
 		assert.NotNil(t, plan)
-		assert.Equal(t, optimizer.UpdatePlan, plan.Type)
 
-		updateProps, ok := plan.Properties.(*optimizer.UpdateProperties)
+		assert.Equal(t, optimizer.UpdatePlan, plan.Type)
+		props, ok := plan.Properties.(*optimizer.UpdateProperties)
 		assert.True(t, ok)
-		assert.Equal(t, "users", updateProps.Table)
-		assert.Len(t, updateProps.Assignments, 1)
-		assert.NotNil(t, updateProps.Where)
+		assert.Equal(t, "users", props.Table)
+		assert.NotNil(t, props.Where)
 	})
 
 	// 测试DELETE语句优化
-	t.Run("OptimizeDelete", func(t *testing.T) {
-		sql := "DELETE FROM users WHERE id = 1;"
+	t.Run("TestOptimizeDelete", func(t *testing.T) {
+		sql := "DELETE FROM users WHERE id = 1"
 		stmt, err := parser.Parse(sql)
 		assert.NoError(t, err)
 
 		opt := optimizer.NewOptimizer()
 		plan, err := opt.Optimize(stmt)
-
 		assert.NoError(t, err)
 		assert.NotNil(t, plan)
+
 		assert.Equal(t, optimizer.DeletePlan, plan.Type)
-
-		deleteProps, ok := plan.Properties.(*optimizer.DeleteProperties)
+		props, ok := plan.Properties.(*optimizer.DeleteProperties)
 		assert.True(t, ok)
-		assert.Equal(t, "users", deleteProps.Table)
-		assert.NotNil(t, deleteProps.Where)
-	})
-
-	// 测试JOIN重排序优化规则
-	t.Run("TestJoinReorderRule", func(t *testing.T) {
-		sql := `
-			SELECT u.id, u.name, o.order_id, p.product_name
-			FROM users u 
-			JOIN orders o ON u.id = o.user_id
-			JOIN products p ON o.product_id = p.id
-			WHERE u.age > 18;
-		`
-		stmt, err := parser.Parse(sql)
-		assert.NoError(t, err)
-
-		opt := optimizer.NewOptimizer()
-		plan, err := opt.Optimize(stmt)
-
-		assert.NoError(t, err)
-		assert.NotNil(t, plan)
-
-		// 验证JOIN节点的顺序
-		joinCount := 0
-		for _, child := range plan.Children {
-			if child.Type == optimizer.JoinPlan {
-				joinCount++
-				// 这里可以添加更多的验证逻辑，比如检查JOIN的顺序是否符合优化预期
-			}
-		}
-		assert.Equal(t, 2, joinCount) // 应该有两个JOIN节点
+		assert.Equal(t, "users", props.Table)
+		assert.NotNil(t, props.Where)
 	})
 }

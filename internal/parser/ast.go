@@ -359,7 +359,7 @@ type PartitionMethod struct {
 // TransactionStmt 事务语句节点
 type TransactionStmt struct {
 	BaseNode
-	Type string // BEGIN/COMMIT/ROLLBACK
+	TxType string // BEGIN/COMMIT/ROLLBACK
 }
 
 // ExplainStmt EXPLAIN语句节点

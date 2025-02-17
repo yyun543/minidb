@@ -58,3 +58,9 @@ func (b *Batch) Release() {
 		b.record.Release()
 	}
 }
+
+// GetString returns the string value at the given column and row index
+func (b *Batch) GetString(col, row int) string {
+	column := b.record.Column(col)
+	return column.(*array.String).Value(row)
+}

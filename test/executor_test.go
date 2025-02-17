@@ -8,126 +8,177 @@ import (
 	"github.com/yyun543/minidb/internal/executor"
 	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/parser"
+	"github.com/yyun543/minidb/internal/session"
 )
 
 func TestExecutor(t *testing.T) {
-	// 创建测试环境
+	// 创建目录和会话
 	cat := catalog.NewCatalog()
+	sessMgr, err := session.NewSessionManager()
+	assert.NoError(t, err)
+	sess := sessMgr.CreateSession()
+
+	// 创建优化器和执行器
+	opt := optimizer.NewOptimizer()
 	exec := executor.NewExecutor(cat)
 
-	// 创建测试数据库和表
-	setupTestDB(t, cat)
-
-	// 测试SELECT查询
-	t.Run("SelectQuery", func(t *testing.T) {
-		// 构建查询计划
-		plan := &optimizer.LogicalPlan{
-			Type: optimizer.SelectPlan,
-			Properties: &optimizer.SelectProperties{
-				Columns: []*parser.ColumnItem{
-					{Column: "id", Alias: ""},
-					{Column: "name", Alias: ""},
-				},
-			},
-			Children: []*optimizer.LogicalPlan{
-				{
-					Type: optimizer.TableScanPlan,
-					Properties: &optimizer.TableScanProperties{
-						Table: "users",
-					},
-				},
-			},
-		}
-
-		// 执行查询
-		result, err := exec.Execute(plan)
-		assert.NoError(t, err)
-		assert.NotNil(t, result)
+	// 测试执行器创建
+	t.Run("TestNewExecutor", func(t *testing.T) {
+		assert.NotNil(t, exec)
 	})
 
-	// 测试INSERT语句
-	t.Run("InsertQuery", func(t *testing.T) {
-		plan := &optimizer.LogicalPlan{
-			Type: optimizer.InsertPlan,
-			Properties: &optimizer.InsertProperties{
-				Table:   "users",
-				Columns: []string{"id", "name"},
-				Values: []parser.Node{
-					&parser.IntLiteral{Value: 1},
-					&parser.StringLiteral{Value: "test"},
-				},
-			},
-		}
+	// 测试SELECT语句执行
+	t.Run("TestExecuteSelect", func(t *testing.T) {
+		// 基本SELECT
+		t.Run("BasicSelect", func(t *testing.T) {
+			// 先创建表并插入数据
+			createSQL := "CREATE TABLE users (id INTEGER, name VARCHAR(255))"
+			stmt, err := parser.Parse(createSQL)
+			assert.NoError(t, err)
+			plan, err := opt.Optimize(stmt)
+			assert.NoError(t, err)
+			_, err = exec.Execute(plan, sess)
+			assert.NoError(t, err)
 
-		result, err := exec.Execute(plan)
-		assert.NoError(t, err)
-		assert.NotNil(t, result)
+			// 插入测试数据
+			insertSQL := "INSERT INTO users (id, name) VALUES (1, 'test')"
+			stmt, err = parser.Parse(insertSQL)
+			assert.NoError(t, err)
+			plan, err = opt.Optimize(stmt)
+			assert.NoError(t, err)
+			_, err = exec.Execute(plan, sess)
+			assert.NoError(t, err)
+
+			// 执行SELECT
+			sql := "SELECT id, name FROM users"
+			stmt, err = parser.Parse(sql)
+			assert.NoError(t, err)
+			plan, err = opt.Optimize(stmt)
+			assert.NoError(t, err)
+			result, err := exec.Execute(plan, sess)
+			assert.NoError(t, err)
+			assert.NotNil(t, result)
+
+			// 验证结果集
+			assert.Equal(t, []string{"id", "name"}, result.Headers)
+			assert.Equal(t, 1, len(result.Batches()))
+		})
+
+		// 带WHERE条件的SELECT
+		t.Run("SelectWithWhere", func(t *testing.T) {
+			sql := "SELECT id, name FROM users WHERE id = 1"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+			plan, err := opt.Optimize(stmt)
+			assert.NoError(t, err)
+			result, err := exec.Execute(plan, sess)
+			assert.NoError(t, err)
+			assert.NotNil(t, result)
+
+			// 验证结果集
+			assert.Equal(t, []string{"id", "name"}, result.Headers)
+			assert.Equal(t, 1, len(result.Batches()))
+		})
+
+		// 带JOIN的SELECT
+		t.Run("SelectWithJoin", func(t *testing.T) {
+			// 创建orders表
+			createSQL := "CREATE TABLE orders (order_id INTEGER, user_id INTEGER)"
+			stmt, err := parser.Parse(createSQL)
+			assert.NoError(t, err)
+			plan, err := opt.Optimize(stmt)
+			assert.NoError(t, err)
+			_, err = exec.Execute(plan, sess)
+			assert.NoError(t, err)
+
+			// 插入测试数据
+			insertSQL := "INSERT INTO orders (order_id, user_id) VALUES (1, 1)"
+			stmt, err = parser.Parse(insertSQL)
+			assert.NoError(t, err)
+			plan, err = opt.Optimize(stmt)
+			assert.NoError(t, err)
+			_, err = exec.Execute(plan, sess)
+			assert.NoError(t, err)
+
+			// 执行JOIN查询
+			sql := "SELECT u.id, u.name, o.order_id FROM users u JOIN orders o ON u.id = o.user_id"
+			stmt, err = parser.Parse(sql)
+			assert.NoError(t, err)
+			plan, err = opt.Optimize(stmt)
+			assert.NoError(t, err)
+			result, err := exec.Execute(plan, sess)
+			assert.NoError(t, err)
+			assert.NotNil(t, result)
+
+			// 验证结果集
+			assert.Equal(t, []string{"u.id", "u.name", "o.order_id"}, result.Headers)
+			assert.Equal(t, 1, len(result.Batches()))
+		})
 	})
 
-	// 测试UPDATE语句
-	t.Run("UpdateQuery", func(t *testing.T) {
-		plan := &optimizer.LogicalPlan{
-			Type: optimizer.UpdatePlan,
-			Properties: &optimizer.UpdateProperties{
-				Table: "users",
-				Assignments: []*parser.UpdateAssignment{
-					{
-						Column: "name",
-						Value:  &parser.StringLiteral{Value: "updated"},
-					},
-				},
-				Where: &parser.WhereClause{
-					Condition: &parser.BinaryExpr{
-						Left:     &parser.Identifier{Value: "id"},
-						Operator: "=",
-						Right:    &parser.IntLiteral{Value: 1},
-					},
-				},
-			},
-		}
-
-		result, err := exec.Execute(plan)
+	// 测试INSERT语句执行
+	t.Run("TestExecuteInsert", func(t *testing.T) {
+		sql := "INSERT INTO users (id, name) VALUES (2, 'test2')"
+		stmt, err := parser.Parse(sql)
+		assert.NoError(t, err)
+		plan, err := opt.Optimize(stmt)
+		assert.NoError(t, err)
+		result, err := exec.Execute(plan, sess)
 		assert.NoError(t, err)
 		assert.NotNil(t, result)
+
+		// 验证插入是否成功
+		sql = "SELECT id, name FROM users WHERE id = 2"
+		stmt, err = parser.Parse(sql)
+		assert.NoError(t, err)
+		plan, err = opt.Optimize(stmt)
+		assert.NoError(t, err)
+		result, err = exec.Execute(plan, sess)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(result.Batches()))
 	})
 
-	// 测试DELETE语句
-	t.Run("DeleteQuery", func(t *testing.T) {
-		plan := &optimizer.LogicalPlan{
-			Type: optimizer.DeletePlan,
-			Properties: &optimizer.DeleteProperties{
-				Table: "users",
-				Where: &parser.WhereClause{
-					Condition: &parser.BinaryExpr{
-						Left:     &parser.Identifier{Value: "id"},
-						Operator: "=",
-						Right:    &parser.IntLiteral{Value: 1},
-					},
-				},
-			},
-		}
-
-		result, err := exec.Execute(plan)
+	// 测试UPDATE语句执行
+	t.Run("TestExecuteUpdate", func(t *testing.T) {
+		sql := "UPDATE users SET name = 'updated' WHERE id = 2"
+		stmt, err := parser.Parse(sql)
+		assert.NoError(t, err)
+		plan, err := opt.Optimize(stmt)
+		assert.NoError(t, err)
+		result, err := exec.Execute(plan, sess)
 		assert.NoError(t, err)
 		assert.NotNil(t, result)
+
+		// 验证更新是否成功
+		sql = "SELECT name FROM users WHERE id = 2"
+		stmt, err = parser.Parse(sql)
+		assert.NoError(t, err)
+		plan, err = opt.Optimize(stmt)
+		assert.NoError(t, err)
+		result, err = exec.Execute(plan, sess)
+		assert.NoError(t, err)
+		assert.Equal(t, "updated", result.Batches()[0].GetString(0, 0))
 	})
-}
 
-// 创建测试数据库和表
-func setupTestDB(t *testing.T, cat *catalog.Catalog) {
-	err := cat.CreateDatabase("testdb")
-	assert.NoError(t, err)
+	// 测试DELETE语句执行
+	t.Run("TestExecuteDelete", func(t *testing.T) {
+		sql := "DELETE FROM users WHERE id = 2"
+		stmt, err := parser.Parse(sql)
+		assert.NoError(t, err)
+		plan, err := opt.Optimize(stmt)
+		assert.NoError(t, err)
+		result, err := exec.Execute(plan, sess)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
 
-	err = cat.UseDatabase("testdb")
-	assert.NoError(t, err)
-
-	table := &catalog.TableMeta{
-		Name: "users",
-		Columns: []catalog.ColumnMeta{
-			{Name: "id", Type: "INT64", NotNull: true},
-			{Name: "name", Type: "STRING", NotNull: true},
-		},
-	}
-	err = cat.CreateTable(table)
-	assert.NoError(t, err)
+		// 验证删除是否成功
+		sql = "SELECT id FROM users WHERE id = 2"
+		stmt, err = parser.Parse(sql)
+		assert.NoError(t, err)
+		plan, err = opt.Optimize(stmt)
+		assert.NoError(t, err)
+		result, err = exec.Execute(plan, sess)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, len(result.Batches()))
+	})
 }

@@ -21,6 +21,12 @@ func main() {
 	}
 	defer listener.Close()
 
+	// 创建全局查询处理器
+	handler, err := NewQueryHandler()
+	if err != nil {
+		log.Fatalf("创建查询处理器失败: %v", err)
+	}
+
 	fmt.Printf("MiniDB 服务器已启动，监听 %s:%s\n", HOST, PORT)
 
 	// 接受客户端连接
@@ -32,18 +38,24 @@ func main() {
 		}
 
 		// 为每个连接创建一个新的goroutine
-		go handleConnection(conn)
+		go handleConnection(conn, handler)
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, handler *QueryHandler) {
 	defer conn.Close()
 
+	// 创建新会话
+	session := handler.sessionManager.CreateSession()
+	sessionID := session.ID
+
+	// 在连接关闭时清理会话
+	defer handler.sessionManager.DeleteSession(sessionID)
+
 	// 发送欢迎消息
-	conn.Write([]byte("欢迎使用 MiniDB!\n"))
+	conn.Write([]byte(fmt.Sprintf("欢迎使用 MiniDB! (会话ID: %d)\n", sessionID)))
 
 	reader := bufio.NewReader(conn)
-	handler := NewQueryHandler()
 
 	// 读取客户端命令
 	for {
@@ -63,8 +75,8 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
-		// 处理查询
-		result, err := handler.HandleQuery(query)
+		// 使用会话ID处理查询
+		result, err := handler.HandleQuery(sessionID, query)
 		if err != nil {
 			conn.Write([]byte(fmt.Sprintf("错误: %v\n", err)))
 			continue

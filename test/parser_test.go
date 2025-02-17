@@ -328,4 +328,128 @@ func TestParser(t *testing.T) {
 			assert.Equal(t, int64(10), selectStmt.Limit)
 		})
 	})
+
+	// 测试事务相关语句
+	t.Run("TestTransactionStatements", func(t *testing.T) {
+		// 测试 BEGIN 语句
+		t.Run("ParseBegin", func(t *testing.T) {
+			sql := "START TRANSACTION;"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+			assert.NotNil(t, stmt)
+
+			txnStmt, ok := stmt.(*parser.TransactionStmt)
+			assert.True(t, ok)
+			assert.Equal(t, "BEGIN", txnStmt.TxType)
+		})
+
+		// 测试 COMMIT 语句
+		t.Run("ParseCommit", func(t *testing.T) {
+			sql := "COMMIT;"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+			assert.NotNil(t, stmt)
+
+			txnStmt, ok := stmt.(*parser.TransactionStmt)
+			assert.True(t, ok)
+			assert.Equal(t, "COMMIT", txnStmt.TxType)
+		})
+
+		// 测试 ROLLBACK 语句
+		t.Run("ParseRollback", func(t *testing.T) {
+			sql := "ROLLBACK;"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+			assert.NotNil(t, stmt)
+
+			txnStmt, ok := stmt.(*parser.TransactionStmt)
+			assert.True(t, ok)
+			assert.Equal(t, "ROLLBACK", txnStmt.TxType)
+		})
+	})
+
+	// 测试 Utility 语句
+	t.Run("TestUtilityStatements", func(t *testing.T) {
+		// 测试 USE DATABASE 语句
+		t.Run("ParseUseDatabase", func(t *testing.T) {
+			sql := "USE test_db;"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+			assert.NotNil(t, stmt)
+
+			useStmt, ok := stmt.(*parser.UseStmt)
+			assert.True(t, ok)
+			assert.Equal(t, "test_db", useStmt.Database)
+		})
+
+		// 测试 SHOW DATABASES 语句
+		t.Run("ParseShowDatabases", func(t *testing.T) {
+			sql := "SHOW DATABASES;"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+			assert.NotNil(t, stmt)
+
+			showStmt, ok := stmt.(*parser.ShowDatabasesStmt)
+			assert.True(t, ok)
+			assert.Equal(t, parser.ShowDatabasesNode, showStmt.Type())
+		})
+
+		// 测试 SHOW TABLES 语句
+		t.Run("ParseShowTables", func(t *testing.T) {
+			sql := "SHOW TABLES;"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+			assert.NotNil(t, stmt)
+
+			showStmt, ok := stmt.(*parser.ShowTablesStmt)
+			assert.True(t, ok)
+			assert.Equal(t, parser.ShowTablesNode, showStmt.Type())
+		})
+
+		// 测试 EXPLAIN 语句
+		t.Run("ParseExplain", func(t *testing.T) {
+			sql := "EXPLAIN SELECT id, name FROM users WHERE age > 18;"
+			stmt, err := parser.Parse(sql)
+			assert.NoError(t, err)
+			assert.NotNil(t, stmt)
+
+			explainStmt, ok := stmt.(*parser.ExplainStmt)
+			assert.True(t, ok)
+			assert.NotNil(t, explainStmt.Query)
+
+			// 验证被解释的查询
+			query, ok := explainStmt.Query.(*parser.SelectStmt)
+			assert.True(t, ok)
+			expectedColumns := []*parser.ColumnItem{
+				{Column: "id", Table: "", Alias: ""},
+				{Column: "name", Table: "", Alias: ""},
+			}
+			assert.Equal(t, len(expectedColumns), len(query.Columns))
+			for i, expected := range expectedColumns {
+				actual := query.Columns[i]
+				assert.Equal(t, expected.Column, actual.Column, "Column %d: Column mismatch", i)
+				assert.Equal(t, expected.Table, actual.Table, "Column %d: Table mismatch", i)
+				assert.Equal(t, expected.Alias, actual.Alias, "Column %d: Alias mismatch", i)
+			}
+			assert.Equal(t, "users", query.From)
+			assert.NotNil(t, query.Where)
+		})
+
+		// 测试带注释的 Utility 语句
+		t.Run("ParseUtilityWithComments", func(t *testing.T) {
+			testCases := []string{
+				"-- 切换数据库\nUSE test_db;",
+				"SHOW DATABASES; -- 显示所有数据库",
+				"/* 显示当前数据库的表 */\nSHOW TABLES;",
+				"EXPLAIN /* 解释查询计划 */ SELECT * FROM users;",
+			}
+
+			for _, sql := range testCases {
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+				assert.NotNil(t, stmt)
+			}
+		})
+	})
+
 }

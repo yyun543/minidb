@@ -10,7 +10,6 @@ import (
 // MiniQLVisitorImpl 是 MiniQL 的访问器实现
 type MiniQLVisitorImpl struct {
 	BaseMiniQLVisitor
-	currentDatabase string // 当前选中的数据库
 }
 
 // Parse 是对外主要接口，传入 SQL 字符串返回 AST 节点
@@ -1078,17 +1077,17 @@ func (v *MiniQLVisitorImpl) VisitTransactionStatement(ctx *TransactionStatementC
 
 	// 根据具体的事务命令设置类型
 	switch {
-	case ctx.START() != nil || ctx.TRANSACTION() != nil:
-		stmt.Type = "BEGIN"
+	case ctx.START() != nil && ctx.TRANSACTION() != nil:
+		// 必须同时存在 START 和 TRANSACTION 关键字
+		stmt.TxType = "BEGIN"
 	case ctx.COMMIT() != nil:
-		stmt.Type = "COMMIT"
+		stmt.TxType = "COMMIT"
 	case ctx.ROLLBACK() != nil:
-		stmt.Type = "ROLLBACK"
+		stmt.TxType = "ROLLBACK"
 	default:
 		return nil
 	}
 
-	// 直接返回事务语句节点，无需额外的中间对象
 	return stmt
 }
 
@@ -1105,9 +1104,6 @@ func (v *MiniQLVisitorImpl) VisitUseStatement(ctx *UseStatementContext) interfac
 			dbName = result.(string)
 		}
 	}
-
-	// 更新当前数据库
-	v.currentDatabase = dbName
 
 	// 返回 UseStmt 节点
 	return &UseStmt{
@@ -1130,19 +1126,10 @@ func (v *MiniQLVisitorImpl) VisitShowTables(ctx *ShowTablesContext) interface{} 
 		return nil
 	}
 
-	// 检查是否已选择数据库
-	if v.currentDatabase == "" {
-		// 这里可以返回错误，但由于接口限制，我们返回一个特殊的节点
-		return &ErrorStmt{
-			BaseNode: BaseNode{nodeType: ErrorNode},
-			Message:  "No database selected",
-		}
-	}
-
 	// 返回 ShowTablesStmt 节点
 	return &ShowTablesStmt{
 		BaseNode: BaseNode{nodeType: ShowTablesNode},
-		Database: v.currentDatabase,
+		Database: "",
 	}
 }
 
