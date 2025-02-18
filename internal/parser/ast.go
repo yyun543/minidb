@@ -51,6 +51,9 @@ const (
 
 	// 新增事务节点类型
 	TransactionNode
+
+	// 新增HavingClause节点类型
+	HavingNode
 )
 
 // ColumnItemType 定义了SELECT列项的类型
@@ -96,7 +99,7 @@ type SelectStmt struct {
 	Joins     []*JoinClause  // JOIN子句
 	Where     *WhereClause   // WHERE子句
 	GroupBy   []Node         // GROUP BY子句
-	Having    Node           // HAVING子句
+	Having    *HavingClause  // HAVING子句
 	OrderBy   []*OrderByItem // ORDER BY子句
 	Limit     int64          // LIMIT子句
 }
@@ -372,4 +375,10 @@ type ExplainStmt struct {
 type ErrorStmt struct {
 	BaseNode
 	Message string // 错误信息
+}
+
+// HavingClause HAVING子句节点
+type HavingClause struct {
+	BaseNode
+	Condition Node // HAVING条件表达式
 }

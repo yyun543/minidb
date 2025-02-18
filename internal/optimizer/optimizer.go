@@ -130,7 +130,7 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 	if stmt.Having != nil {
 		havingPlan := NewPlan(HavingPlan)
 		havingPlan.Properties = &HavingProperties{
-			Condition: convertExpression(stmt.Having),
+			Condition: convertExpression(stmt.Having.Condition),
 		}
 		havingPlan.AddChild(currentPlan)
 		currentPlan = havingPlan

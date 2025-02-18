@@ -538,12 +538,19 @@ func (v *MiniQLVisitorImpl) VisitSelectStatement(ctx *SelectStatementContext) in
 
 	// 处理 HAVING 子句
 	if ctx.HAVING() != nil {
-		// 修改：使用正确的 Expression 获取 HAVING 条件
-		// 注意：HAVING 子句的表达式在 ctx.Expression(1) 中
-		// WHERE 子句的表达式在 ctx.Expression(0) 中
-		if result := v.Visit(ctx.Expression(1)); result != nil {
-			if expr, ok := result.(Node); ok {
-				stmt.Having = expr
+		// 获取所有表达式
+		expressions := ctx.AllExpression()
+		if len(expressions) > 0 {
+			// HAVING 表达式总是最后一个表达式
+			// 因为它在语法上是最后处理的条件
+			havingExpr := expressions[len(expressions)-1]
+			if result := v.Visit(havingExpr); result != nil {
+				if expr, ok := result.(Node); ok {
+					stmt.Having = &HavingClause{
+						BaseNode:  BaseNode{nodeType: HavingNode},
+						Condition: expr,
+					}
+				}
 			}
 		}
 	}

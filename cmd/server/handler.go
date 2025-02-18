@@ -21,7 +21,10 @@ type QueryHandler struct {
 
 // NewQueryHandler 创建新的查询处理器
 func NewQueryHandler() (*QueryHandler, error) {
-	cat := catalog.NewCatalog()
+	cat, err := catalog.NewCatalog()
+	if err != nil {
+		return nil, fmt.Errorf("创建目录失败: %v", err)
+	}
 	exec := executor.NewExecutor(cat)
 
 	sessMgr, err := session.NewSessionManager()

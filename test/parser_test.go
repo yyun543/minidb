@@ -293,7 +293,7 @@ func TestParser(t *testing.T) {
 			assert.NotNil(t, selectStmt.Having)
 
 			// 验证HAVING条件
-			havingExpr, ok := selectStmt.Having.(*parser.BinaryExpr)
+			havingExpr, ok := selectStmt.Having.Condition.(*parser.BinaryExpr)
 			assert.True(t, ok)
 			assert.Equal(t, ">", havingExpr.Operator)
 		})

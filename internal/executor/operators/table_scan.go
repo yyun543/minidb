@@ -10,6 +10,7 @@ import (
 
 // TableScan 表扫描算子
 type TableScan struct {
+	database  string
 	table     string
 	catalog   *catalog.Catalog
 	schema    *arrow.Schema
@@ -31,7 +32,7 @@ func NewTableScan(table string, catalog *catalog.Catalog) *TableScan {
 // Init 初始化算子
 func (op *TableScan) Init(ctx interface{}) error {
 	// 获取表结构
-	table, err := op.catalog.GetTable(op.table)
+	table, err := op.catalog.GetTable(op.database, op.table)
 	if err != nil {
 		return err
 	}
@@ -48,7 +49,7 @@ func (op *TableScan) Init(ctx interface{}) error {
 // Next 获取下一批数据
 func (op *TableScan) Next() (*types.Batch, error) {
 	// 从存储引擎读取数据
-	table, err := op.catalog.GetTable(op.table)
+	table, err := op.catalog.GetTable(op.database, op.table)
 	if err != nil {
 		return nil, err
 	}
