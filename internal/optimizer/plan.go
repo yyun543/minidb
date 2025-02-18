@@ -20,6 +20,14 @@ const (
 	OrderPlan
 	LimitPlan
 	GroupPlan
+	CreateDatabasePlan
+	CreateTablePlan
+	DropDatabasePlan
+	DropTablePlan
+	TransactionPlan
+	UsePlan
+	ShowPlan
+	ExplainPlan
 )
 
 // String 返回 PlanType 的字符串描述，便于调试和日志记录
@@ -45,6 +53,22 @@ func (pt PlanType) String() string {
 		return "Limit"
 	case GroupPlan:
 		return "GroupBy"
+	case CreateDatabasePlan:
+		return "CreateDatabase"
+	case CreateTablePlan:
+		return "CreateTable"
+	case DropDatabasePlan:
+		return "DropDatabase"
+	case DropTablePlan:
+		return "DropTable"
+	case TransactionPlan:
+		return "Transaction"
+	case UsePlan:
+		return "Use"
+	case ShowPlan:
+		return "Show"
+	case ExplainPlan:
+		return "Explain"
 	default:
 		return "Unknown"
 	}
@@ -294,4 +318,86 @@ type Asterisk struct{}
 
 func (a *Asterisk) String() string {
 	return "*"
+}
+
+// CreateDatabaseProperties 用于 CREATE DATABASE 计划
+type CreateDatabaseProperties struct {
+	Database string
+}
+
+func (p *CreateDatabaseProperties) Explain() string {
+	return fmt.Sprintf("Database: %s", p.Database)
+}
+
+// CreateTableProperties 用于 CREATE TABLE 计划
+type CreateTableProperties struct {
+	Table   string
+	Columns []ColumnRef
+}
+
+// ColumnDef 定义列属性
+type ColumnDef struct {
+	Name        string
+	Type        string
+	Nullable    bool
+	Default     interface{}
+	Constraints []string
+}
+
+func (p *CreateTableProperties) Explain() string {
+	return fmt.Sprintf("Table: %s, Columns: %d", p.Table, len(p.Columns))
+}
+
+// DropDatabaseProperties 用于 DROP DATABASE 计划
+type DropDatabaseProperties struct {
+	Database string
+}
+
+func (p *DropDatabaseProperties) Explain() string {
+	return fmt.Sprintf("Database: %s", p.Database)
+}
+
+// DropTableProperties 用于 DROP TABLE 计划
+type DropTableProperties struct {
+	Table string
+}
+
+func (p *DropTableProperties) Explain() string {
+	return fmt.Sprintf("Table: %s", p.Table)
+}
+
+// TransactionProperties 用于事务计划
+type TransactionProperties struct {
+	Type string // BEGIN/COMMIT/ROLLBACK
+}
+
+func (p *TransactionProperties) Explain() string {
+	return fmt.Sprintf("Type: %s", p.Type)
+}
+
+// UseProperties 用于 USE DATABASE 计划
+type UseProperties struct {
+	Database string
+}
+
+func (p *UseProperties) Explain() string {
+	return fmt.Sprintf("Database: %s", p.Database)
+}
+
+// ShowProperties 用于 SHOW 计划
+type ShowProperties struct {
+	Type string // DATABASES/TABLES
+}
+
+func (p *ShowProperties) Explain() string {
+	return fmt.Sprintf("Type: %s", p.Type)
+}
+
+// ExplainProperties 用于 EXPLAIN 计划
+type ExplainProperties struct {
+	Query *Plan // 要解释的查询计划
+}
+
+func (p *ExplainProperties) Explain() string {
+	return fmt.Sprintf("Query Plan:\n%s", p.Query.Explain("  "))
 }

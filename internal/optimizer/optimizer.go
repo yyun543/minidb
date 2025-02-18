@@ -41,7 +41,7 @@ func (o *Optimizer) Optimize(stmt parser.Node) (*Plan, error) {
 	return plan, nil
 }
 
-// buildPlan 根据AST构建初始查询计划
+// buildPlan 根据AST节点构建查询计划
 func (o *Optimizer) buildPlan(node parser.Node) (*Plan, error) {
 	switch n := node.(type) {
 	case *parser.SelectStmt:
@@ -52,6 +52,24 @@ func (o *Optimizer) buildPlan(node parser.Node) (*Plan, error) {
 		return o.buildUpdatePlan(n)
 	case *parser.DeleteStmt:
 		return o.buildDeletePlan(n)
+	case *parser.CreateDatabaseStmt:
+		return o.buildCreateDatabasePlan(n)
+	case *parser.CreateTableStmt:
+		return o.buildCreateTablePlan(n)
+	case *parser.DropDatabaseStmt:
+		return o.buildDropDatabasePlan(n)
+	case *parser.DropTableStmt:
+		return o.buildDropTablePlan(n)
+	case *parser.TransactionStmt:
+		return o.buildTransactionPlan(n)
+	case *parser.UseStmt:
+		return o.buildUsePlan(n)
+	case *parser.ShowDatabasesStmt:
+		return o.buildShowDatabasesPlan(n)
+	case *parser.ShowTablesStmt:
+		return o.buildShowTablesPlan(n)
+	case *parser.ExplainStmt:
+		return o.buildExplainPlan(n)
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", node)
 	}
@@ -194,6 +212,110 @@ func (o *Optimizer) buildJoinPlan(leftTable string, leftAlias string, joins []*p
 	}
 
 	return currentPlan
+}
+
+// buildCreateDatabasePlan 构建CREATE DATABASE语句的查询计划
+func (o *Optimizer) buildCreateDatabasePlan(stmt *parser.CreateDatabaseStmt) (*Plan, error) {
+	return &Plan{
+		Type: CreateDatabasePlan,
+		Properties: &CreateDatabaseProperties{
+			Database: stmt.Database,
+		},
+	}, nil
+}
+
+// buildCreateTablePlan 构建CREATE TABLE语句的查询计划
+func (o *Optimizer) buildCreateTablePlan(stmt *parser.CreateTableStmt) (*Plan, error) {
+	columns := make([]ColumnRef, len(stmt.Columns))
+	for i, col := range stmt.Columns {
+		columns[i] = ColumnRef{
+			Column: col.Name,
+			Type:   ColumnRefTypeColumn,
+		}
+	}
+	return &Plan{
+		Type: CreateTablePlan,
+		Properties: &CreateTableProperties{
+			Table:   stmt.Table,
+			Columns: columns,
+		},
+	}, nil
+}
+
+// buildDropDatabasePlan 构建DROP DATABASE语句的查询计划
+func (o *Optimizer) buildDropDatabasePlan(stmt *parser.DropDatabaseStmt) (*Plan, error) {
+	return &Plan{
+		Type: DropDatabasePlan,
+		Properties: &DropDatabaseProperties{
+			Database: stmt.Database,
+		},
+	}, nil
+}
+
+// buildDropTablePlan 构建DROP TABLE语句的查询计划
+func (o *Optimizer) buildDropTablePlan(stmt *parser.DropTableStmt) (*Plan, error) {
+	return &Plan{
+		Type: DropTablePlan,
+		Properties: &DropTableProperties{
+			Table: stmt.Table,
+		},
+	}, nil
+}
+
+// buildTransactionPlan 构建事务语句的查询计划
+func (o *Optimizer) buildTransactionPlan(stmt *parser.TransactionStmt) (*Plan, error) {
+	return &Plan{
+		Type: TransactionPlan,
+		Properties: &TransactionProperties{
+			Type: stmt.TxType,
+		},
+	}, nil
+}
+
+// buildUsePlan 构建USE DATABASE语句的查询计划
+func (o *Optimizer) buildUsePlan(stmt *parser.UseStmt) (*Plan, error) {
+	return &Plan{
+		Type: UsePlan,
+		Properties: &UseProperties{
+			Database: stmt.Database,
+		},
+	}, nil
+}
+
+// buildShowDatabasesPlan 构建SHOW DATABASES语句的查询计划
+func (o *Optimizer) buildShowDatabasesPlan(stmt *parser.ShowDatabasesStmt) (*Plan, error) {
+	return &Plan{
+		Type: ShowPlan,
+		Properties: &ShowProperties{
+			Type: "DATABASES",
+		},
+	}, nil
+}
+
+// buildShowTablesPlan 构建SHOW TABLES语句的查询计划
+func (o *Optimizer) buildShowTablesPlan(stmt *parser.ShowTablesStmt) (*Plan, error) {
+	return &Plan{
+		Type: ShowPlan,
+		Properties: &ShowProperties{
+			Type: "TABLES",
+		},
+	}, nil
+}
+
+// buildExplainPlan 构建EXPLAIN语句的查询计划
+func (o *Optimizer) buildExplainPlan(stmt *parser.ExplainStmt) (*Plan, error) {
+	// 首先构建要解释的查询计划
+	queryPlan, err := o.buildPlan(stmt.Query)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Plan{
+		Type: ExplainPlan,
+		Properties: &ExplainProperties{
+			Query: queryPlan,
+		},
+	}, nil
 }
 
 // convertExpression 将AST表达式节点转换为优化器的表达式结构

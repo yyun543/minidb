@@ -424,5 +424,185 @@ func TestOptimizer(t *testing.T) {
 			assert.Equal(t, "users", usersProps.Table)
 			assert.Equal(t, "u", usersProps.TableAlias)
 		})
+
+		// 测试DDL语句的优化
+		t.Run("TestDDLStatements", func(t *testing.T) {
+			// 测试CREATE DATABASE语句
+			t.Run("CreateDatabase", func(t *testing.T) {
+				sql := "CREATE DATABASE test_db"
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.CreateDatabasePlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.CreateDatabaseProperties)
+				assert.True(t, ok)
+				assert.Equal(t, "test_db", props.Database)
+			})
+
+			// 测试CREATE TABLE语句
+			t.Run("CreateTable", func(t *testing.T) {
+				sql := `CREATE TABLE users (
+					id INTEGER PRIMARY KEY,
+					name VARCHAR(255) NOT NULL,
+					age INTEGER
+				)`
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.CreateTablePlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.CreateTableProperties)
+				assert.True(t, ok)
+				assert.Equal(t, "users", props.Table)
+				assert.Len(t, props.Columns, 3)
+			})
+
+			// 测试DROP DATABASE语句
+			t.Run("DropDatabase", func(t *testing.T) {
+				sql := "DROP DATABASE test_db"
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.DropDatabasePlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.DropDatabaseProperties)
+				assert.True(t, ok)
+				assert.Equal(t, "test_db", props.Database)
+			})
+
+			// 测试DROP TABLE语句
+			t.Run("DropTable", func(t *testing.T) {
+				sql := "DROP TABLE users"
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.DropTablePlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.DropTableProperties)
+				assert.True(t, ok)
+				assert.Equal(t, "users", props.Table)
+			})
+		})
+
+		// 测试DCL语句的优化
+		t.Run("TestDCLStatements", func(t *testing.T) {
+			// 测试BEGIN TRANSACTION语句
+			t.Run("BeginTransaction", func(t *testing.T) {
+				sql := "START TRANSACTION"
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.TransactionPlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.TransactionProperties)
+				assert.True(t, ok)
+				assert.Equal(t, "BEGIN", props.Type)
+			})
+
+			// 测试COMMIT语句
+			t.Run("CommitTransaction", func(t *testing.T) {
+				sql := "COMMIT"
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.TransactionPlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.TransactionProperties)
+				assert.True(t, ok)
+				assert.Equal(t, "COMMIT", props.Type)
+			})
+		})
+
+		// 测试Utility语句的优化
+		t.Run("TestUtilityStatements", func(t *testing.T) {
+			// 测试USE语句
+			t.Run("UseDatabase", func(t *testing.T) {
+				sql := "USE test_db"
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.UsePlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.UseProperties)
+				assert.True(t, ok)
+				assert.Equal(t, "test_db", props.Database)
+			})
+
+			// 测试SHOW DATABASES语句
+			t.Run("ShowDatabases", func(t *testing.T) {
+				sql := "SHOW DATABASES"
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.ShowPlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.ShowProperties)
+				assert.True(t, ok)
+				assert.Equal(t, "DATABASES", props.Type)
+			})
+
+			// 测试EXPLAIN语句
+			t.Run("ExplainStatement", func(t *testing.T) {
+				sql := "EXPLAIN SELECT * FROM users"
+				stmt, err := parser.Parse(sql)
+				assert.NoError(t, err)
+
+				opt := optimizer.NewOptimizer()
+				plan, err := opt.Optimize(stmt)
+				assert.NoError(t, err)
+				assert.NotNil(t, plan)
+
+				// 验证计划类型
+				assert.Equal(t, optimizer.ExplainPlan, plan.Type)
+				props, ok := plan.Properties.(*optimizer.ExplainProperties)
+				assert.True(t, ok)
+				assert.NotNil(t, props.Query)
+
+				// 验证被解释的查询计划
+				queryPlan := props.Query
+				assert.Equal(t, optimizer.SelectPlan, queryPlan.Type)
+			})
+		})
 	})
 }

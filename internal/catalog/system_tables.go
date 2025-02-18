@@ -36,8 +36,8 @@ func (st *SystemTables) initSystemTables() {
 	st.tables[SYS_DATABASES] = &TableMeta{
 		Name: SYS_DATABASES,
 		Columns: []ColumnMeta{
-			{Name: "id", Type: "INT64", NotNull: true},
-			{Name: "name", Type: "STRING", NotNull: true},
+			{Name: "id", Type: "INTEGER", NotNull: true},
+			{Name: "name", Type: "VARCHAR", NotNull: true},
 			{Name: "create_time", Type: "TIMESTAMP", NotNull: true},
 			{Name: "update_time", Type: "TIMESTAMP", NotNull: true},
 		},
@@ -51,9 +51,9 @@ func (st *SystemTables) initSystemTables() {
 	st.tables[SYS_TABLES] = &TableMeta{
 		Name: SYS_TABLES,
 		Columns: []ColumnMeta{
-			{Name: "id", Type: "INT64", NotNull: true},
-			{Name: "database_id", Type: "INT64", NotNull: true},
-			{Name: "name", Type: "STRING", NotNull: true},
+			{Name: "id", Type: "INTEGER", NotNull: true},
+			{Name: "database_id", Type: "INTEGER", NotNull: true},
+			{Name: "name", Type: "VARCHAR", NotNull: true},
 			{Name: "create_time", Type: "TIMESTAMP", NotNull: true},
 			{Name: "update_time", Type: "TIMESTAMP", NotNull: true},
 		},
@@ -67,13 +67,13 @@ func (st *SystemTables) initSystemTables() {
 	st.tables[SYS_COLUMNS] = &TableMeta{
 		Name: SYS_COLUMNS,
 		Columns: []ColumnMeta{
-			{Name: "id", Type: "INT64", NotNull: true},
-			{Name: "table_id", Type: "INT64", NotNull: true},
-			{Name: "name", Type: "STRING", NotNull: true},
-			{Name: "type", Type: "STRING", NotNull: true},
-			{Name: "not_null", Type: "BOOL", NotNull: true},
-			{Name: "default_value", Type: "STRING"},
-			{Name: "comment", Type: "STRING"},
+			{Name: "id", Type: "INTEGER", NotNull: true},
+			{Name: "table_id", Type: "INTEGER", NotNull: true},
+			{Name: "name", Type: "VARCHAR", NotNull: true},
+			{Name: "type", Type: "VARCHAR", NotNull: true},
+			{Name: "not_null", Type: "BOOLEAN", NotNull: true},
+			{Name: "default_value", Type: "VARCHAR"},
+			{Name: "comment", Type: "VARCHAR"},
 			{Name: "create_time", Type: "TIMESTAMP", NotNull: true},
 		},
 		Constraints: []Constraint{
