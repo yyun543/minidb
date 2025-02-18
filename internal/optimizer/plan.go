@@ -12,6 +12,7 @@ const (
 	SelectPlan
 	TableScanPlan
 	FilterPlan
+	HavingPlan
 	JoinPlan
 	InsertPlan
 	UpdatePlan
@@ -144,6 +145,7 @@ func (fp *FilterProperties) Explain() string {
 // OrderKey 定义排序键
 type OrderKey struct {
 	Column    string // 排序列
+	Table     string // 排序表
 	Direction string // 排序方向 (ASC/DESC)
 }
 
@@ -211,19 +213,37 @@ func (jp *JoinProperties) Explain() string {
 	return fmt.Sprintf("Type: %s, Left: %s, Right: %s", jp.JoinType, jp.Left, jp.Right)
 }
 
+// HavingProperties 用于 HAVING 计划
+type HavingProperties struct {
+	Condition Expression // HAVING 条件
+}
+
+func (hp *HavingProperties) Explain() string {
+	return fmt.Sprintf("Having Condition: %v", hp.Condition)
+}
+
 // GroupByProperties 用于 GROUP BY 计划
 type GroupByProperties struct {
-	GroupKeys []string    // 分组键列表
-	Having    interface{} // HAVING 条件
+	GroupKeys []ColumnRef // 分组键列表
 }
 
 func (gp *GroupByProperties) Explain() string {
-	return fmt.Sprintf("GroupKeys: %v, Having: %v", gp.GroupKeys, gp.Having)
+	return fmt.Sprintf("GroupKeys: %v", gp.GroupKeys)
 }
 
 // Expression 表达式接口
 type Expression interface {
 	String() string
+}
+
+// FunctionCall 函数调用表达式
+type FunctionCall struct {
+	Name string
+	Args []Expression
+}
+
+func (f *FunctionCall) String() string {
+	return fmt.Sprintf("%s()", f.Name)
 }
 
 // BinaryExpression 二元表达式
@@ -268,3 +288,10 @@ const (
 	LiteralTypeString
 	LiteralTypeBoolean
 )
+
+// Asterisk 表示 * 通配符
+type Asterisk struct{}
+
+func (a *Asterisk) String() string {
+	return "*"
+}

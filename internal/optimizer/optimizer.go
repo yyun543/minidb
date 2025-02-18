@@ -57,108 +57,65 @@ func (o *Optimizer) buildPlan(node parser.Node) (*Plan, error) {
 	}
 }
 
-// buildSelectPlan 构建SELECT查询计划
+// buildSelectPlan 根据AST构建初始查询计划
 func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
-	plan := NewPlan(SelectPlan)
-
-	// 1. 构建SELECT属性
-	selectProps := &SelectProperties{
-		Columns: make([]ColumnRef, 0),
+	// 1. 创建投影算子
+	projectPlan := NewPlan(SelectPlan)
+	projectPlan.Properties = &SelectProperties{
+		Columns: convertSelectItems(stmt.Columns),
 	}
 
-	// 处理 SELECT *
-	if stmt.All {
-		selectProps.All = true
-	} else {
-		// 处理普通列、函数和表达式
-		for _, col := range stmt.Columns {
-			colRef := ColumnRef{
-				Column: col.Column,
-				Table:  col.Table,
-				Alias:  col.Alias,
-			}
-
-			// 根据不同类型处理
-			switch col.Kind {
-			case parser.ColumnItemColumn:
-				colRef.Type = ColumnRefTypeColumn
-			case parser.ColumnItemFunction:
-				colRef.Type = ColumnRefTypeFunction
-				if funcExpr, ok := col.Expr.(*parser.FunctionCall); ok {
-					colRef.FunctionName = funcExpr.Name
-					// 处理函数参数
-					colRef.FunctionArgs = convertFunctionArgs(funcExpr.Args)
-				}
-			case parser.ColumnItemExpression:
-				colRef.Type = ColumnRefTypeExpression
-				colRef.Expression = convertExpression(col.Expr)
-			}
-
-			selectProps.Columns = append(selectProps.Columns, colRef)
-		}
-	}
-	plan.Properties = selectProps
-
-	// 2. 构建FROM子句的表扫描
+	// 2. 构建表扫描和JOIN
+	var currentPlan *Plan
 	if stmt.From != "" {
-		scanPlan := NewPlan(TableScanPlan)
-		scanProps := &TableScanProperties{
-			Table:      stmt.From,
-			TableAlias: stmt.FromAlias,
-			Columns:    make([]ColumnRef, 0),
-		}
-
-		// 收集所需的列信息
-		for _, col := range selectProps.Columns {
-			if col.Type == ColumnRefTypeColumn {
-				scanProps.Columns = append(scanProps.Columns, col)
+		if len(stmt.Joins) > 0 {
+			currentPlan = o.buildJoinPlan(stmt.From, stmt.FromAlias, stmt.Joins)
+		} else {
+			currentPlan = NewPlan(TableScanPlan)
+			currentPlan.Properties = &TableScanProperties{
+				Table:      stmt.From,
+				TableAlias: stmt.FromAlias,
 			}
-		}
-
-		scanPlan.Properties = scanProps
-		plan.AddChild(scanPlan)
-	}
-
-	// 3. 构建JOIN
-	if len(stmt.Joins) > 0 {
-		for _, join := range stmt.Joins {
-			joinPlan := NewPlan(JoinPlan)
-			joinProps := &JoinProperties{
-				JoinType:   join.JoinType,
-				Left:       join.Left.Table,
-				LeftAlias:  join.Left.Alias,
-				Right:      join.Right.Table,
-				RightAlias: join.Right.Alias,
-				Condition:  convertExpression(join.Condition),
-			}
-			joinPlan.Properties = joinProps
-			plan.AddChild(joinPlan)
 		}
 	}
 
-	// 4. 构建WHERE过滤
+	// 3. 构建WHERE过滤
 	if stmt.Where != nil {
 		filterPlan := NewPlan(FilterPlan)
 		filterPlan.Properties = &FilterProperties{
 			Condition: convertExpression(stmt.Where.Condition),
 		}
-		plan.AddChild(filterPlan)
+		filterPlan.AddChild(currentPlan)
+		currentPlan = filterPlan
 	}
 
-	// 5. 构建GROUP BY
+	// 4. 构建GROUP BY
 	if len(stmt.GroupBy) > 0 {
 		groupPlan := NewPlan(GroupPlan)
-		groupKeys := make([]string, len(stmt.GroupBy))
-		for i, key := range stmt.GroupBy {
-			if colRef, ok := key.(*parser.ColumnRef); ok {
-				groupKeys[i] = colRef.Column
+		groupKeys := make([]ColumnRef, len(stmt.GroupBy))
+		for i, expr := range stmt.GroupBy {
+			if colRef, ok := expr.(*parser.ColumnRef); ok {
+				groupKeys[i] = ColumnRef{
+					Column: colRef.Column,
+					Table:  colRef.Table,
+				}
 			}
 		}
 		groupPlan.Properties = &GroupByProperties{
 			GroupKeys: groupKeys,
-			Having:    stmt.Having,
 		}
-		plan.AddChild(groupPlan)
+		groupPlan.AddChild(currentPlan)
+		currentPlan = groupPlan
+	}
+
+	// 5. 构建HAVING (必须在GROUP BY之后)
+	if stmt.Having != nil {
+		havingPlan := NewPlan(HavingPlan)
+		havingPlan.Properties = &HavingProperties{
+			Condition: convertExpression(stmt.Having),
+		}
+		havingPlan.AddChild(currentPlan)
+		currentPlan = havingPlan
 	}
 
 	// 6. 构建ORDER BY
@@ -169,6 +126,7 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 			if colRef, ok := item.Expr.(*parser.ColumnRef); ok {
 				orderKeys[i] = OrderKey{
 					Column:    colRef.Column,
+					Table:     colRef.Table,
 					Direction: item.Direction,
 				}
 			}
@@ -176,7 +134,8 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 		orderPlan.Properties = &OrderByProperties{
 			OrderKeys: orderKeys,
 		}
-		plan.AddChild(orderPlan)
+		orderPlan.AddChild(currentPlan)
+		currentPlan = orderPlan
 	}
 
 	// 7. 构建LIMIT
@@ -185,10 +144,56 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 		limitPlan.Properties = &LimitProperties{
 			Limit: stmt.Limit,
 		}
-		plan.AddChild(limitPlan)
+		limitPlan.AddChild(currentPlan)
+		currentPlan = limitPlan
 	}
 
-	return plan, nil
+	// 8. 最后添加投影算子
+	projectPlan.AddChild(currentPlan)
+
+	return projectPlan, nil
+}
+
+// buildJoinPlan 构建JOIN计划
+func (o *Optimizer) buildJoinPlan(leftTable string, leftAlias string, joins []*parser.JoinClause) *Plan {
+	// 创建左表扫描
+	leftScan := NewPlan(TableScanPlan)
+	leftScan.Properties = &TableScanProperties{
+		Table:      leftTable,
+		TableAlias: leftAlias,
+	}
+
+	currentPlan := leftScan
+
+	// 处理每个JOIN子句
+	for _, join := range joins {
+		joinPlan := NewPlan(JoinPlan)
+
+		// 创建右表扫描
+		rightScan := NewPlan(TableScanPlan)
+		rightScan.Properties = &TableScanProperties{
+			Table:      join.Right.Table,
+			TableAlias: join.Right.Alias,
+		}
+
+		// 设置JOIN属性
+		joinPlan.Properties = &JoinProperties{
+			JoinType:   join.JoinType,
+			Left:       leftTable,
+			LeftAlias:  leftAlias,
+			Right:      join.Right.Table,
+			RightAlias: join.Right.Alias,
+			Condition:  convertExpression(join.Condition),
+		}
+
+		// 添加左右子节点
+		joinPlan.AddChild(currentPlan)
+		joinPlan.AddChild(rightScan)
+
+		currentPlan = joinPlan
+	}
+
+	return currentPlan
 }
 
 // convertExpression 将AST表达式节点转换为优化器的表达式结构
@@ -203,6 +208,11 @@ func convertExpression(expr parser.Node) Expression {
 			Left:     convertExpression(e.Left),
 			Operator: e.Operator,
 			Right:    convertExpression(e.Right),
+		}
+	case *parser.FunctionCall:
+		return &FunctionCall{
+			Name: e.Name,
+			Args: convertFunctionArgs(e.Args),
 		}
 	case *parser.ColumnRef:
 		return &ColumnReference{
@@ -247,10 +257,16 @@ func convertExpression(expr parser.Node) Expression {
 
 // convertFunctionArgs 转换函数参数
 func convertFunctionArgs(args []parser.Node) []Expression {
-	result := make([]Expression, 0, len(args))
-	for _, arg := range args {
-		if expr := convertExpression(arg); expr != nil {
-			result = append(result, expr)
+	if args == nil {
+		return nil
+	}
+	result := make([]Expression, len(args))
+	for i, arg := range args {
+		if arg.Type() == parser.AsteriskNode {
+			// TODO 根据元数据补全所有字段信息
+			result[i] = &Asterisk{}
+		} else {
+			result[i] = convertExpression(arg)
 		}
 	}
 	return result
@@ -301,4 +317,32 @@ func (o *Optimizer) buildDeletePlan(stmt *parser.DeleteStmt) (*Plan, error) {
 		Where: stmt.Where.Condition,
 	}
 	return plan, nil
+}
+
+// convertSelectItems 将解析器的列项转换为优化器的列引用
+func convertSelectItems(items []*parser.ColumnItem) []ColumnRef {
+	refs := make([]ColumnRef, len(items))
+	for i, item := range items {
+		refs[i] = ColumnRef{
+			Column: item.Column,
+			Table:  item.Table,
+			Alias:  item.Alias,
+		}
+
+		// 根据列项类型设置相应的属性
+		switch item.Kind {
+		case parser.ColumnItemColumn:
+			refs[i].Type = ColumnRefTypeColumn
+		case parser.ColumnItemFunction:
+			refs[i].Type = ColumnRefTypeFunction
+			if funcCall, ok := item.Expr.(*parser.FunctionCall); ok {
+				refs[i].FunctionName = funcCall.Name
+				refs[i].FunctionArgs = convertFunctionArgs(funcCall.Args)
+			}
+		case parser.ColumnItemExpression:
+			refs[i].Type = ColumnRefTypeExpression
+			refs[i].Expression = convertExpression(item.Expr)
+		}
+	}
+	return refs
 }

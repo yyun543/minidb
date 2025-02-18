@@ -537,8 +537,11 @@ func (v *MiniQLVisitorImpl) VisitSelectStatement(ctx *SelectStatementContext) in
 	}
 
 	// 处理 HAVING 子句
-	if ctx.HAVING() != nil && ctx.Expression(0) != nil {
-		if result := v.Visit(ctx.Expression(0)); result != nil {
+	if ctx.HAVING() != nil {
+		// 修改：使用正确的 Expression 获取 HAVING 条件
+		// 注意：HAVING 子句的表达式在 ctx.Expression(1) 中
+		// WHERE 子句的表达式在 ctx.Expression(0) 中
+		if result := v.Visit(ctx.Expression(1)); result != nil {
 			if expr, ok := result.(Node); ok {
 				stmt.Having = expr
 			}
