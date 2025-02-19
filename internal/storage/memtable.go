@@ -206,15 +206,17 @@ func deserializeRecord(data []byte) (*arrow.Record, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create IPC reader: %w", err)
 	}
-	// 确保 reader 资源及时释放，不过返回的 record 已经拥有自己的内存引用
-	defer reader.Release()
 
 	// 读取第一个 record 批次
 	if !reader.Next() {
+		reader.Release()
 		return nil, fmt.Errorf("no record found in data")
 	}
 	record := reader.Record()
-	// 注意：record 内部已持有必要的内存引用，调用该函数后，调用方需要在适当时机调用 record.Release()
+	// 增加 record 的引用计数，确保在释放 reader 后 record 的数据依然有效
+	record.Retain()
+	// 释放 reader
+	reader.Release()
 
 	return &record, nil
 }
