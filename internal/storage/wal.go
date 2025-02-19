@@ -1,109 +1,62 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
-	"go.etcd.io/bbolt"
+	bolt "go.etcd.io/bbolt"
 )
 
-// TODO WAL (Write-Ahead Log)
-
-// WAL 预写日志
+// WAL (Write-Ahead Log) 实现基于 bbolt 的预写式日志
 type WAL struct {
-	db     *bbolt.DB
+	db     *bolt.DB
+	path   string
 	bucket []byte
 }
 
-// WALRecord WAL记录
-type WALRecord struct {
-	Timestamp int64  // 时间戳
-	Type      byte   // 操作类型(PUT/DELETE)
-	Key       []byte // 键
-	Value     []byte // 值
+// WALEntry 表示一个WAL条目
+type WALEntry struct {
+	Timestamp int64  // 操作时间戳
+	OpType    OpType // 操作类型
+	Key       []byte // 操作的键
+	Value     []byte // 操作的值
 }
+
+// OpType 定义WAL操作类型
+type OpType byte
 
 const (
-	// 操作类型常量
-	WAL_PUT    byte = 1
-	WAL_DELETE byte = 2
+	OpPut    OpType = 1
+	OpDelete OpType = 2
 )
 
-// NewWAL 创建WAL实例
+// NewWAL 创建新的WAL实例
 func NewWAL(path string) (*WAL, error) {
-	// 确保目录存在
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return nil, err
-	}
-
-	// 打开bbolt数据库
-	db, err := bbolt.Open(path, 0600, &bbolt.Options{Timeout: 1 * time.Second})
-	if err != nil {
-		return nil, err
-	}
-
-	// 创建bucket
-	bucket := []byte("wal")
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(bucket)
-		return err
+	db, err := bolt.Open(path, 0600, &bolt.Options{
+		Timeout: 1 * time.Second,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open WAL: %v", err)
 	}
 
-	return &WAL{
+	w := &WAL{
 		db:     db,
-		bucket: bucket,
-	}, nil
-}
-
-// Write 写入WAL记录
-func (w *WAL) Write(recordType byte, key, value []byte) error {
-	// 构造WAL记录
-	record := &WALRecord{
-		Timestamp: time.Now().UnixNano(),
-		Type:      recordType,
-		Key:       key,
-		Value:     value,
+		path:   path,
+		bucket: []byte("wal"),
 	}
 
-	// 序列化记录
-	data, err := w.encodeRecord(record)
-	if err != nil {
+	// 初始化bucket
+	err = w.db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(w.bucket)
 		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create WAL bucket: %v", err)
 	}
 
-	// 写入bbolt
-	return w.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(w.bucket)
-		// 使用时间戳作为key
-		k := make([]byte, 8)
-		binary.BigEndian.PutUint64(k, uint64(record.Timestamp))
-		return b.Put(k, data)
-	})
-}
-
-// Read 读取WAL记录
-func (w *WAL) Read() ([]*WALRecord, error) {
-	var records []*WALRecord
-
-	err := w.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(w.bucket)
-		return b.ForEach(func(k, v []byte) error {
-			record, err := w.decodeRecord(v)
-			if err != nil {
-				return err
-			}
-			records = append(records, record)
-			return nil
-		})
-	})
-
-	return records, err
+	return w, nil
 }
 
 // Close 关闭WAL
@@ -111,60 +64,159 @@ func (w *WAL) Close() error {
 	return w.db.Close()
 }
 
-// encodeRecord 序列化WAL记录
-func (w *WAL) encodeRecord(record *WALRecord) ([]byte, error) {
-	// 8字节时间戳 + 1字节类型 + 4字节key长度 + key + 4字节value长度 + value
-	keyLen := len(record.Key)
-	valueLen := len(record.Value)
-	data := make([]byte, 8+1+4+keyLen+4+valueLen)
-
-	// 写入时间戳
-	binary.BigEndian.PutUint64(data[0:], uint64(record.Timestamp))
-	// 写入类型
-	data[8] = record.Type
-	// 写入key长度
-	binary.BigEndian.PutUint32(data[9:], uint32(keyLen))
-	// 写入key
-	copy(data[13:], record.Key)
-	// 写入value长度
-	binary.BigEndian.PutUint32(data[13+keyLen:], uint32(valueLen))
-	// 写入value
-	copy(data[17+keyLen:], record.Value)
-
-	return data, nil
-}
-
-// decodeRecord 反序列化WAL记录
-func (w *WAL) decodeRecord(data []byte) (*WALRecord, error) {
-	if len(data) < 13 { // 最小长度检查
-		return nil, fmt.Errorf("invalid record data")
-	}
-
-	// 读取时间戳
-	timestamp := int64(binary.BigEndian.Uint64(data[0:]))
-	// 读取类型
-	recordType := data[8]
-	// 读取key长度
-	keyLen := binary.BigEndian.Uint32(data[9:])
-	if len(data) < 13+int(keyLen)+4 {
-		return nil, fmt.Errorf("invalid record data")
-	}
-	// 读取key
-	key := make([]byte, keyLen)
-	copy(key, data[13:13+keyLen])
-	// 读取value长度
-	valueLen := binary.BigEndian.Uint32(data[13+keyLen:])
-	if len(data) < 17+int(keyLen)+int(valueLen) {
-		return nil, fmt.Errorf("invalid record data")
-	}
-	// 读取value
-	value := make([]byte, valueLen)
-	copy(value, data[17+keyLen:])
-
-	return &WALRecord{
-		Timestamp: timestamp,
-		Type:      recordType,
+// AppendPut 追加Put操作到WAL
+func (w *WAL) AppendPut(key, value []byte) error {
+	entry := WALEntry{
+		Timestamp: time.Now().UnixNano(),
+		OpType:    OpPut,
 		Key:       key,
 		Value:     value,
-	}, nil
+	}
+	return w.append(entry)
+}
+
+// AppendDelete 追加Delete操作到WAL
+func (w *WAL) AppendDelete(key []byte) error {
+	entry := WALEntry{
+		Timestamp: time.Now().UnixNano(),
+		OpType:    OpDelete,
+		Key:       key,
+	}
+	return w.append(entry)
+}
+
+// append 将WAL条目写入存储
+func (w *WAL) append(entry WALEntry) error {
+	return w.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(w.bucket)
+
+		// 使用时间戳作为key
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(key, uint64(entry.Timestamp))
+
+		// 序列化entry
+		value := w.encodeEntry(entry)
+
+		return b.Put(key, value)
+	})
+}
+
+// encodeEntry 序列化WAL条目
+func (w *WAL) encodeEntry(entry WALEntry) []byte {
+	// 计算总长度：timestamp(8) + opType(1) + keyLen(4) + key + valueLen(4) + value
+	keyLen := len(entry.Key)
+	valueLen := len(entry.Value)
+	totalLen := 8 + 1 + 4 + keyLen + 4 + valueLen
+
+	buf := make([]byte, totalLen)
+	offset := 0
+
+	// 写入timestamp
+	binary.BigEndian.PutUint64(buf[offset:], uint64(entry.Timestamp))
+	offset += 8
+
+	// 写入操作类型
+	buf[offset] = byte(entry.OpType)
+	offset += 1
+
+	// 写入key长度和key
+	binary.BigEndian.PutUint32(buf[offset:], uint32(keyLen))
+	offset += 4
+	copy(buf[offset:], entry.Key)
+	offset += keyLen
+
+	// 写入value长度和value
+	binary.BigEndian.PutUint32(buf[offset:], uint32(valueLen))
+	offset += 4
+	copy(buf[offset:], entry.Value)
+
+	return buf
+}
+
+// Scan 扫描指定时间范围内的WAL条目
+func (w *WAL) Scan(startTime, endTime int64) ([]WALEntry, error) {
+	var entries []WALEntry
+
+	err := w.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(w.bucket)
+		c := b.Cursor()
+
+		// 构造范围查询的key
+		startKey := make([]byte, 8)
+		endKey := make([]byte, 8)
+		binary.BigEndian.PutUint64(startKey, uint64(startTime))
+		binary.BigEndian.PutUint64(endKey, uint64(endTime))
+
+		for k, v := c.Seek(startKey); k != nil && bytes.Compare(k, endKey) <= 0; k, v = c.Next() {
+			entry, err := w.decodeEntry(v)
+			if err != nil {
+				return err
+			}
+			entries = append(entries, entry)
+		}
+
+		return nil
+	})
+
+	return entries, err
+}
+
+// decodeEntry 反序列化WAL条目
+func (w *WAL) decodeEntry(data []byte) (WALEntry, error) {
+	var entry WALEntry
+
+	if len(data) < 13 { // 最小长度：timestamp(8) + opType(1) + keyLen(4)
+		return entry, fmt.Errorf("invalid WAL entry data")
+	}
+
+	offset := 0
+
+	// 读取timestamp
+	entry.Timestamp = int64(binary.BigEndian.Uint64(data[offset:]))
+	offset += 8
+
+	// 读取操作类型
+	entry.OpType = OpType(data[offset])
+	offset += 1
+
+	// 读取key
+	keyLen := binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+	if offset+int(keyLen) > len(data) {
+		return entry, fmt.Errorf("invalid key length")
+	}
+	entry.Key = make([]byte, keyLen)
+	copy(entry.Key, data[offset:offset+int(keyLen)])
+	offset += int(keyLen)
+
+	// 读取value
+	if offset+4 <= len(data) {
+		valueLen := binary.BigEndian.Uint32(data[offset:])
+		offset += 4
+		if offset+int(valueLen) <= len(data) {
+			entry.Value = make([]byte, valueLen)
+			copy(entry.Value, data[offset:offset+int(valueLen)])
+		}
+	}
+
+	return entry, nil
+}
+
+// Truncate 清除指定时间之前的WAL条目
+func (w *WAL) Truncate(beforeTime int64) error {
+	return w.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(w.bucket)
+		c := b.Cursor()
+
+		endKey := make([]byte, 8)
+		binary.BigEndian.PutUint64(endKey, uint64(beforeTime))
+
+		for k, _ := c.First(); k != nil && bytes.Compare(k, endKey) <= 0; k, _ = c.First() {
+			if err := c.Delete(); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }

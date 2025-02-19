@@ -2,166 +2,219 @@ package storage
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 
-	"github.com/google/btree"
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/ipc"
+	"github.com/apache/arrow/go/v18/arrow/memory"
 )
 
-// TODO 内存表
-
-// MemTable 内存表
+// MemTable 实现基于内存的存储引擎，支持 WAL 日志和内存索引
 type MemTable struct {
-	tree    *btree.BTree // B树存储
-	wal     *WAL         // 预写日志
-	rwMutex sync.RWMutex // 读写锁
+	wal   *WAL
+	index *Index
+	mutex sync.RWMutex
 }
 
-// memTableItem B树节点项
-type memTableItem struct {
-	key   []byte
-	value []byte
-}
-
-// Less 实现btree.Item接口
-func (i *memTableItem) Less(than btree.Item) bool {
-	return bytes.Compare(i.key, than.(*memTableItem).key) < 0
-}
-
-// NewMemTable 创建内存表
+// NewMemTable 创建新的 MemTable 实例
 func NewMemTable(walPath string) (*MemTable, error) {
-	// 创建WAL
 	wal, err := NewWAL(walPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create WAL: %v", err)
 	}
 
-	mt := &MemTable{
-		tree: btree.New(32), // 32阶B树
-		wal:  wal,
-	}
-
-	// 从WAL恢复数据
-	if err := mt.recover(); err != nil {
-		return nil, err
-	}
-
-	return mt, nil
-}
-
-// Get 获取key对应的值
-func (mt *MemTable) Get(key []byte) ([]byte, error) {
-	mt.rwMutex.RLock()
-	defer mt.rwMutex.RUnlock()
-
-	item := mt.tree.Get(&memTableItem{key: key})
-	if item == nil {
-		return nil, nil
-	}
-	return item.(*memTableItem).value, nil
-}
-
-// Put 写入key-value对
-func (mt *MemTable) Put(key []byte, value []byte) error {
-	// 先写WAL
-	if err := mt.wal.Write(WAL_PUT, key, value); err != nil {
-		return err
-	}
-
-	// 再更新内存
-	mt.rwMutex.Lock()
-	mt.tree.ReplaceOrInsert(&memTableItem{
-		key:   key,
-		value: value,
-	})
-	mt.rwMutex.Unlock()
-
-	return nil
-}
-
-// Delete 删除key对应的数据
-func (mt *MemTable) Delete(key []byte) error {
-	// 先写WAL
-	if err := mt.wal.Write(WAL_DELETE, key, nil); err != nil {
-		return err
-	}
-
-	// 再更新内存
-	mt.rwMutex.Lock()
-	mt.tree.Delete(&memTableItem{key: key})
-	mt.rwMutex.Unlock()
-
-	return nil
-}
-
-// Scan 范围扫描
-func (mt *MemTable) Scan(start []byte, end []byte) (Iterator, error) {
-	mt.rwMutex.RLock()
-	defer mt.rwMutex.RUnlock()
-
-	var items []*memTableItem
-	mt.tree.AscendRange(&memTableItem{key: start}, &memTableItem{key: end}, func(i btree.Item) bool {
-		items = append(items, i.(*memTableItem))
-		return true
-	})
-
-	return &memTableIterator{
-		items:    items,
-		position: -1,
+	return &MemTable{
+		wal:   wal,
+		index: NewIndex(),
 	}, nil
 }
 
-// Close 关闭内存表
+// Open 实现 Engine 接口
+func (mt *MemTable) Open() error {
+	// MemTable 在创建时已经完成初始化，这里无需额外操作
+	return nil
+}
+
+// Close 实现 Engine 接口
 func (mt *MemTable) Close() error {
+	mt.mutex.Lock()
+	defer mt.mutex.Unlock()
+
+	// 清理索引
+	mt.index.Clear()
+
+	// 关闭 WAL
 	return mt.wal.Close()
 }
 
-// recover 从WAL恢复数据
-func (mt *MemTable) recover() error {
-	records, err := mt.wal.Read()
+// Get 实现 Engine 接口
+func (mt *MemTable) Get(key []byte) (*arrow.Record, error) {
+	mt.mutex.RLock()
+	defer mt.mutex.RUnlock()
+
+	// 从索引中查找
+	value, exists := mt.index.Get(key)
+	if !exists {
+		return nil, nil
+	}
+
+	// TODO 将字节数组转换为 Arrow Record
+	// 注意：这里假设 value 中存储的是序列化的 Arrow Record
+	// 实际实现中需要添加序列化/反序列化逻辑
+	record, err := deserializeRecord(value)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to deserialize record: %v", err)
 	}
 
-	for _, record := range records {
-		switch record.Type {
-		case WAL_PUT:
-			mt.tree.ReplaceOrInsert(&memTableItem{
-				key:   record.Key,
-				value: record.Value,
-			})
-		case WAL_DELETE:
-			mt.tree.Delete(&memTableItem{key: record.Key})
-		}
+	return record, nil
+}
+
+// Put 实现 Engine 接口
+func (mt *MemTable) Put(key []byte, record *arrow.Record) error {
+	mt.mutex.Lock()
+	defer mt.mutex.Unlock()
+
+	// 序列化 Arrow Record
+	value, err := serializeRecord(*record)
+	if err != nil {
+		return fmt.Errorf("failed to serialize record: %v", err)
 	}
+
+	// 写入 WAL
+	if err := mt.wal.AppendPut(key, value); err != nil {
+		return fmt.Errorf("failed to append to WAL: %v", err)
+	}
+
+	// 更新内存索引
+	mt.index.Put(key, value)
 
 	return nil
 }
 
-// memTableIterator 内存表迭代器
+// Delete 实现 Engine 接口
+func (mt *MemTable) Delete(key []byte) error {
+	mt.mutex.Lock()
+	defer mt.mutex.Unlock()
+
+	// 写入 WAL
+	if err := mt.wal.AppendDelete(key); err != nil {
+		return fmt.Errorf("failed to append delete to WAL: %v", err)
+	}
+
+	// 从索引中删除
+	mt.index.Delete(key)
+
+	return nil
+}
+
+// Scan 实现 Engine 接口
+func (mt *MemTable) Scan(start []byte, end []byte) (RecordIterator, error) {
+	mt.mutex.RLock()
+	defer mt.mutex.RUnlock()
+
+	// 创建迭代器
+	it := &memTableIterator{
+		table:    mt,
+		iterator: mt.index.NewIterator(start, end),
+	}
+
+	return it, nil
+}
+
+// Flush 实现 Engine 接口
+func (mt *MemTable) Flush() error {
+	// TODO MemTable 目前是纯内存实现，需要实现将数据持久化到其他存储介质的逻辑
+	return nil
+}
+
+// memTableIterator 实现 RecordIterator 接口
 type memTableIterator struct {
-	items    []*memTableItem
-	position int
+	table    *MemTable
+	iterator *Iterator
+	current  arrow.Record
 }
 
+// Next 实现 RecordIterator 接口
 func (it *memTableIterator) Next() bool {
-	it.position++
-	return it.position < len(it.items)
-}
-
-func (it *memTableIterator) Key() []byte {
-	if it.position >= len(it.items) {
-		return nil
+	// 释放之前的 Record
+	if it.current != nil {
+		it.current.Release()
+		it.current = nil
 	}
-	return it.items[it.position].key
-}
 
-func (it *memTableIterator) Value() []byte {
-	if it.position >= len(it.items) {
-		return nil
+	if !it.iterator.Next() {
+		return false
 	}
-	return it.items[it.position].value
+
+	// 获取当前值并反序列化为 Record
+	value := it.iterator.Value()
+	record, err := deserializeRecord(value)
+	if err != nil {
+		// 处理错误，这里简单返回 false
+		return false
+	}
+
+	it.current = *record
+	return true
 }
 
+// Record 实现 RecordIterator 接口
+func (it *memTableIterator) Record() *arrow.Record {
+	return &it.current
+}
+
+// Close 实现 RecordIterator 接口
 func (it *memTableIterator) Close() error {
+	if it.current != nil {
+		it.current.Release()
+		it.current = nil
+	}
 	return nil
+}
+
+// serializeRecord 将 Arrow Record 序列化为字节数组。
+// 实现采用 Arrow IPC Writer，将 record 写入到缓冲区。
+// 调用者在写入 WAL 时，只需要持久化生成的字节数组。
+func serializeRecord(record arrow.Record) ([]byte, error) {
+	var buf bytes.Buffer
+
+	// 使用 record 的 schema 进行 IPC writer 初始化，同时指定内存分配器
+	allocator := memory.NewGoAllocator()
+	writer := ipc.NewWriter(&buf, ipc.WithSchema(record.Schema()), ipc.WithAllocator(allocator))
+
+	// 写入 record（数据批次），必须检查错误
+	if err := writer.Write(record); err != nil {
+		writer.Close() // 尽量释放 writer 资源
+		return nil, fmt.Errorf("failed to write record: %w", err)
+	}
+
+	// 关闭 writer，将缓冲区内容刷新
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close IPC writer: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// deserializeRecord 将字节数组反序列化为 Arrow Record。
+// 使用 Arrow IPC Reader 从数据中恢复 record，注意仅读取第一个 record 批次。
+// 调用者在处理完返回的 record 后应调用 record.Release() 释放资源。
+func deserializeRecord(data []byte) (*arrow.Record, error) {
+	buf := bytes.NewReader(data)
+	reader, err := ipc.NewReader(buf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create IPC reader: %w", err)
+	}
+	// 确保 reader 资源及时释放，不过返回的 record 已经拥有自己的内存引用
+	defer reader.Release()
+
+	// 读取第一个 record 批次
+	if !reader.Next() {
+		return nil, fmt.Errorf("no record found in data")
+	}
+	record := reader.Record()
+	// 注意：record 内部已持有必要的内存引用，调用该函数后，调用方需要在适当时机调用 record.Release()
+
+	return &record, nil
 }
