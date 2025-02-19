@@ -36,7 +36,7 @@ type Engine interface {
 
 	// Get 获取指定 key 对应的 Arrow 记录。
 	// IMPORTANT: 调用者应在处理完返回的 Record 后调用 Record.Release() 释放资源！
-	Get(key []byte) (*arrow.Record, error)
+	Get(key []byte) (arrow.Record, error)
 
 	// Put 写入 Arrow 记录到指定 key。
 	// 注意：通常建议对传入的 record 转移所有权，存储引擎在持久化后可能调用 Release() 释放内存。
@@ -60,7 +60,7 @@ type RecordIterator interface {
 
 	// Record 获取当前位置的 Arrow 记录。
 	// IMPORTANT: 调用者需在使用完 Record 后调用 Record.Release() 释放内存。
-	Record() *arrow.Record
+	Record() arrow.Record
 
 	// Close 关闭迭代器并释放相关资源
 	Close() error

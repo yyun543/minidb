@@ -49,7 +49,7 @@ func (mt *MemTable) Close() error {
 }
 
 // Get 实现 Engine 接口
-func (mt *MemTable) Get(key []byte) (*arrow.Record, error) {
+func (mt *MemTable) Get(key []byte) (arrow.Record, error) {
 	mt.mutex.RLock()
 	defer mt.mutex.RUnlock()
 
@@ -67,7 +67,7 @@ func (mt *MemTable) Get(key []byte) (*arrow.Record, error) {
 		return nil, fmt.Errorf("failed to deserialize record: %v", err)
 	}
 
-	return record, nil
+	return *record, nil
 }
 
 // Put 实现 Engine 接口
@@ -160,8 +160,8 @@ func (it *memTableIterator) Next() bool {
 }
 
 // Record 实现 RecordIterator 接口
-func (it *memTableIterator) Record() *arrow.Record {
-	return &it.current
+func (it *memTableIterator) Record() arrow.Record {
+	return it.current
 }
 
 // Close 实现 RecordIterator 接口
