@@ -163,15 +163,37 @@ func (b *Batch) Release() {
 // MapSQLTypeToArrowType converts SQL type to arrow.DataType
 func MapSQLTypeToArrowType(sqlType string) arrow.DataType {
 	switch sqlType {
-	case "INT":
+	case "INTEGER":
 		return arrow.PrimitiveTypes.Int64
-	case "FLOAT":
+	case "DOUBLE":
 		return arrow.PrimitiveTypes.Float64
-	case "VARCHAR", "TEXT":
+	case "VARCHAR", "STRING":
 		return arrow.BinaryTypes.String
-	case "BOOL":
+	case "BOOLEAN":
 		return arrow.FixedWidthTypes.Boolean
 	default:
 		return arrow.BinaryTypes.String
 	}
+}
+
+// ToRow 将当前批次转换为行格式
+func (b *Batch) ToRow() []interface{} {
+	if b.record == nil {
+		return nil
+	}
+	result := make([]interface{}, b.record.NumCols())
+	for i := 0; i < int(b.record.NumCols()); i++ {
+		col := b.record.Column(i)
+		switch col.DataType().ID() {
+		case arrow.STRING:
+			result[i] = col.(*array.String).Value(0)
+		case arrow.INT64:
+			result[i] = col.(*array.Int64).Value(0)
+		case arrow.FLOAT64:
+			result[i] = col.(*array.Float64).Value(0)
+		case arrow.BOOL:
+			result[i] = col.(*array.Boolean).Value(0)
+		}
+	}
+	return result
 }
