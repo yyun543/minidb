@@ -1,329 +1,125 @@
 package catalog
 
 import (
+	"fmt"
+
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/storage"
-	"time"
 )
 
-// SystemTables 系统表管理器
+const (
+	// 定义系统表的固定 key，用于存储系统级元数据
+	KeySysDatabases = "sys:databases"
+	KeySysTables    = "sys:tables"
+	KeySysColumns   = "sys:columns"
+	KeySysIndexes   = "sys:indexes"
+)
 
-// initSystemTables 初始化系统表
-func (c *Catalog) initSystemTables() error {
-	// 创建系统数据库
-	sysDB := &DatabaseMeta{
-		ID:         time.Now().UnixNano(),
-		Name:       storage.SYS_DATABASE,
-		CreateTime: time.Now(),
-		UpdateTime: time.Now(),
+var SysDatabasesSchema = arrow.NewSchema([]arrow.Field{
+	{Name: "name", Type: arrow.BinaryTypes.String},
+}, nil)
+
+var SysTablesSchema = arrow.NewSchema([]arrow.Field{
+	{Name: "database", Type: arrow.BinaryTypes.String},
+	{Name: "table", Type: arrow.BinaryTypes.String},
+	{Name: "schema", Type: arrow.BinaryTypes.String}, // 存储 Arrow Schema 的 JSON 表示
+}, nil)
+
+var SysColumnsSchema = arrow.NewSchema([]arrow.Field{
+	{Name: "database", Type: arrow.BinaryTypes.String},
+	{Name: "table", Type: arrow.BinaryTypes.String},
+	{Name: "column", Type: arrow.BinaryTypes.String},
+	{Name: "type", Type: arrow.BinaryTypes.String},
+}, nil)
+
+var SysIndexesSchema = arrow.NewSchema([]arrow.Field{
+	{Name: "database", Type: arrow.BinaryTypes.String},
+	{Name: "table", Type: arrow.BinaryTypes.String},
+	{Name: "index", Type: arrow.BinaryTypes.String},
+	{Name: "columns", Type: arrow.BinaryTypes.String}, // 可存储 JSON 数组或逗号分隔的名称序列
+}, nil)
+
+// createEmptyRecord 辅助函数：为给定 schema 构造一个空的 Arrow record。
+// 这里假设系统表所有的字段均为 string 类型。
+func createEmptyRecord(schema *arrow.Schema) arrow.Record {
+	pool := memory.NewGoAllocator()
+	arrays := make([]arrow.Array, len(schema.Fields()))
+	for i := range schema.Fields() {
+		builder := array.NewStringBuilder(pool)
+		arr := builder.NewArray()
+		builder.Release()
+		arrays[i] = arr
+	}
+	return array.NewRecord(schema, arrays, 0)
+}
+
+// InitializeSystemTables 检查系统表是否存在；如果不存在，则创建空记录初始化，确保系统自举时 Catalog 元数据可用。
+func InitializeSystemTables(engine storage.Engine) error {
+	// 检查 sys_databases 表
+	rec, err := engine.Get([]byte(KeySysDatabases))
+	if err != nil {
+		return fmt.Errorf("failed to get sys_databases: %w", err)
+	}
+	if rec == nil {
+		emptyRec := createEmptyRecord(SysDatabasesSchema)
+		if err := engine.Put([]byte(KeySysDatabases), &emptyRec); err != nil {
+			emptyRec.Release()
+			return fmt.Errorf("failed to initialize sys_databases: %w", err)
+		}
+		emptyRec.Release()
+	} else {
+		rec.Release()
 	}
 
-	if err := c.storage.Put(c.keyManager.DatabaseKey(sysDB.Name), encodeDatabase(sysDB)); err != nil {
-		return err
+	// 检查 sys_tables 表
+	rec, err = engine.Get([]byte(KeySysTables))
+	if err != nil {
+		return fmt.Errorf("failed to get sys_tables: %w", err)
+	}
+	if rec == nil {
+		emptyRec := createEmptyRecord(SysTablesSchema)
+		if err := engine.Put([]byte(KeySysTables), &emptyRec); err != nil {
+			emptyRec.Release()
+			return fmt.Errorf("failed to initialize sys_tables: %w", err)
+		}
+		emptyRec.Release()
+	} else {
+		rec.Release()
 	}
 
-	// 创建系统表: sys_databases
-	if err := c.createSysDatabasesTable(sysDB.ID); err != nil {
-		return err
+	// 检查 sys_columns 表
+	rec, err = engine.Get([]byte(KeySysColumns))
+	if err != nil {
+		return fmt.Errorf("failed to get sys_columns: %w", err)
+	}
+	if rec == nil {
+		emptyRec := createEmptyRecord(SysColumnsSchema)
+		if err := engine.Put([]byte(KeySysColumns), &emptyRec); err != nil {
+			emptyRec.Release()
+			return fmt.Errorf("failed to initialize sys_columns: %w", err)
+		}
+		emptyRec.Release()
+	} else {
+		rec.Release()
 	}
 
-	// 创建系统表: sys_tables
-	if err := c.createSysTablesTable(); err != nil {
-		return err
+	// 检查 sys_indexes 表
+	rec, err = engine.Get([]byte(KeySysIndexes))
+	if err != nil {
+		return fmt.Errorf("failed to get sys_indexes: %w", err)
 	}
-
-	// 创建系统表: sys_columns
-	if err := c.createSysColumnsTable(); err != nil {
-		return err
-	}
-
-	// 创建系统表: sys_indexes
-	if err := c.createSysIndexesTable(); err != nil {
-		return err
+	if rec == nil {
+		emptyRec := createEmptyRecord(SysIndexesSchema)
+		if err := engine.Put([]byte(KeySysIndexes), &emptyRec); err != nil {
+			emptyRec.Release()
+			return fmt.Errorf("failed to initialize sys_indexes: %w", err)
+		}
+		emptyRec.Release()
+	} else {
+		rec.Release()
 	}
 
 	return nil
-}
-
-func (c *Catalog) createSysDatabasesTable(sysDBID int64) error {
-	table := &TableMeta{
-		ID:         time.Now().UnixNano(),
-		Name:       storage.SYS_DATABASES,
-		DatabaseID: sysDBID,
-		Columns: []ColumnMeta{
-			{
-				ID:         time.Now().UnixNano(),
-				Name:       "id",
-				Type:       "INTEGER",
-				NotNull:    true,
-				CreateTime: time.Now(),
-				UpdateTime: time.Now(),
-			},
-			{
-				ID:         time.Now().UnixNano(),
-				Name:       "name",
-				Type:       "VARCHAR",
-				NotNull:    true,
-				CreateTime: time.Now(),
-				UpdateTime: time.Now(),
-			},
-			{
-				ID:         time.Now().UnixNano(),
-				Name:       "create_time",
-				Type:       "TIMESTAMP",
-				NotNull:    true,
-				CreateTime: time.Now(),
-				UpdateTime: time.Now(),
-			},
-		},
-		Constraints: []Constraint{
-			{
-				Name:    "pk_sys_databases",
-				Type:    "PRIMARY",
-				Columns: []string{"id"},
-			},
-		},
-		CreateTime: time.Now(),
-		UpdateTime: time.Now(),
-	}
-
-	return c.storage.Put(c.keyManager.TableKey(storage.SYS_DATABASE, table.Name), encodeTable(table))
-}
-
-// createSysTablesTable 创建系统表 sys_tables
-func (c *Catalog) createSysTablesTable() error {
-	// 创建系统表 sys_tables 的元数据
-	sysTablesTable := &TableMeta{
-		ID:   time.Now().UnixNano(),
-		Name: "sys_tables",
-		Columns: []ColumnMeta{
-			{
-				ID:      1,
-				Name:    "table_id",
-				Type:    "INTEGER",
-				NotNull: true,
-			},
-			{
-				ID:      2,
-				Name:    "database_name",
-				Type:    "VARCHAR",
-				NotNull: true,
-			},
-			{
-				ID:      3,
-				Name:    "table_name",
-				Type:    "VARCHAR",
-				NotNull: true,
-			},
-			{
-				ID:      4,
-				Name:    "table_type",
-				Type:    "VARCHAR",
-				NotNull: true,
-			},
-			{
-				ID:      5,
-				Name:    "create_time",
-				Type:    "TIMESTAMP",
-				NotNull: true,
-			},
-			{
-				ID:      6,
-				Name:    "update_time",
-				Type:    "TIMESTAMP",
-				NotNull: true,
-			},
-		},
-		Constraints: []Constraint{
-			{
-				Name:    "pk_sys_tables",
-				Type:    "PRIMARY",
-				Columns: []string{"table_id"},
-			},
-			{
-				Name:    "uk_sys_tables_name",
-				Type:    "UNIQUE",
-				Columns: []string{"database_name", "table_name"},
-			},
-		},
-		CreateTime: time.Now(),
-		UpdateTime: time.Now(),
-	}
-
-	// 存储系统表元数据
-	return c.storage.Put(c.keyManager.TableKey(storage.SYS_DATABASE, sysTablesTable.Name), encodeTable(sysTablesTable))
-}
-
-// createSysColumnsTable 创建系统表 sys_columns
-func (c *Catalog) createSysColumnsTable() error {
-	// 创建系统表 sys_columns 的元数据
-	sysColumnsTable := &TableMeta{
-		ID:   time.Now().UnixNano(),
-		Name: "sys_columns",
-		Columns: []ColumnMeta{
-			{
-				ID:      1,
-				Name:    "column_id",
-				Type:    "INTEGER",
-				NotNull: true,
-			},
-			{
-				ID:      2,
-				Name:    "table_id",
-				Type:    "INTEGER",
-				NotNull: true,
-			},
-			{
-				ID:      3,
-				Name:    "column_name",
-				Type:    "VARCHAR",
-				NotNull: true,
-			},
-			{
-				ID:      4,
-				Name:    "data_type",
-				Type:    "VARCHAR",
-				NotNull: true,
-			},
-			{
-				ID:      5,
-				Name:    "is_nullable",
-				Type:    "BOOLEAN",
-				NotNull: true,
-			},
-			{
-				ID:      6,
-				Name:    "default_value",
-				Type:    "VARCHAR",
-				NotNull: false,
-			},
-			{
-				ID:      7,
-				Name:    "ordinal_position",
-				Type:    "INTEGER",
-				NotNull: true,
-			},
-			{
-				ID:      8,
-				Name:    "create_time",
-				Type:    "TIMESTAMP",
-				NotNull: true,
-			},
-			{
-				ID:      9,
-				Name:    "update_time",
-				Type:    "TIMESTAMP",
-				NotNull: true,
-			},
-		},
-		Constraints: []Constraint{
-			{
-				Name:    "pk_sys_columns",
-				Type:    "PRIMARY",
-				Columns: []string{"column_id"},
-			},
-			{
-				Name:       "fk_sys_columns_table",
-				Type:       "FOREIGN",
-				Columns:    []string{"table_id"},
-				RefTable:   "sys_tables",
-				RefColumns: []string{"table_id"},
-			},
-			{
-				Name:    "uk_sys_columns_name",
-				Type:    "UNIQUE",
-				Columns: []string{"table_id", "column_name"},
-			},
-		},
-		CreateTime: time.Now(),
-		UpdateTime: time.Now(),
-	}
-
-	// 存储系统表元数据
-	return c.storage.Put(c.keyManager.TableKey(storage.SYS_DATABASE, sysColumnsTable.Name), encodeTable(sysColumnsTable))
-}
-
-func (c *Catalog) createSysIndexesTable() error {
-	sysIndexesTable := &TableMeta{
-		ID:   time.Now().UnixNano(),
-		Name: "sys_indexes",
-		Columns: []ColumnMeta{
-			{
-				ID:      1,
-				Name:    "index_id",
-				Type:    "INTEGER",
-				NotNull: true,
-			},
-			{
-				ID:      2,
-				Name:    "table_id",
-				Type:    "INTEGER",
-				NotNull: true,
-			},
-			{
-				ID:      3,
-				Name:    "index_name",
-				Type:    "VARCHAR",
-				NotNull: true,
-			},
-			{
-				ID:      4,
-				Name:    "index_type",
-				Type:    "VARCHAR",
-				NotNull: true,
-			},
-			{
-				ID:      5,
-				Name:    "is_unique",
-				Type:    "BOOLEAN",
-				NotNull: true,
-			},
-			{
-				ID:      6,
-				Name:    "is_primary",
-				Type:    "BOOLEAN",
-				NotNull: true,
-			},
-			{
-				ID:      7,
-				Name:    "column_names",
-				Type:    "VARCHAR",
-				NotNull: true,
-			},
-			{
-				ID:      8,
-				Name:    "create_time",
-				Type:    "TIMESTAMP",
-				NotNull: true,
-			},
-			{
-				ID:      9,
-				Name:    "update_time",
-				Type:    "TIMESTAMP",
-				NotNull: true,
-			},
-		},
-		Constraints: []Constraint{
-			{
-				Name:    "pk_sys_indexes",
-				Type:    "PRIMARY",
-				Columns: []string{"index_id"},
-			},
-			{
-				Name:       "fk_sys_indexes_table",
-				Type:       "FOREIGN",
-				Columns:    []string{"table_id"},
-				RefTable:   "sys_tables",
-				RefColumns: []string{"table_id"},
-			},
-			{
-				Name:    "uk_sys_indexes_name",
-				Type:    "UNIQUE",
-				Columns: []string{"table_id", "index_name"},
-			},
-		},
-		CreateTime: time.Now(),
-		UpdateTime: time.Now(),
-	}
-
-	return c.storage.Put(c.keyManager.TableKey(storage.SYS_DATABASE, sysIndexesTable.Name), encodeTable(sysIndexesTable))
 }

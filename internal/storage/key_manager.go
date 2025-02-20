@@ -54,6 +54,15 @@ func (km *KeyManager) SysTableKey(tableID int64) []byte {
 	return []byte(fmt.Sprintf("%ssys_tables:%d", km.sysPrefix, tableID))
 }
 
+// GetKeyRange 返回以指定前缀的扫描范围：起始键为prefix，结束键为prefix的字典序后继。
+func (km *KeyManager) GetKeyRange(prefix []byte) (start, end []byte) {
+	start = prefix
+	end = make([]byte, len(prefix))
+	copy(end, prefix)
+	end[len(end)-1]++ // 将最后一字节加1，假设不会溢出
+	return
+}
+
 // ParseKey 解析key获取组成部分
 func (km *KeyManager) ParseKey(key string) map[string]string {
 	parts := strings.Split(key, ":")
