@@ -1,23 +1,22 @@
 package catalog
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
 	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/storage"
+	"github.com/yyun543/minidb/internal/types"
 )
 
-// MetadataManager 封装了 Catalog 元数据的读写操作（例如数据库、表信息），
-// 其实现基于存储引擎以及 Apache Arrow 记录格式。
+// MetadataManager 负责管理数据库元数据，包括数据库、表等信息。
 type MetadataManager struct {
 	engine storage.Engine
 	km     *storage.KeyManager
 }
 
-// NewMetadataManager 创建 MetadataManager 实例。
+// NewMetadataManager 创建一个新的元数据管理器实例。
 func NewMetadataManager(engine storage.Engine) *MetadataManager {
 	return &MetadataManager{
 		engine: engine,
@@ -25,161 +24,380 @@ func NewMetadataManager(engine storage.Engine) *MetadataManager {
 	}
 }
 
-// DatabaseMeta 表示数据库元数据（目前仅包含名称，后续可扩展）。
+// DatabaseMeta 表示数据库元数据。
 type DatabaseMeta struct {
-	Name string `json:"name"`
+	Name string
 }
 
-// TableMeta 表示表元数据，其中 Schema 字段存储 Arrow Schema 的 JSON 表示。
+// TableMeta 表示表元数据。
 type TableMeta struct {
-	Database string `json:"database"`
-	Table    string `json:"table"`
-	Schema   string `json:"schema"`
+	Database string
+	Table    string
+	Schema   *arrow.Schema
 }
 
-// CreateDatabase 构造一条 Arrow 记录写入存储引擎，实现“数据库创建”。
-//
-// 注：这里采用单行单列的 Arrow 记录，列名固定为 "name"。
+// CreateDatabase 创建数据库元数据记录。
 func (m *MetadataManager) CreateDatabase(name string) error {
-	pool := memory.NewGoAllocator()
-	// 定义 schema：单个 string 字段 "name"
-	field := arrow.Field{Name: "name", Type: arrow.BinaryTypes.String}
-	schema := arrow.NewSchema([]arrow.Field{field}, nil)
-
-	builder := array.NewStringBuilder(pool)
-	builder.Append(name)
-	arr := builder.NewArray()
-	builder.Release()
-
-	record := array.NewRecord(schema, []arrow.Array{arr}, 1)
-
-	key := m.km.DatabaseKey(name)
-	err := m.engine.Put(key, &record)
+	// 检查数据库是否已存在
+	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES)
+	existingRecord, err := m.engine.Get(key)
 	if err != nil {
-		record.Release()
+		return fmt.Errorf("failed to check database existence: %w", err)
+	}
+
+	// 获取当前最大ID
+	maxID := int64(0)
+	if existingRecord != nil {
+		defer existingRecord.Release()
+		if existingRecord.NumRows() > 0 {
+			// 检查数据库是否已存在
+			nameCol := existingRecord.Column(1).(*array.String)
+			for i := int64(0); i < existingRecord.NumRows(); i++ {
+				if nameCol.Value(int(i)) == name {
+					return fmt.Errorf("database %s already exists", name)
+				}
+			}
+			// 获取最大ID
+			idCol := existingRecord.Column(0).(*array.Int64)
+			for i := int64(0); i < existingRecord.NumRows(); i++ {
+				if idCol.Value(int(i)) > maxID {
+					maxID = idCol.Value(int(i))
+				}
+			}
+		}
+	}
+
+	// 创建新的数据库记录
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, SysDatabasesSchema)
+	defer builder.Release()
+
+	// 保留现有记录
+	if existingRecord != nil && existingRecord.NumRows() > 0 {
+		// 复制现有的ID
+		idCol := existingRecord.Column(0).(*array.Int64)
+		idBuilder := builder.Field(0).(*array.Int64Builder)
+		for i := int64(0); i < existingRecord.NumRows(); i++ {
+			idBuilder.Append(idCol.Value(int(i)))
+		}
+		// 复制现有的名称
+		nameCol := existingRecord.Column(1).(*array.String)
+		nameBuilder := builder.Field(1).(*array.StringBuilder)
+		for i := int64(0); i < existingRecord.NumRows(); i++ {
+			nameBuilder.Append(nameCol.Value(int(i)))
+		}
+	}
+
+	// 添加新数据库记录
+	builder.Field(0).(*array.Int64Builder).Append(maxID + 1)
+	builder.Field(1).(*array.StringBuilder).Append(name)
+
+	// 创建Record
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 写入存储
+	err = m.engine.Put(key, &record)
+	if err != nil {
 		return fmt.Errorf("failed to create database meta: %w", err)
 	}
-	// 所有权已转移，不需要调用 Release() 由引擎统一管理
+
 	return nil
 }
 
-// GetDatabase 通过存储引擎中 key 获取数据库的元数据。
+// GetDatabase 获取数据库元数据。
 func (m *MetadataManager) GetDatabase(name string) (DatabaseMeta, error) {
-	key := m.km.DatabaseKey(name)
+	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES)
 	record, err := m.engine.Get(key)
-	if err != nil || record == nil {
+	if err != nil {
+		return DatabaseMeta{}, fmt.Errorf("failed to get database meta: %w", err)
+	}
+	if record == nil {
 		return DatabaseMeta{}, fmt.Errorf("database not found")
 	}
 	defer record.Release()
 
-	// 假设 record 中第一列存储 "name"
-	col := record.Column(0)
-	stringArr := col.(*array.String)
-	if stringArr.Len() < 1 {
-		return DatabaseMeta{}, fmt.Errorf("empty database metadata")
-	}
-	dbName := stringArr.Value(0)
-	return DatabaseMeta{Name: dbName}, nil
-}
-
-// CreateTable 构造一条表元数据 Arrow 记录写入存储引擎，实现“建表”操作。
-//
-// 此处将表元数据（包括所属数据库、表名、以及 Schema 信息）序列化为 JSON 存入单列 "meta" 中。
-func (m *MetadataManager) CreateTable(dbName string, table TableMeta) error {
-	// 将 TableMeta 序列化为 JSON
-	b, err := json.Marshal(table)
-	if err != nil {
-		return fmt.Errorf("failed to marshal table metadata: %w", err)
+	// 遍历记录查找匹配的数据库
+	for i := int64(0); i < record.NumRows(); i++ {
+		nameCol := record.Column(1).(*array.String)
+		if nameCol.Value(int(i)) == name {
+			return DatabaseMeta{
+				Name: name,
+			}, nil
+		}
 	}
 
-	pool := memory.NewGoAllocator()
-	field := arrow.Field{Name: "meta", Type: arrow.BinaryTypes.String}
-	schema := arrow.NewSchema([]arrow.Field{field}, nil)
-
-	builder := array.NewStringBuilder(pool)
-	builder.Append(string(b))
-	arr := builder.NewArray()
-	builder.Release()
-
-	record := array.NewRecord(schema, []arrow.Array{arr}, 1)
-
-	key := m.km.TableKey(dbName, table.Table)
-	err = m.engine.Put(key, &record)
-	if err != nil {
-		record.Release()
-		return fmt.Errorf("failed to create table meta: %w", err)
-	}
-	return nil
-}
-
-// GetTable 通过存储引擎获取表元数据，并反序列化成 TableMeta 结构体。
-func (m *MetadataManager) GetTable(dbName, tableName string) (TableMeta, error) {
-	key := m.km.TableKey(dbName, tableName)
-	record, err := m.engine.Get(key)
-	if err != nil || record == nil {
-		return TableMeta{}, fmt.Errorf("table not found")
-	}
-	defer record.Release()
-
-	col := record.Column(0)
-	stringArr := col.(*array.String)
-	if stringArr.Len() < 1 {
-		return TableMeta{}, fmt.Errorf("empty table metadata")
-	}
-	metaJSON := stringArr.Value(0)
-	var tableMeta TableMeta
-	err = json.Unmarshal([]byte(metaJSON), &tableMeta)
-	if err != nil {
-		return TableMeta{}, fmt.Errorf("failed to unmarshal table metadata: %w", err)
-	}
-	return tableMeta, nil
+	return DatabaseMeta{}, fmt.Errorf("database %s not found", name)
 }
 
 // GetAllDatabases 获取所有数据库的元数据。
 func (m *MetadataManager) GetAllDatabases() ([]DatabaseMeta, error) {
-	// 使用 KeyManager 构造扫描范围
-	prefix := m.km.DatabaseKey("")
-	startKey, endKey := m.km.GetKeyRange(prefix)
-
-	// 创建迭代器
-	it, err := m.engine.Scan(startKey, endKey)
+	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES)
+	record, err := m.engine.Get(key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to scan databases: %w", err)
+		return nil, fmt.Errorf("failed to get databases: %w", err)
 	}
-	defer it.Close()
+	if record == nil {
+		return []DatabaseMeta{}, nil
+	}
+	defer record.Release()
 
 	var databases []DatabaseMeta
-	// 遍历所有数据库记录
-	for it.Next() {
-		record := it.Record()
-		// 确保在处理完后释放记录
-		defer record.Release()
-
-		if record.NumCols() < 1 {
-			continue
-		}
-
-		// 获取数据库名称
-		col := record.Column(0)
-		stringArr := col.(*array.String)
-		for i := 0; i < stringArr.Len(); i++ {
-			databases = append(databases, DatabaseMeta{
-				Name: stringArr.Value(i),
-			})
-		}
+	nameCol := record.Column(1).(*array.String)
+	for i := int64(0); i < record.NumRows(); i++ {
+		databases = append(databases, DatabaseMeta{Name: nameCol.Value(int(i))})
 	}
 
 	return databases, nil
 }
 
-// DeleteDatabase 删除指定数据库的元数据。
-func (m *MetadataManager) DeleteDatabase(name string) error {
-	key := m.km.DatabaseKey(name)
-	return m.engine.Delete(key)
+// CreateTable 创建表元数据记录。
+func (m *MetadataManager) CreateTable(dbName string, table TableMeta) error {
+	// 检查数据库是否存在
+	_, err := m.GetDatabase(dbName)
+	if err != nil {
+		return fmt.Errorf("database %s not found", dbName)
+	}
+
+	// 获取现有表记录
+	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_TABLES)
+	existingRecord, err := m.engine.Get(key)
+	if err != nil {
+		return fmt.Errorf("failed to check table existence: %w", err)
+	}
+
+	// 获取当前最大ID
+	maxID := int64(0)
+	if existingRecord != nil {
+		defer existingRecord.Release()
+		if existingRecord.NumRows() > 0 {
+			// 检查表是否已存在
+			dbNameCol := existingRecord.Column(2).(*array.String)
+			tableNameCol := existingRecord.Column(3).(*array.String)
+			for i := int64(0); i < existingRecord.NumRows(); i++ {
+				if dbNameCol.Value(int(i)) == dbName && tableNameCol.Value(int(i)) == table.Table {
+					return fmt.Errorf("table %s already exists in database %s", table.Table, dbName)
+				}
+			}
+			// 获取最大ID
+			idCol := existingRecord.Column(0).(*array.Int64)
+			for i := int64(0); i < existingRecord.NumRows(); i++ {
+				if idCol.Value(int(i)) > maxID {
+					maxID = idCol.Value(int(i))
+				}
+			}
+		}
+	}
+
+	// 创建新的表记录
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, SysTablesSchema)
+	defer builder.Release()
+
+	// 保留现有记录
+	if existingRecord != nil && existingRecord.NumRows() > 0 {
+		// 复制现有的ID
+		idCol := existingRecord.Column(0).(*array.Int64)
+		idBuilder := builder.Field(0).(*array.Int64Builder)
+		for i := int64(0); i < existingRecord.NumRows(); i++ {
+			idBuilder.Append(idCol.Value(int(i)))
+		}
+		// 复制现有的数据库ID
+		dbIDCol := existingRecord.Column(1).(*array.Int64)
+		dbIDBuilder := builder.Field(1).(*array.Int64Builder)
+		for i := int64(0); i < existingRecord.NumRows(); i++ {
+			dbIDBuilder.Append(dbIDCol.Value(int(i)))
+		}
+		// 复制现有的数据库名
+		dbNameCol := existingRecord.Column(2).(*array.String)
+		dbNameBuilder := builder.Field(2).(*array.StringBuilder)
+		for i := int64(0); i < existingRecord.NumRows(); i++ {
+			dbNameBuilder.Append(dbNameCol.Value(int(i)))
+		}
+		// 复制现有的表名
+		tableNameCol := existingRecord.Column(3).(*array.String)
+		tableNameBuilder := builder.Field(3).(*array.StringBuilder)
+		for i := int64(0); i < existingRecord.NumRows(); i++ {
+			tableNameBuilder.Append(tableNameCol.Value(int(i)))
+		}
+		// 复制现有的schema
+		schemaCol := existingRecord.Column(4).(*array.Binary)
+		schemaBuilder := builder.Field(4).(*array.BinaryBuilder)
+		for i := int64(0); i < existingRecord.NumRows(); i++ {
+			schemaBuilder.Append(schemaCol.Value(int(i)))
+		}
+	}
+
+	// 添加新表记录
+	builder.Field(0).(*array.Int64Builder).Append(maxID + 1)    // id
+	builder.Field(1).(*array.Int64Builder).Append(1)            // db_id (固定为1，因为是系统表)
+	builder.Field(2).(*array.StringBuilder).Append(dbName)      // db_name
+	builder.Field(3).(*array.StringBuilder).Append(table.Table) // table_name
+
+	// 序列化schema
+	schemaBytes := types.SerializeSchema(table.Schema)
+	builder.Field(4).(*array.BinaryBuilder).Append(schemaBytes)
+
+	// 创建Record
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 写入存储
+	err = m.engine.Put(key, &record)
+	if err != nil {
+		return fmt.Errorf("failed to create table meta: %w", err)
+	}
+
+	return nil
 }
 
-// DeleteTable 删除指定表的元数据。
+// GetTable 获取表元数据。
+func (m *MetadataManager) GetTable(dbName, tableName string) (TableMeta, error) {
+	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_TABLES)
+	record, err := m.engine.Get(key)
+	if err != nil {
+		return TableMeta{}, fmt.Errorf("failed to get table meta: %w", err)
+	}
+	if record == nil {
+		return TableMeta{}, fmt.Errorf("table not found")
+	}
+	defer record.Release()
+
+	// 遍历记录查找匹配的表
+	for i := int64(0); i < record.NumRows(); i++ {
+		dbNameCol := record.Column(2).(*array.String)
+		tableNameCol := record.Column(3).(*array.String)
+		schemaCol := record.Column(4).(*array.Binary)
+
+		if dbNameCol.Value(int(i)) == dbName && tableNameCol.Value(int(i)) == tableName {
+			// 找到匹配的表，解析schema
+			schemaData := schemaCol.Value(int(i))
+			schema, err := types.DeserializeSchema(schemaData)
+			if err != nil {
+				return TableMeta{}, fmt.Errorf("failed to deserialize schema: %w", err)
+			}
+
+			return TableMeta{
+				Database: dbName,
+				Table:    tableName,
+				Schema:   schema,
+			}, nil
+		}
+	}
+
+	return TableMeta{}, fmt.Errorf("table %s.%s not found", dbName, tableName)
+}
+
+// DeleteDatabase 删除数据库元数据。
+func (m *MetadataManager) DeleteDatabase(name string) error {
+	if name == storage.SYS_DATABASE {
+		return fmt.Errorf("cannot delete system database")
+	}
+
+	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES)
+	record, err := m.engine.Get(key)
+	if err != nil {
+		return fmt.Errorf("failed to get database meta: %w", err)
+	}
+	if record == nil {
+		return fmt.Errorf("database not found")
+	}
+	defer record.Release()
+
+	// 检查数据库是否存在
+	nameCol := record.Column(1).(*array.String)
+	found := false
+	for i := int64(0); i < record.NumRows(); i++ {
+		if nameCol.Value(int(i)) == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("database %s not found", name)
+	}
+
+	// 创建新的Record，排除要删除的数据库
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, SysDatabasesSchema)
+	defer builder.Release()
+
+	idCol := record.Column(0).(*array.Int64)
+
+	for i := int64(0); i < record.NumRows(); i++ {
+		if nameCol.Value(int(i)) != name {
+			builder.Field(0).(*array.Int64Builder).Append(idCol.Value(int(i)))
+			builder.Field(1).(*array.StringBuilder).Append(nameCol.Value(int(i)))
+		}
+	}
+
+	newRecord := builder.NewRecord()
+	defer newRecord.Release()
+
+	// 更新存储
+	err = m.engine.Put(key, &newRecord)
+	if err != nil {
+		return fmt.Errorf("failed to update database meta: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteTable 删除表元数据。
 func (m *MetadataManager) DeleteTable(dbName, tableName string) error {
-	key := m.km.TableKey(dbName, tableName)
-	return m.engine.Delete(key)
+	if dbName == storage.SYS_DATABASE {
+		return fmt.Errorf("cannot delete system tables")
+	}
+
+	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_TABLES)
+	record, err := m.engine.Get(key)
+	if err != nil {
+		return fmt.Errorf("failed to get table meta: %w", err)
+	}
+	if record == nil {
+		return fmt.Errorf("table not found")
+	}
+	defer record.Release()
+
+	// 检查表是否存在
+	dbNameCol := record.Column(2).(*array.String)
+	tableNameCol := record.Column(3).(*array.String)
+	found := false
+	for i := int64(0); i < record.NumRows(); i++ {
+		if dbNameCol.Value(int(i)) == dbName && tableNameCol.Value(int(i)) == tableName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("table %s.%s not found", dbName, tableName)
+	}
+
+	// 创建新的Record，排除要删除的表
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, SysTablesSchema)
+	defer builder.Release()
+
+	for i := int64(0); i < record.NumRows(); i++ {
+		if record.Column(2).(*array.String).Value(int(i)) != dbName ||
+			record.Column(3).(*array.String).Value(int(i)) != tableName {
+			// 复制所有字段
+			builder.Field(0).(*array.Int64Builder).Append(record.Column(0).(*array.Int64).Value(int(i)))
+			builder.Field(1).(*array.Int64Builder).Append(record.Column(1).(*array.Int64).Value(int(i)))
+			builder.Field(2).(*array.StringBuilder).Append(record.Column(2).(*array.String).Value(int(i)))
+			builder.Field(3).(*array.StringBuilder).Append(record.Column(3).(*array.String).Value(int(i)))
+			builder.Field(4).(*array.BinaryBuilder).Append(record.Column(4).(*array.Binary).Value(int(i)))
+		}
+	}
+
+	newRecord := builder.NewRecord()
+	defer newRecord.Release()
+
+	// 更新存储
+	err = m.engine.Put(key, &newRecord)
+	if err != nil {
+		return fmt.Errorf("failed to update table meta: %w", err)
+	}
+
+	return nil
 }

@@ -49,9 +49,34 @@ func (km *KeyManager) TableKey(dbName, tableName string) []byte {
 	return []byte(fmt.Sprintf("%s:%s:%s", keyTypeTable, dbName, tableName))
 }
 
+// TableColumnKey 生成表列记录的key
+func (km *KeyManager) TableColumnKey(dbName, tableName, columnName string) []byte {
+	return []byte(fmt.Sprintf("%s:%s:%s:%s", keyTypeColumn, dbName, tableName, columnName))
+}
+
+// TableIndexKey 生成表索引记录的key
+func (km *KeyManager) TableIndexKey(dbName, tableName, indexName string) []byte {
+	return []byte(fmt.Sprintf("%s:%s:%s:%s", keyTypeIndex, dbName, tableName, indexName))
+}
+
 // SysTableKey 生成系统表记录的key
 func (km *KeyManager) SysTableKey(tableID int64) []byte {
 	return []byte(fmt.Sprintf("%ssys_tables:%d", km.sysPrefix, tableID))
+}
+
+// SysDatabaseKey 生成系统数据库记录的key
+func (km *KeyManager) SysDatabaseKey(dbID int64) []byte {
+	return []byte(fmt.Sprintf("%ssys_databases:%d", km.sysPrefix, dbID))
+}
+
+// SysColumnKey 生成系统列记录的key
+func (km *KeyManager) SysColumnKey(columnID int64) []byte {
+	return []byte(fmt.Sprintf("%ssys_columns:%d", km.sysPrefix, columnID))
+}
+
+// SysIndexKey 生成系统索引记录的key
+func (km *KeyManager) SysIndexKey(indexID int64) []byte {
+	return []byte(fmt.Sprintf("%ssys_indexes:%d", km.sysPrefix, indexID))
 }
 
 // GetKeyRange 返回以指定前缀的扫描范围：起始键为prefix，结束键为prefix的字典序后继。

@@ -30,21 +30,33 @@ func (c *Catalog) Init() error {
 
 // CreateDatabase 通过 MetadataManager 创建一个新的数据库记录。
 func (c *Catalog) CreateDatabase(name string) error {
+	if name == "" {
+		return fmt.Errorf("database name is empty")
+	}
 	return c.metadataMgr.CreateDatabase(name)
 }
 
 // CreateTable 通过 MetadataManager 创建一个新的表记录。
 func (c *Catalog) CreateTable(dbName string, table TableMeta) error {
+	if dbName == "" || table.Table == "" {
+		return fmt.Errorf("database name or table name is empty")
+	}
 	return c.metadataMgr.CreateTable(dbName, table)
 }
 
 // DeleteDatabase 通过 MetadataManager 删除指定数据库的记录。
 func (c *Catalog) DeleteDatabase(name string) error {
+	if name == "" {
+		return fmt.Errorf("database name is empty")
+	}
 	return c.metadataMgr.DeleteDatabase(name)
 }
 
 // DeleteTable 通过 MetadataManager 删除指定表的记录。
 func (c *Catalog) DeleteTable(dbName, tableName string) error {
+	if dbName == "" || tableName == "" {
+		return fmt.Errorf("database name or table name is empty")
+	}
 	return c.metadataMgr.DeleteTable(dbName, tableName)
 }
 
@@ -55,10 +67,16 @@ func (c *Catalog) GetAllDatabases() ([]DatabaseMeta, error) {
 
 // GetDatabase 读取指定数据库的元数据。
 func (c *Catalog) GetDatabase(name string) (DatabaseMeta, error) {
+	if name == "" {
+		return DatabaseMeta{}, fmt.Errorf("database name is empty")
+	}
 	return c.metadataMgr.GetDatabase(name)
 }
 
 // GetTable 读取指定表的元数据。
 func (c *Catalog) GetTable(dbName, tableName string) (TableMeta, error) {
+	if dbName == "" || tableName == "" {
+		return TableMeta{}, fmt.Errorf("database name or table name is empty")
+	}
 	return c.metadataMgr.GetTable(dbName, tableName)
 }
