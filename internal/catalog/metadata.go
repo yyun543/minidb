@@ -31,15 +31,16 @@ type DatabaseMeta struct {
 
 // TableMeta 表示表元数据。
 type TableMeta struct {
-	Database string
-	Table    string
-	Schema   *arrow.Schema
+	Database   string
+	Table      string
+	ChunkCount int64
+	Schema     *arrow.Schema
 }
 
 // CreateDatabase 创建数据库元数据记录。
 func (m *MetadataManager) CreateDatabase(name string) error {
 	// 检查数据库是否已存在
-	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES)
+	key := m.km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_DATABASES, 0)
 	existingRecord, err := m.engine.Get(key)
 	if err != nil {
 		return fmt.Errorf("failed to check database existence: %w", err)
@@ -107,7 +108,7 @@ func (m *MetadataManager) CreateDatabase(name string) error {
 
 // GetDatabase 获取数据库元数据。
 func (m *MetadataManager) GetDatabase(name string) (DatabaseMeta, error) {
-	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES)
+	key := m.km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_DATABASES, 0)
 	record, err := m.engine.Get(key)
 	if err != nil {
 		return DatabaseMeta{}, fmt.Errorf("failed to get database meta: %w", err)
@@ -132,7 +133,7 @@ func (m *MetadataManager) GetDatabase(name string) (DatabaseMeta, error) {
 
 // GetAllDatabases 获取所有数据库的元数据。
 func (m *MetadataManager) GetAllDatabases() ([]DatabaseMeta, error) {
-	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES)
+	key := m.km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_DATABASES, 0)
 	record, err := m.engine.Get(key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get databases: %w", err)
@@ -160,7 +161,7 @@ func (m *MetadataManager) CreateTable(dbName string, table TableMeta) error {
 	}
 
 	// 获取现有表记录
-	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_TABLES)
+	key := m.km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_TABLES, 0)
 	existingRecord, err := m.engine.Get(key)
 	if err != nil {
 		return fmt.Errorf("failed to check table existence: %w", err)
@@ -220,9 +221,15 @@ func (m *MetadataManager) CreateTable(dbName string, table TableMeta) error {
 		for i := int64(0); i < existingRecord.NumRows(); i++ {
 			tableNameBuilder.Append(tableNameCol.Value(int(i)))
 		}
+		// 复制现有的chunk_count
+		chunkCountCol := existingRecord.Column(4).(*array.Int64)
+		chunkCountBuilder := builder.Field(4).(*array.Int64Builder)
+		for i := int64(0); i < existingRecord.NumRows(); i++ {
+			chunkCountBuilder.Append(chunkCountCol.Value(int(i)))
+		}
 		// 复制现有的schema
-		schemaCol := existingRecord.Column(4).(*array.Binary)
-		schemaBuilder := builder.Field(4).(*array.BinaryBuilder)
+		schemaCol := existingRecord.Column(5).(*array.Binary)
+		schemaBuilder := builder.Field(5).(*array.BinaryBuilder)
 		for i := int64(0); i < existingRecord.NumRows(); i++ {
 			schemaBuilder.Append(schemaCol.Value(int(i)))
 		}
@@ -233,10 +240,14 @@ func (m *MetadataManager) CreateTable(dbName string, table TableMeta) error {
 	builder.Field(1).(*array.Int64Builder).Append(1)            // db_id (固定为1，因为是系统表)
 	builder.Field(2).(*array.StringBuilder).Append(dbName)      // db_name
 	builder.Field(3).(*array.StringBuilder).Append(table.Table) // table_name
+	builder.Field(4).(*array.Int64Builder).Append(0)            // chunk_count
 
 	// 序列化schema
-	schemaBytes := types.SerializeSchema(table.Schema)
-	builder.Field(4).(*array.BinaryBuilder).Append(schemaBytes)
+	schemaBytes, err := types.SerializeSchema(table.Schema)
+	if err != nil {
+		return fmt.Errorf("failed to serialize schema: %w", err)
+	}
+	builder.Field(5).(*array.BinaryBuilder).Append(schemaBytes)
 
 	// 创建Record
 	record := builder.NewRecord()
@@ -253,7 +264,7 @@ func (m *MetadataManager) CreateTable(dbName string, table TableMeta) error {
 
 // GetTable 获取表元数据。
 func (m *MetadataManager) GetTable(dbName, tableName string) (TableMeta, error) {
-	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_TABLES)
+	key := m.km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_TABLES, 0)
 	record, err := m.engine.Get(key)
 	if err != nil {
 		return TableMeta{}, fmt.Errorf("failed to get table meta: %w", err)
@@ -267,20 +278,23 @@ func (m *MetadataManager) GetTable(dbName, tableName string) (TableMeta, error) 
 	for i := int64(0); i < record.NumRows(); i++ {
 		dbNameCol := record.Column(2).(*array.String)
 		tableNameCol := record.Column(3).(*array.String)
-		schemaCol := record.Column(4).(*array.Binary)
+		chunkCountCol := record.Column(4).(*array.Int64)
+		schemaCol := record.Column(5).(*array.Binary)
 
 		if dbNameCol.Value(int(i)) == dbName && tableNameCol.Value(int(i)) == tableName {
 			// 找到匹配的表，解析schema
 			schemaData := schemaCol.Value(int(i))
+			chunkCountData := chunkCountCol.Value(int(i))
 			schema, err := types.DeserializeSchema(schemaData)
 			if err != nil {
 				return TableMeta{}, fmt.Errorf("failed to deserialize schema: %w", err)
 			}
 
 			return TableMeta{
-				Database: dbName,
-				Table:    tableName,
-				Schema:   schema,
+				Database:   dbName,
+				Table:      tableName,
+				ChunkCount: chunkCountData,
+				Schema:     schema,
 			}, nil
 		}
 	}
@@ -294,7 +308,7 @@ func (m *MetadataManager) DeleteDatabase(name string) error {
 		return fmt.Errorf("cannot delete system database")
 	}
 
-	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES)
+	key := m.km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_DATABASES, 0)
 	record, err := m.engine.Get(key)
 	if err != nil {
 		return fmt.Errorf("failed to get database meta: %w", err)
@@ -349,7 +363,7 @@ func (m *MetadataManager) DeleteTable(dbName, tableName string) error {
 		return fmt.Errorf("cannot delete system tables")
 	}
 
-	key := m.km.TableKey(storage.SYS_DATABASE, storage.SYS_TABLES)
+	key := m.km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_TABLES, 0)
 	record, err := m.engine.Get(key)
 	if err != nil {
 		return fmt.Errorf("failed to get table meta: %w", err)
@@ -386,7 +400,8 @@ func (m *MetadataManager) DeleteTable(dbName, tableName string) error {
 			builder.Field(1).(*array.Int64Builder).Append(record.Column(1).(*array.Int64).Value(int(i)))
 			builder.Field(2).(*array.StringBuilder).Append(record.Column(2).(*array.String).Value(int(i)))
 			builder.Field(3).(*array.StringBuilder).Append(record.Column(3).(*array.String).Value(int(i)))
-			builder.Field(4).(*array.BinaryBuilder).Append(record.Column(4).(*array.Binary).Value(int(i)))
+			builder.Field(4).(*array.Int64Builder).Append(record.Column(4).(*array.Int64).Value(int(i)))
+			builder.Field(5).(*array.BinaryBuilder).Append(record.Column(5).(*array.Binary).Value(int(i)))
 		}
 	}
 
