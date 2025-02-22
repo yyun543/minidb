@@ -1,199 +1,183 @@
 package types
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow/ipc"
 	"github.com/apache/arrow/go/v18/arrow/memory"
 )
 
-// Batch 表示一批数据
-type Batch struct {
-	record arrow.Record
-	pool   memory.Allocator
-	schema *arrow.Schema
-	cols   []arrow.Array
+/**
+* 核心设计思路：
+* Arrow Record和存储是通过动态的Chunk分割和元数据更新的数据读写的。
+* 一个arrow.Record对应一个chunk，多个chunk构成的chunks  []*types.Chunk来表示一个表，
+* 一个Chunk包含小于4KB的数据行（需要用storage.KeyManager.CalculateChunkSize根据表的Schema来计算出当前表的一个Chunk最大行数），
+* 一个Chunk对应storage存储引擎一个Key-Value。
+* 一个表的元数据包括：表的Schema，表的Chunk个数，每个Chunk的ID。
+* 一个Chunk的元数据包括：Chunk的ID，Chunk的行数，Chunk的Schema。
+* 一个Chunk的数据包括：Chunk的行数据。
+* 一个表的元数据和Chunk的元数据存储在storage存储引擎中，Chunk的数据存储在storage存储引擎中。
+* 一个表的元数据和Chunk的元数据通过Key-Value的形式存储在storage存储引擎中。
+* 一个表的Chunk的数据通过Key-Value的形式存储在storage存储引擎中。
+ */
+
+// Chunk 表示从一个Chunks表分片出的一批数据，是对 arrow.Record 的封装
+type Chunk struct {
+	chunk     arrow.Record
+	chunkId   int64 // Chunk 的序号，从 0 开始
+	chunkSize int64 // Chunk 的大小，单位为字节
 }
 
-// NewBatch 创建新的数据批次
-func NewBatch(schema *arrow.Schema, capacity int, pool memory.Allocator) *Batch {
+// NewChunk 从 arrow.Record 创建新的数据批次
+func NewChunk(chunk arrow.Record, chunkId int64, chunkSize int64) *Chunk {
+	// 增加引用计数，确保数据不会被过早释放
+	chunk.Retain()
+	return &Chunk{chunk: chunk, chunkId: chunkId, chunkSize: chunkSize}
+}
+
+// NewEmptyChunk 创建空的数据批次
+func NewEmptyChunk(schema *arrow.Schema, pool memory.Allocator) *Chunk {
 	if pool == nil {
 		pool = memory.DefaultAllocator
 	}
-	return &Batch{
-		pool:   pool,
-		schema: schema,
-		cols:   make([]arrow.Array, schema.NumFields()),
+
+	// 创建空记录
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	chunk := builder.NewRecord()
+	return &Chunk{chunk: chunk, chunkId: 0, chunkSize: 0}
+}
+
+// Schema 返回批次的 schema
+func (b *Chunk) Schema() *arrow.Schema {
+	return b.chunk.Schema()
+}
+
+// NumRows 返回行数
+func (b *Chunk) NumRows() int64 {
+	return b.chunk.NumRows()
+}
+
+// NumCols 返回列数
+func (b *Chunk) NumCols() int64 {
+	return b.chunk.NumCols()
+}
+
+// Column 返回指定索引的列
+func (b *Chunk) Column(i int) arrow.Array {
+	return b.chunk.Column(i)
+}
+
+// ColumnByName 返回指定名称的列
+func (b *Chunk) ColumnByName(name string) (arrow.Array, error) {
+	idx := b.Schema().FieldIndices(name)
+	if len(idx) == 0 {
+		return nil, fmt.Errorf("column %s not found", name)
+	}
+	return b.Column(idx[0]), nil
+}
+
+// Release 释放底层 arrow.Record 的内存
+func (b *Chunk) Release() {
+	if b.chunk != nil {
+		b.chunk.Release()
+		b.chunk = nil
 	}
 }
 
-// AddColumn 添加列数据
-func (b *Batch) AddColumn(name string, data interface{}) error {
-	if b.schema == nil {
-		return fmt.Errorf("schema is not initialized")
+// Record 返回底层的 arrow.Record
+// 注意：调用者不应该修改返回的 Record
+func (b *Chunk) Record() arrow.Record {
+	return b.chunk
+}
+
+// Slice 返回指定范围的数据切片
+func (b *Chunk) Slice(offset, length int64) *Chunk {
+	return NewChunk(b.chunk.NewSlice(offset, length), b.chunkId, b.chunkSize)
+}
+
+// ChunkBuilder 创建用于构建新块的 Builder
+type ChunkBuilder struct {
+	schema  *arrow.Schema
+	pool    memory.Allocator
+	builder *array.RecordBuilder
+}
+
+// NewChunkBuilder 创建新的批次构建器
+func NewChunkBuilder(schema *arrow.Schema, pool memory.Allocator) *ChunkBuilder {
+	if pool == nil {
+		pool = memory.DefaultAllocator
 	}
-
-	fieldIdx := b.schema.FieldIndices(name)
-	if len(fieldIdx) == 0 {
-		return fmt.Errorf("column %s not found in schema", name)
+	return &ChunkBuilder{
+		schema:  schema,
+		pool:    pool,
+		builder: array.NewRecordBuilder(pool, schema),
 	}
+}
 
-	idx := fieldIdx[0]
-	field := b.schema.Field(idx)
-
-	var arr arrow.Array
-	switch v := data.(type) {
-	case []int64:
-		builder := array.NewInt64Builder(b.pool)
-		defer builder.Release()
-		builder.AppendValues(v, nil)
-		arr = builder.NewArray()
-	case []float64:
-		builder := array.NewFloat64Builder(b.pool)
-		defer builder.Release()
-		builder.AppendValues(v, nil)
-		arr = builder.NewArray()
-	case []string:
-		builder := array.NewStringBuilder(b.pool)
-		defer builder.Release()
-		builder.AppendValues(v, nil)
-		arr = builder.NewArray()
-	case []bool:
-		builder := array.NewBooleanBuilder(b.pool)
-		defer builder.Release()
-		builder.AppendValues(v, nil)
-		arr = builder.NewArray()
-	default:
-		return fmt.Errorf("unsupported data type %T for column %s", data, name)
-	}
-
-	if !arrow.TypeEqual(arr.DataType(), field.Type) {
-		arr.Release()
-		return fmt.Errorf("data type mismatch for column %s: expected %s, got %s",
-			name, field.Type, arr.DataType())
-	}
-
-	if b.cols[idx] != nil {
-		b.cols[idx].Release()
-	}
-	b.cols[idx] = arr
-
-	// 检查是否所有列都已添加
-	complete := true
-	for _, col := range b.cols {
-		if col == nil {
-			complete = false
-			break
+// AppendValue 添加值到指定列
+func (cb *ChunkBuilder) AppendValue(colIdx int, value interface{}) error {
+	field := cb.builder.Field(colIdx)
+	switch field := field.(type) {
+	case *array.Int64Builder:
+		if v, ok := value.(int64); ok {
+			field.Append(v)
+			return nil
+		}
+	case *array.Float64Builder:
+		if v, ok := value.(float64); ok {
+			field.Append(v)
+			return nil
+		}
+	case *array.StringBuilder:
+		if v, ok := value.(string); ok {
+			field.Append(v)
+			return nil
+		}
+	case *array.BooleanBuilder:
+		if v, ok := value.(bool); ok {
+			field.Append(v)
+			return nil
 		}
 	}
-
-	// 如果之前的 record 存在，释放它
-	if b.record != nil {
-		b.record.Release()
-	}
-
-	// 创建新的 record
-	if complete {
-		b.record = array.NewRecord(b.schema, b.cols, int64(arr.Len()))
-	}
-
-	return nil
+	return fmt.Errorf("unsupported value type for column %d", colIdx)
 }
 
-// Values 获取指定行的所有列值
-func (b *Batch) Values(row int) ([]interface{}, error) {
-	if b.record == nil {
-		return nil, fmt.Errorf("record is not initialized")
-	}
-	if row < 0 || row >= int(b.record.NumRows()) {
-		return nil, fmt.Errorf("row index out of range")
-	}
-
-	result := make([]interface{}, b.record.NumCols())
-	for i := 0; i < int(b.record.NumCols()); i++ {
-		col := b.record.Column(i)
-		switch col.DataType().ID() {
-		case arrow.STRING:
-			result[i] = col.(*array.String).Value(row)
-		case arrow.INT64:
-			result[i] = col.(*array.Int64).Value(row)
-		case arrow.FLOAT64:
-			result[i] = col.(*array.Float64).Value(row)
-		case arrow.BOOL:
-			result[i] = col.(*array.Boolean).Value(row)
-		default:
-			return nil, fmt.Errorf("unsupported data type for column %d", i)
-		}
-	}
-	return result, nil
+// NewChunk 从构建器创建新的批次
+func (cb *ChunkBuilder) NewChunk(chunkId int64, chunkSize int64) *Chunk {
+	record := cb.builder.NewRecord()
+	return NewChunk(record, chunkId, chunkSize)
 }
 
-// GetString returns the string value at the given column and row index
-func (b *Batch) GetString(col, row int) (string, error) {
-	if b.record == nil {
-		return "", fmt.Errorf("record is not initialized")
-	}
-	if col < 0 || col >= int(b.record.NumCols()) {
-		return "", fmt.Errorf("column index out of range")
-	}
-	if row < 0 || row >= int(b.record.NumRows()) {
-		return "", fmt.Errorf("row index out of range")
-	}
-
-	column := b.record.Column(col)
-	if column.DataType().ID() != arrow.STRING {
-		return "", fmt.Errorf("column %d is not of string type", col)
-	}
-	return column.(*array.String).Value(row), nil
-}
-
-// Release 释放资源
-func (b *Batch) Release() {
-	if b.record != nil {
-		b.record.Release()
-	}
-	for _, col := range b.cols {
-		if col != nil {
-			col.Release()
-		}
+// Release 释放构建器使用的资源
+func (cb *ChunkBuilder) Release() {
+	if cb.builder != nil {
+		cb.builder.Release()
+		cb.builder = nil
 	}
 }
 
-// MapSQLTypeToArrowType converts SQL type to arrow.DataType
-func MapSQLTypeToArrowType(sqlType string) arrow.DataType {
-	switch sqlType {
-	case "INTEGER":
-		return arrow.PrimitiveTypes.Int64
-	case "DOUBLE":
-		return arrow.PrimitiveTypes.Float64
-	case "VARCHAR", "STRING":
-		return arrow.BinaryTypes.String
-	case "BOOLEAN":
-		return arrow.FixedWidthTypes.Boolean
-	default:
-		return arrow.BinaryTypes.String
+// SerializeSchema 序列化 schema
+func SerializeSchema(schema *arrow.Schema) ([]byte, error) {
+	var buf bytes.Buffer
+	// 创建 writer 并立即关闭以写入 schema
+	writer := ipc.NewWriter(&buf, ipc.WithSchema(schema))
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("failed to serialize schema: %w", err)
 	}
+	return buf.Bytes(), nil
 }
 
-// ToRow 将当前批次转换为行格式
-func (b *Batch) ToRow() []interface{} {
-	if b.record == nil {
-		return nil
+// DeserializeSchema 反序列化 schema
+func DeserializeSchema(data []byte) (*arrow.Schema, error) {
+	reader, err := ipc.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
 	}
-	result := make([]interface{}, b.record.NumCols())
-	for i := 0; i < int(b.record.NumCols()); i++ {
-		col := b.record.Column(i)
-		switch col.DataType().ID() {
-		case arrow.STRING:
-			result[i] = col.(*array.String).Value(0)
-		case arrow.INT64:
-			result[i] = col.(*array.Int64).Value(0)
-		case arrow.FLOAT64:
-			result[i] = col.(*array.Float64).Value(0)
-		case arrow.BOOL:
-			result[i] = col.(*array.Boolean).Value(0)
-		}
-	}
-	return result
+	schema := reader.Schema()
+	return schema, nil
 }

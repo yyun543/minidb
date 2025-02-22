@@ -21,6 +21,7 @@ var SysTablesSchema = arrow.NewSchema([]arrow.Field{
 	{Name: "db_id", Type: arrow.PrimitiveTypes.Int64},
 	{Name: "db_name", Type: arrow.BinaryTypes.String},
 	{Name: "table_name", Type: arrow.BinaryTypes.String},
+	{Name: "chunk_count", Type: arrow.PrimitiveTypes.Int64},
 	{Name: "schema", Type: arrow.BinaryTypes.Binary}, // 使用Binary类型存储Arrow Schema
 }, nil)
 
@@ -83,12 +84,21 @@ func createRecord(schema *arrow.Schema, rowData [][]interface{}) arrow.Record {
 	return record
 }
 
+// mustSerializeSchema serializes schema or panics on error
+func mustSerializeSchema(schema *arrow.Schema) []byte {
+	data, err := types.SerializeSchema(schema)
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
 // InitializeSystemTables 检查系统表是否存在；如果不存在，则创建初始记录。
 func InitializeSystemTables(engine storage.Engine) error {
 	km := storage.NewKeyManager()
 
 	// 检查 sys_databases 表
-	rec, err := engine.Get(km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES))
+	rec, err := engine.Get(km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_DATABASES, 0))
 	if err != nil {
 		return fmt.Errorf("failed to get sys_databases: %w", err)
 	}
@@ -99,7 +109,7 @@ func InitializeSystemTables(engine storage.Engine) error {
 			{storage.SYS_DATABASE}, // name
 		}
 		initRec := createRecord(SysDatabasesSchema, data)
-		if err := engine.Put(km.TableKey(storage.SYS_DATABASE, storage.SYS_DATABASES), &initRec); err != nil {
+		if err := engine.Put(km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_DATABASES, 0), &initRec); err != nil {
 			initRec.Release()
 			return fmt.Errorf("failed to initialize sys_databases: %w", err)
 		}
@@ -109,7 +119,7 @@ func InitializeSystemTables(engine storage.Engine) error {
 	}
 
 	// 检查 sys_tables 表
-	rec, err = engine.Get(km.TableKey(storage.SYS_DATABASE, storage.SYS_TABLES))
+	rec, err = engine.Get(km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_TABLES, 0))
 	if err != nil {
 		return fmt.Errorf("failed to get sys_tables: %w", err)
 	}
@@ -120,11 +130,12 @@ func InitializeSystemTables(engine storage.Engine) error {
 			{int64(1), int64(1), int64(1), int64(1)},                                                 // db_id
 			{storage.SYS_DATABASE, storage.SYS_DATABASE, storage.SYS_DATABASE, storage.SYS_DATABASE}, // db_name
 			{storage.SYS_DATABASES, storage.SYS_TABLES, storage.SYS_COLUMNS, storage.SYS_INDEXES},    // table_name
-			{types.SerializeSchema(SysDatabasesSchema), types.SerializeSchema(SysTablesSchema),
-				types.SerializeSchema(SysColumnsSchema), types.SerializeSchema(SysIndexesSchema)}, // schema
+			{int64(1), int64(1), int64(1), int64(1)},                                                 // chunk_count
+			{mustSerializeSchema(SysDatabasesSchema), mustSerializeSchema(SysTablesSchema),
+				mustSerializeSchema(SysColumnsSchema), mustSerializeSchema(SysIndexesSchema)}, // schema
 		}
 		initRec := createRecord(SysTablesSchema, data)
-		if err := engine.Put(km.TableKey(storage.SYS_DATABASE, storage.SYS_TABLES), &initRec); err != nil {
+		if err := engine.Put(km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_TABLES, 0), &initRec); err != nil {
 			initRec.Release()
 			return fmt.Errorf("failed to initialize sys_tables: %w", err)
 		}
@@ -134,7 +145,7 @@ func InitializeSystemTables(engine storage.Engine) error {
 	}
 
 	// 检查 sys_columns 表
-	rec, err = engine.Get(km.TableKey(storage.SYS_DATABASE, storage.SYS_COLUMNS))
+	rec, err = engine.Get(km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_COLUMNS, 0))
 	if err != nil {
 		return fmt.Errorf("failed to get sys_columns: %w", err)
 	}
@@ -150,7 +161,7 @@ func InitializeSystemTables(engine storage.Engine) error {
 			{"string"},              // column_type
 		}
 		initRec := createRecord(SysColumnsSchema, data)
-		if err := engine.Put(km.TableKey(storage.SYS_DATABASE, storage.SYS_COLUMNS), &initRec); err != nil {
+		if err := engine.Put(km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_COLUMNS, 0), &initRec); err != nil {
 			initRec.Release()
 			return fmt.Errorf("failed to initialize sys_columns: %w", err)
 		}
@@ -160,7 +171,7 @@ func InitializeSystemTables(engine storage.Engine) error {
 	}
 
 	// 检查 sys_indexes 表
-	rec, err = engine.Get(km.TableKey(storage.SYS_DATABASE, storage.SYS_INDEXES))
+	rec, err = engine.Get(km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_INDEXES, 0))
 	if err != nil {
 		return fmt.Errorf("failed to get sys_indexes: %w", err)
 	}
@@ -168,7 +179,7 @@ func InitializeSystemTables(engine storage.Engine) error {
 		// 创建空的系统索引表
 		data := [][]interface{}{} // 初始不包含任何索引
 		initRec := createRecord(SysIndexesSchema, data)
-		if err := engine.Put(km.TableKey(storage.SYS_DATABASE, storage.SYS_INDEXES), &initRec); err != nil {
+		if err := engine.Put(km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_INDEXES, 0), &initRec); err != nil {
 			initRec.Release()
 			return fmt.Errorf("failed to initialize sys_indexes: %w", err)
 		}

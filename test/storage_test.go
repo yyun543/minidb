@@ -2,10 +2,11 @@ package test
 
 import (
 	"bytes"
-	"github.com/yyun543/minidb/internal/storage"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/yyun543/minidb/internal/storage"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
@@ -207,19 +208,21 @@ func TestKeyManager(t *testing.T) {
 
 	// 测试数据库key
 	dbKey := km.DatabaseKey("testdb")
-	assert.Equal(t, "db:testdb", string(dbKey))
+	assert.Equal(t, "user:db:testdb", string(dbKey))
 
 	// 测试表key
-	tableKey := km.TableKey("testdb", "testtable")
-	assert.Equal(t, "table:testdb:testtable", string(tableKey))
+	tableKey := km.TableChunkKey("testdb", "testtable", 0)
+	assert.Equal(t, "user:chunk:testdb:testtable:0", string(tableKey))
 
 	// 测试系统表key
-	sysTableKey := km.TableKey(storage.SYS_DATABASE, "sys_tables")
-	assert.Equal(t, "sys:table:system:sys_tables", string(sysTableKey))
+	sysTableKey := km.TableChunkKey(storage.SYS_DATABASE, "sys_tables", 0)
+	assert.Equal(t, "sys:chunk:system:sys_tables:0", string(sysTableKey))
 
 	// 测试key解析
-	parsed := km.ParseKey("table:testdb:testtable")
-	assert.Equal(t, "table", parsed["type"])
-	assert.Equal(t, "testdb", parsed["database"])
-	assert.Equal(t, "testtable", parsed["table"])
+	parsed := km.ParseKey("sys:chunk:system:sys_tables:0")
+	assert.Equal(t, "system", parsed["database"])
+	assert.Equal(t, "sys", parsed["prefix"])
+	assert.Equal(t, "sys_tables", parsed["table"])
+	assert.Equal(t, "chunk", parsed["type"])
+	assert.Equal(t, int64(0), parsed["chunk_id"])
 }

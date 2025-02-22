@@ -124,9 +124,10 @@ func TestCatalog_TableLifecycle(t *testing.T) {
 	)
 
 	tableMeta := catalog.TableMeta{
-		Database: dbName,
-		Table:    "testtable",
-		Schema:   schema,
+		Database:   dbName,
+		Table:      "testtable",
+		ChunkCount: 1,
+		Schema:     schema,
 	}
 
 	err = c.CreateTable(dbName, tableMeta)

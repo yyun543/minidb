@@ -2,19 +2,23 @@ package storage
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+
+	"github.com/apache/arrow/go/v18/arrow"
 )
 
 // KeyManager 用于管理存储引擎的key
 type KeyManager struct {
-	// 系统表前缀常量
-	sysPrefix string
+	sysPrefix  string
+	userPrefix string
 }
 
 // NewKeyManager 创建KeyManager实例
 func NewKeyManager() *KeyManager {
 	return &KeyManager{
-		sysPrefix: "sys:",
+		sysPrefix:  "sys:",
+		userPrefix: "user:",
 	}
 }
 
@@ -26,88 +30,145 @@ const (
 	SYS_TABLES    = "sys_tables"
 	SYS_COLUMNS   = "sys_columns"
 	SYS_INDEXES   = "sys_indexes"
+
+	// 每个chunk的目标大小(4KB)
+	TARGET_CHUNK_SIZE = 4 * 1024
 )
 
 // 定义key类型常量
 const (
-	keyTypeDatabase = "db"
-	keyTypeTable    = "table"
-	keyTypeColumn   = "column"
-	keyTypeIndex    = "index"
+	keyTypeDatabase = "db"     // 数据库元数据
+	keyTypeTable    = "table"  // 表元数据
+	keyTypeChunk    = "chunk"  // 表数据chunk
+	keyTypeIndex    = "index"  // 索引数据
+	keyTypeSchema   = "schema" // 表结构
 )
 
 // DatabaseKey 生成数据库元数据的key
 func (km *KeyManager) DatabaseKey(dbName string) []byte {
-	return []byte(fmt.Sprintf("%s:%s", keyTypeDatabase, dbName))
-}
-
-// TableKey 生成表元数据的key
-func (km *KeyManager) TableKey(dbName, tableName string) []byte {
 	if dbName == SYS_DATABASE {
-		return []byte(fmt.Sprintf("%s%s:%s:%s", km.sysPrefix, keyTypeTable, dbName, tableName))
+		return []byte(fmt.Sprintf("%s%s:%s", km.sysPrefix, keyTypeDatabase, dbName))
 	}
-	return []byte(fmt.Sprintf("%s:%s:%s", keyTypeTable, dbName, tableName))
+	return []byte(fmt.Sprintf("%s%s:%s", km.userPrefix, keyTypeDatabase, dbName))
 }
 
-// TableColumnKey 生成表列记录的key
-func (km *KeyManager) TableColumnKey(dbName, tableName, columnName string) []byte {
-	return []byte(fmt.Sprintf("%s:%s:%s:%s", keyTypeColumn, dbName, tableName, columnName))
+// TableSchemaKey 生成表Schema的key
+func (km *KeyManager) TableSchemaKey(dbName, tableName string) []byte {
+	if dbName == SYS_DATABASE {
+		return []byte(fmt.Sprintf("%s%s:%s:%s", km.sysPrefix, keyTypeSchema, dbName, tableName))
+	}
+	return []byte(fmt.Sprintf("%s%s:%s:%s", km.userPrefix, keyTypeSchema, dbName, tableName))
+}
+
+// TableChunkKey 生成表数据chunk的key
+func (km *KeyManager) TableChunkKey(dbName, tableName string, chunkId int64) []byte {
+	if dbName == SYS_DATABASE {
+		return []byte(fmt.Sprintf("%s%s:%s:%s:%d", km.sysPrefix, keyTypeChunk, dbName, tableName, chunkId))
+	}
+	return []byte(fmt.Sprintf("%s%s:%s:%s:%d", km.userPrefix, keyTypeChunk, dbName, tableName, chunkId))
 }
 
 // TableIndexKey 生成表索引记录的key
 func (km *KeyManager) TableIndexKey(dbName, tableName, indexName string) []byte {
-	return []byte(fmt.Sprintf("%s:%s:%s:%s", keyTypeIndex, dbName, tableName, indexName))
+	if dbName == SYS_DATABASE {
+		return []byte(fmt.Sprintf("%s%s:%s:%s:%s", km.sysPrefix, keyTypeIndex, dbName, tableName, indexName))
+	}
+	return []byte(fmt.Sprintf("%s%s:%s:%s:%s", km.userPrefix, keyTypeIndex, dbName, tableName, indexName))
 }
 
-// SysTableKey 生成系统表记录的key
-func (km *KeyManager) SysTableKey(tableID int64) []byte {
-	return []byte(fmt.Sprintf("%ssys_tables:%d", km.sysPrefix, tableID))
+// CalculateChunkSize 计算给定schema的每行大小，返回每个chunk可以容纳的最大行数
+func (km *KeyManager) CalculateChunkSize(schema *arrow.Schema) int64 {
+	rowSize := int64(0)
+	for _, field := range schema.Fields() {
+		switch field.Type.ID() {
+		case arrow.BOOL:
+			rowSize += 1
+		case arrow.INT8, arrow.UINT8:
+			rowSize += 1
+		case arrow.INT16, arrow.UINT16:
+			rowSize += 2
+		case arrow.INT32, arrow.UINT32, arrow.FLOAT32:
+			rowSize += 4
+		case arrow.INT64, arrow.UINT64, arrow.FLOAT64:
+			rowSize += 8
+		case arrow.STRING, arrow.BINARY:
+			// 对于变长类型，假设平均长度为32字节
+			rowSize += 32
+		default:
+			// 其他类型默认按8字节计算
+			rowSize += 8
+		}
+	}
+
+	// 计算每个chunk可以容纳的最大行数
+	maxRows := TARGET_CHUNK_SIZE / rowSize
+	if maxRows < 1 {
+		maxRows = 1 // 确保至少有1行
+	}
+	return maxRows
 }
 
-// SysDatabaseKey 生成系统数据库记录的key
-func (km *KeyManager) SysDatabaseKey(dbID int64) []byte {
-	return []byte(fmt.Sprintf("%ssys_databases:%d", km.sysPrefix, dbID))
+// 根据当前最大行数和chunk可以容纳的最大行数，计算出当前chunk的ID
+func (km *KeyManager) CalculateChunkId(chunkSize int64, numRows int64) int64 {
+	// 计算当前chunk的ID
+	return (numRows + chunkSize - 1) / chunkSize
 }
 
-// SysColumnKey 生成系统列记录的key
-func (km *KeyManager) SysColumnKey(columnID int64) []byte {
-	return []byte(fmt.Sprintf("%ssys_columns:%d", km.sysPrefix, columnID))
-}
-
-// SysIndexKey 生成系统索引记录的key
-func (km *KeyManager) SysIndexKey(indexID int64) []byte {
-	return []byte(fmt.Sprintf("%ssys_indexes:%d", km.sysPrefix, indexID))
-}
-
-// GetKeyRange 返回以指定前缀的扫描范围：起始键为prefix，结束键为prefix的字典序后继。
-func (km *KeyManager) GetKeyRange(prefix []byte) (start, end []byte) {
-	start = prefix
-	end = make([]byte, len(prefix))
-	copy(end, prefix)
-	end[len(end)-1]++ // 将最后一字节加1，假设不会溢出
-	return
-}
-
-// ParseKey 解析key获取组成部分
-func (km *KeyManager) ParseKey(key string) map[string]string {
+// ParseKey 解析key，返回其组成部分
+func (km *KeyManager) ParseKey(key string) map[string]interface{} {
+	result := make(map[string]interface{})
 	parts := strings.Split(key, ":")
-	result := make(map[string]string)
 
+	// 检查前缀
 	if len(parts) < 2 {
 		return result
 	}
 
-	result["type"] = parts[0]
+	// 设置前缀
+	result["prefix"] = parts[0]
 
-	switch parts[0] {
+	// 根据第二个部分（类型）进行解析
+	switch parts[1] {
 	case keyTypeDatabase:
-		if len(parts) >= 2 {
-			result["database"] = parts[1]
+		// sys:db:system 或 user:db:testdb
+		if len(parts) >= 3 {
+			result["type"] = "db"
+			result["database"] = parts[2]
+		}
+	case keyTypeChunk:
+		// sys:chunk:system:sys_tables:0
+		if len(parts) >= 5 {
+			result["type"] = "chunk"
+			result["database"] = parts[2]
+			result["table"] = parts[3]
+			chunkId, err := strconv.ParseInt(parts[4], 10, 64)
+			if err == nil {
+				result["chunk_id"] = chunkId
+			}
 		}
 	case keyTypeTable:
-		if len(parts) >= 3 {
-			result["database"] = parts[1]
-			result["table"] = parts[2]
+		// sys:table:system:sys_tables 或 user:table:testdb:testtable
+		if len(parts) >= 4 {
+			result["type"] = "table"
+			result["database"] = parts[2]
+			result["table"] = parts[3]
+		}
+	case keyTypeSchema:
+		// sys:schema:system:sys_tables 或 user:schema:testdb:testtable
+		if len(parts) >= 4 {
+			result["type"] = "schema"
+			result["database"] = parts[2]
+			result["table"] = parts[3]
+		}
+	case keyTypeIndex:
+		// sys:index:system:sys_tables:idx_name 或 user:index:testdb:testtable:idx_name
+		if len(parts) >= 4 {
+			result["type"] = "index"
+			result["database"] = parts[2]
+			result["table"] = parts[3]
+			if len(parts) > 4 {
+				result["index"] = parts[4]
+			}
 		}
 	}
 
