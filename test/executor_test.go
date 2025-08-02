@@ -13,7 +13,9 @@ import (
 
 func TestExecutor(t *testing.T) {
 	// 创建目录和会话
-	cat, err := catalog.NewCatalog()
+	cat, err := catalog.NewCatalogWithDefaultStorage()
+	assert.NoError(t, err)
+	err = cat.Init()
 	assert.NoError(t, err)
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)

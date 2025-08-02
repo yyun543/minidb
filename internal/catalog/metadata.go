@@ -302,6 +302,82 @@ func (m *MetadataManager) GetTable(dbName, tableName string) (TableMeta, error) 
 	return TableMeta{}, fmt.Errorf("table %s.%s not found", dbName, tableName)
 }
 
+// UpdateTable 更新表元数据记录
+func (m *MetadataManager) UpdateTable(dbName string, table TableMeta) error {
+	// 获取现有表记录
+	key := m.km.TableChunkKey(storage.SYS_DATABASE, storage.SYS_TABLES, 0)
+	existingRecord, err := m.engine.Get(key)
+	if err != nil {
+		return fmt.Errorf("failed to get table record: %w", err)
+	}
+
+	if existingRecord == nil {
+		return fmt.Errorf("table %s.%s not found", dbName, table.Table)
+	}
+	defer existingRecord.Release()
+
+	// 创建新的记录构建器
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, existingRecord.Schema())
+	defer builder.Release()
+
+	// 复制现有记录并更新目标表的信息
+	tableFound := false
+	for i := int64(0); i < existingRecord.NumRows(); i++ {
+		idCol := existingRecord.Column(0).(*array.Int64)
+		dbIdCol := existingRecord.Column(1).(*array.Int64)
+		dbNameCol := existingRecord.Column(2).(*array.String)
+		tableNameCol := existingRecord.Column(3).(*array.String)
+		chunkCountCol := existingRecord.Column(4).(*array.Int64)
+		schemaCol := existingRecord.Column(5).(*array.Binary)
+
+		currentDB := dbNameCol.Value(int(i))
+		currentTable := tableNameCol.Value(int(i))
+
+		if currentDB == dbName && currentTable == table.Table {
+			// 更新这个表的记录
+			tableFound = true
+
+			// 序列化更新的schema
+			schemaData, err := types.SerializeSchema(table.Schema)
+			if err != nil {
+				return fmt.Errorf("failed to serialize schema: %w", err)
+			}
+
+			builder.Field(0).(*array.Int64Builder).Append(idCol.Value(int(i)))
+			builder.Field(1).(*array.Int64Builder).Append(dbIdCol.Value(int(i)))
+			builder.Field(2).(*array.StringBuilder).Append(dbName)
+			builder.Field(3).(*array.StringBuilder).Append(table.Table)
+			builder.Field(4).(*array.Int64Builder).Append(table.ChunkCount)
+			builder.Field(5).(*array.BinaryBuilder).Append(schemaData)
+		} else {
+			// 复制现有记录
+			builder.Field(0).(*array.Int64Builder).Append(idCol.Value(int(i)))
+			builder.Field(1).(*array.Int64Builder).Append(dbIdCol.Value(int(i)))
+			builder.Field(2).(*array.StringBuilder).Append(currentDB)
+			builder.Field(3).(*array.StringBuilder).Append(currentTable)
+			builder.Field(4).(*array.Int64Builder).Append(chunkCountCol.Value(int(i)))
+			builder.Field(5).(*array.BinaryBuilder).Append(schemaCol.Value(int(i)))
+		}
+	}
+
+	if !tableFound {
+		return fmt.Errorf("table %s.%s not found for update", dbName, table.Table)
+	}
+
+	// 构建新记录
+	newRecord := builder.NewRecord()
+	defer newRecord.Release()
+
+	// 存储更新后的记录
+	err = m.engine.Put(key, &newRecord)
+	if err != nil {
+		return fmt.Errorf("failed to update table record: %w", err)
+	}
+
+	return nil
+}
+
 // DeleteDatabase 删除数据库元数据。
 func (m *MetadataManager) DeleteDatabase(name string) error {
 	if name == storage.SYS_DATABASE {

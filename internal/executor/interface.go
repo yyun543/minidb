@@ -25,7 +25,7 @@ type Operator interface {
 
 // ResultSet 查询结果集
 type ResultSet struct {
-	headers []string       // 列名
+	Headers []string       // 列名 - 大写开头用于导出
 	rows    []*types.Batch // 数据批次
 	curRow  int            // 当前行
 }
@@ -35,9 +35,9 @@ func (rs *ResultSet) Batches() []*types.Batch {
 	return rs.rows
 }
 
-// Headers 获取结果集列名
-func (rs *ResultSet) Headers() []string {
-	return rs.headers
+// GetHeaders 获取结果集列名 - 方法重命名避免与字段名冲突
+func (rs *ResultSet) GetHeaders() []string {
+	return rs.Headers
 }
 
 // Next 获取下一行数据

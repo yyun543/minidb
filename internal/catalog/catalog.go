@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/yyun543/minidb/internal/storage"
 )
@@ -20,11 +22,40 @@ func NewCatalog(engine storage.Engine) *Catalog {
 	}
 }
 
+// NewCatalogWithDefaultStorage 创建一个使用默认内存存储的 Catalog 实例，用于测试
+func NewCatalogWithDefaultStorage() (*Catalog, error) {
+	// 使用临时内存存储引擎
+	tmpDir, err := os.MkdirTemp("", "test_catalog")
+	if err != nil {
+		return nil, err
+	}
+	walPath := filepath.Join(tmpDir, "test.wal")
+	tmpEngine, err := storage.NewMemTable(walPath)
+	if err != nil {
+		return nil, err
+	}
+	err = tmpEngine.Open()
+	if err != nil {
+		return nil, err
+	}
+	return &Catalog{
+		engine:      tmpEngine,
+		metadataMgr: NewMetadataManager(tmpEngine),
+	}, nil
+}
+
 // Init 初始化 Catalog，主要是检查并初始化系统表（sys_databases、sys_tables、…）。
 func (c *Catalog) Init() error {
 	if err := InitializeSystemTables(c.engine); err != nil {
 		return fmt.Errorf("catalog initialization failed: %w", err)
 	}
+
+	// 创建默认数据库
+	err := c.CreateDatabase("default")
+	if err != nil && err.Error() != "database default already exists" {
+		return fmt.Errorf("failed to create default database: %w", err)
+	}
+
 	return nil
 }
 
@@ -79,4 +110,17 @@ func (c *Catalog) GetTable(dbName, tableName string) (TableMeta, error) {
 		return TableMeta{}, fmt.Errorf("database name or table name is empty")
 	}
 	return c.metadataMgr.GetTable(dbName, tableName)
+}
+
+// UpdateTable 更新指定表的元数据。
+func (c *Catalog) UpdateTable(dbName string, table TableMeta) error {
+	if dbName == "" || table.Table == "" {
+		return fmt.Errorf("database name or table name is empty")
+	}
+	return c.metadataMgr.UpdateTable(dbName, table)
+}
+
+// GetEngine 获取存储引擎，供其他组件使用
+func (c *Catalog) GetEngine() storage.Engine {
+	return c.engine
 }

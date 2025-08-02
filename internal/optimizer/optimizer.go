@@ -79,7 +79,15 @@ func (o *Optimizer) buildPlan(node parser.Node) (*Plan, error) {
 func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 	// 1. 创建投影算子
 	projectPlan := NewPlan(SelectPlan)
+
+	// 检查是否为 SELECT * 查询
+	// 如果没有指定列，或者指定了"*"，则认为是SELECT *
+	isSelectAll := len(stmt.Columns) == 0 || (len(stmt.Columns) == 1 && stmt.Columns[0].Column == "*")
+
+	// Debug: fmt.Printf("DEBUG buildSelectPlan: isSelectAll: %v\n", isSelectAll)
+
 	projectPlan.Properties = &SelectProperties{
+		All:     isSelectAll,
 		Columns: convertSelectItems(stmt.Columns),
 	}
 
@@ -326,6 +334,7 @@ func convertExpression(expr parser.Node) Expression {
 
 	switch e := expr.(type) {
 	case *parser.BinaryExpr:
+		// 处理所有BinaryExpr类型（包括LIKE表达式）
 		return &BinaryExpression{
 			Left:     convertExpression(e.Left),
 			Operator: e.Operator,
@@ -373,8 +382,64 @@ func convertExpression(expr parser.Node) Expression {
 			Operator: e.Operator,
 			Right:    convertExpression(e.Right),
 		}
+	case *parser.InExpr:
+		// 将IN表达式转换为多个OR条件: age IN (25, 30, 35) -> age = 25 OR age = 30 OR age = 35
+		return convertInExpression(e)
 	}
 	return nil
+}
+
+// convertInExpression 转换IN表达式为OR条件链
+func convertInExpression(inExpr *parser.InExpr) Expression {
+	if len(inExpr.Values) == 0 {
+		return nil
+	}
+
+	leftExpr := convertExpression(inExpr.Left)
+	if leftExpr == nil {
+		return nil
+	}
+
+	// 为每个值创建等值比较条件
+	var orChain Expression
+
+	for _, value := range inExpr.Values {
+		valueExpr := convertExpression(value)
+		if valueExpr == nil {
+			continue
+		}
+
+		// 创建等值比较: column = value
+		eqExpr := &BinaryExpression{
+			Left:     leftExpr,
+			Operator: "=",
+			Right:    valueExpr,
+		}
+
+		// 如果是NOT IN，使用不等于比较
+		if inExpr.Operator == "NOT IN" {
+			eqExpr.Operator = "!="
+		}
+
+		if orChain == nil {
+			orChain = eqExpr
+		} else {
+			// 构建OR链: (... OR column = value)
+			logicalOp := "OR"
+			if inExpr.Operator == "NOT IN" {
+				// NOT IN 使用 AND: column != val1 AND column != val2
+				logicalOp = "AND"
+			}
+
+			orChain = &BinaryExpression{
+				Left:     orChain,
+				Operator: logicalOp,
+				Right:    eqExpr,
+			}
+		}
+	}
+
+	return orChain
 }
 
 // convertFunctionArgs 转换函数参数
@@ -423,10 +488,16 @@ func (o *Optimizer) buildUpdatePlan(stmt *parser.UpdateStmt) (*Plan, error) {
 		assignments[assign.Column] = assign.Value
 	}
 
+	// Handle WHERE clause (might be nil)
+	var whereCondition parser.Node
+	if stmt.Where != nil {
+		whereCondition = stmt.Where.Condition
+	}
+
 	plan.Properties = &UpdateProperties{
 		Table:       stmt.Table,
 		Assignments: assignments,
-		Where:       stmt.Where.Condition,
+		Where:       whereCondition,
 	}
 	return plan, nil
 }

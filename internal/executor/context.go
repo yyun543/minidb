@@ -7,20 +7,27 @@ import (
 
 // Context 执行上下文
 type Context struct {
-	Session *session.Session
-	catalog *catalog.Catalog // 元数据管理器
+	Session     *session.Session
+	catalog     *catalog.Catalog // 元数据管理器
+	dataManager *DataManager     // 数据管理器
 	// 可以添加更多上下文信息
 }
 
 // NewContext 创建执行上下文
-func NewContext(cat *catalog.Catalog, sess *session.Session) *Context {
+func NewContext(cat *catalog.Catalog, sess *session.Session, dataManager *DataManager) *Context {
 	return &Context{
-		Session: sess,
-		catalog: cat,
+		Session:     sess,
+		catalog:     cat,
+		dataManager: dataManager,
 	}
 }
 
 // GetCatalog 获取元数据管理器
 func (ctx *Context) GetCatalog() *catalog.Catalog {
 	return ctx.catalog
+}
+
+// GetDataManager 获取数据管理器
+func (ctx *Context) GetDataManager() *DataManager {
+	return ctx.dataManager
 }
