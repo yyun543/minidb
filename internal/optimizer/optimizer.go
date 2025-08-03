@@ -2,6 +2,7 @@ package optimizer
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/yyun543/minidb/internal/parser"
 )
@@ -117,6 +118,8 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 
 	// 4. 构建GROUP BY
 	if len(stmt.GroupBy) > 0 {
+		// TEST: This should cause an error if this code path is reached
+		// return nil, fmt.Errorf("DEBUG: GROUP BY optimizer code is being executed")
 		groupPlan := NewPlan(GroupPlan)
 		groupKeys := make([]ColumnRef, len(stmt.GroupBy))
 		for i, expr := range stmt.GroupBy {
@@ -127,8 +130,58 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 				}
 			}
 		}
+
+		// 从SELECT子句中提取聚合表达式
+		var aggregations []AggregateExpr
+		var selectColumns []ColumnRef
+
+		for _, col := range stmt.Columns {
+
+			selectCol := ColumnRef{
+				Column: col.Column,
+				Table:  col.Table,
+				Alias:  col.Alias,
+			}
+
+			// 检查是否是聚合函数
+			if col.Expr != nil {
+				if funcCall, ok := col.Expr.(*parser.FunctionCall); ok {
+					funcName := strings.ToUpper(funcCall.Name)
+					if isAggregateFunction(funcName) {
+						aggExpr := AggregateExpr{
+							Function: funcName,
+							Alias:    col.Alias,
+							Expr:     convertExpression(col.Expr),
+						}
+
+						// 如果函数有参数，提取第一个参数作为列名
+						if len(funcCall.Args) > 0 {
+							if colRef, ok := funcCall.Args[0].(*parser.ColumnRef); ok {
+								aggExpr.Column = colRef.Column
+							} else if funcName == "COUNT" && len(funcCall.Args) == 1 {
+								// 处理 COUNT(*) 情况
+								if _, isAsterisk := funcCall.Args[0].(*parser.Asterisk); isAsterisk {
+									aggExpr.Column = "*"
+								}
+							}
+						}
+
+						aggregations = append(aggregations, aggExpr)
+
+						// 为聚合函数设置相应的类型
+						selectCol.Type = ColumnRefTypeFunction
+						selectCol.FunctionName = funcName
+					}
+				}
+			}
+
+			selectColumns = append(selectColumns, selectCol)
+		}
+
 		groupPlan.Properties = &GroupByProperties{
-			GroupKeys: groupKeys,
+			GroupKeys:     groupKeys,
+			Aggregations:  aggregations,
+			SelectColumns: selectColumns,
 		}
 		groupPlan.AddChild(currentPlan)
 		currentPlan = groupPlan
@@ -538,4 +591,16 @@ func convertSelectItems(items []*parser.ColumnItem) []ColumnRef {
 		}
 	}
 	return refs
+}
+
+// isAggregateFunction 检查函数是否为聚合函数
+func isAggregateFunction(funcName string) bool {
+	aggregateFunctions := map[string]bool{
+		"COUNT": true,
+		"SUM":   true,
+		"AVG":   true,
+		"MIN":   true,
+		"MAX":   true,
+	}
+	return aggregateFunctions[strings.ToUpper(funcName)]
 }

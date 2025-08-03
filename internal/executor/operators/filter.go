@@ -67,6 +67,8 @@ func (op *Filter) applyFilter(record arrow.Record) (arrow.Record, error) {
 		return op.applyBinaryFilter(record, binExpr)
 	}
 
+	// TODO: Support IN expressions when optimizer.InExpression is implemented
+
 	// 如果不支持的条件类型，返回原记录
 	return record, nil
 }

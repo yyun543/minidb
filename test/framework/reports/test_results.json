@@ -1,0 +1,24 @@
+{
+  "timestamp": "2025-08-03T15:56:56+08:00",
+  "summary": {
+    "total_suites": 1,
+    "passed": 1,
+    "failed": 0,
+    "skipped": 0,
+    "success_rate": 100.0
+  },
+  "test_suites": [
+    {
+      "name": "test_crud_operations",
+      "status": "PASSED",
+      "duration": "2.000",
+      "details": "Assertions: 0, Passed: 0, Failed: 0"
+    }
+  ],
+  "assertions": {
+  "total": 0,
+  "passed": 0,
+  "failed": 0,
+  "success_rate": 0
+}
+}

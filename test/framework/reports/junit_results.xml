@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="MiniDB Test Suite" 
+           tests="6" 
+           failures="1
+0" 
+           errors="0" 
+           time="0" 
+           timestamp="2025-08-03T14:31:51+08:00">
+  <testcase classname="MiniDB" name="test_crud_operations" time="2.000">
+    <failure message="Test failed">Assertions: 1, Passed: 0, Failed: 1</failure>
+  </testcase>
+  <testcase classname="MiniDB" name="test_where_clause" time="3.000">
+  </testcase>
+  <testcase classname="MiniDB" name="test_basic_storage" time="2.000">
+  </testcase>
+  <testcase classname="MiniDB" name="test_group_order_by" time="3.000">
+  </testcase>
+  <testcase classname="MiniDB" name="test_join_operations" time="2.000">
+  </testcase>
+  <testcase classname="MiniDB" name="test_fixed_issues" time="3.000">
+  </testcase>
+</testsuite>

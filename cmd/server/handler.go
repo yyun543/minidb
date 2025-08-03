@@ -38,31 +38,32 @@ func NewQueryHandler() (*QueryHandler, error) {
 		return nil, fmt.Errorf("Failed to open storage engine: %v", err)
 	}
 
-	// 2. 创建catalog（使用同一个存储引擎）
-	cat := catalog.NewCatalog(storageEngine)
-
-	// 初始化catalog
-	if err := cat.Init(); err != nil {
-		return nil, fmt.Errorf("Failed to initialize catalog: %v", err)
-	}
-
-	// 3. 创建统计信息管理器
-	statsMgr := statistics.NewStatisticsManager()
-
-	// 4. 创建共享的数据管理器
-	dataManager := executor.NewDataManager(cat)
-
-	// 5. 创建执行器（常规和向量化）
-	exec := executor.NewExecutorWithDataManager(cat, dataManager)
-	vectorizedExec := executor.NewVectorizedExecutorWithDataManager(cat, dataManager, statsMgr)
-
-	// 5. 创建会话管理器
+	// 2. 创建会话管理器
 	sessMgr, err := session.NewSessionManager()
 	if err != nil {
 		return nil, fmt.Errorf("Failure to create session manager: %v", err)
 	}
 
-	// 6. 创建QueryHandler
+	// 3. 创建catalog（暂时使用临时初始化）
+	cat := catalog.NewCatalog(storageEngine)
+
+	// 4. 创建统计信息管理器
+	statsMgr := statistics.NewStatisticsManager()
+
+	// 5. 创建共享的数据管理器
+	dataManager := executor.NewDataManager(cat)
+
+	// 6. 创建执行器（常规和向量化）
+	exec := executor.NewExecutorWithDataManager(cat, dataManager)
+	vectorizedExec := executor.NewVectorizedExecutorWithDataManager(cat, dataManager, statsMgr)
+
+	// 7. 暂时使用简单初始化，稍后实现SQL集成
+	// TODO: 集成SQL执行器到catalog
+	if err := cat.Init(); err != nil {
+		return nil, fmt.Errorf("Failed to initialize catalog: %v", err)
+	}
+
+	// 9. 创建QueryHandler
 	handler := &QueryHandler{
 		catalog:                cat,
 		executor:               exec,
@@ -73,39 +74,10 @@ func NewQueryHandler() (*QueryHandler, error) {
 		useVectorizedExecution: true, // 默认启用向量化执行
 	}
 
-	// 7. 启动后台服务
+	// 10. 启动后台服务
 	go handler.startBackgroundServices()
 
 	return handler, nil
-}
-
-// getTablesInDatabase 获取指定数据库中的所有表
-func (h *QueryHandler) getTablesInDatabase(dbName string) ([]string, error) {
-	// 通过存储引擎直接查询sys_tables
-	engine := h.catalog.GetEngine()
-	keyManager := storage.NewKeyManager()
-
-	key := keyManager.TableChunkKey("system", "sys_tables", 0)
-	record, err := engine.Get(key)
-	if err != nil {
-		return nil, err
-	}
-	if record == nil {
-		return []string{}, nil
-	}
-	defer record.Release()
-
-	var tables []string
-	dbNameCol := record.Column(2).(*array.String)
-	tableNameCol := record.Column(3).(*array.String)
-
-	for i := int64(0); i < record.NumRows(); i++ {
-		if dbNameCol.Value(int(i)) == dbName {
-			tables = append(tables, tableNameCol.Value(int(i)))
-		}
-	}
-
-	return tables, nil
 }
 
 // startBackgroundServices 启动后台服务
@@ -162,19 +134,26 @@ func (h *QueryHandler) HandleQuery(sessionID int64, sql string) (string, error) 
 		return "", fmt.Errorf("optimization error: %v", err)
 	}
 
+	// 检查plan是否为nil
+	if plan == nil {
+		return "", fmt.Errorf("optimizer returned nil plan")
+	}
+
 	// 4. 执行查询（选择向量化或常规执行器）
 	var result interface{}
 	if h.useVectorizedExecution && h.isVectorizableQuery(plan) {
 		// 使用向量化执行器
-		// fmt.Printf("DEBUG: Using vectorized executor for plan type: %v\n", plan.Type)
 		vectorizedResult, err := h.vectorizedExecutor.Execute(plan, sess)
 		if err != nil {
+			// 为BETWEEN操作提供更好的错误信息
+			if strings.Contains(err.Error(), "unsupported predicate type") {
+				return "", fmt.Errorf("BETWEEN operator is not yet supported. Please use equivalent conditions like: column >= value1 AND column <= value2")
+			}
 			return "", fmt.Errorf("vectorized execution error: %v", err)
 		}
 		result = vectorizedResult
 	} else {
 		// 使用常规执行器
-		// fmt.Printf("DEBUG: Using regular executor for plan type: %v\n", plan.Type)
 		regularResult, err := h.executor.Execute(plan, sess)
 		if err != nil {
 			return "", fmt.Errorf("execution error: %v", err)
@@ -210,7 +189,7 @@ func (h *QueryHandler) handleSpecialCommands(ast interface{}, sess *session.Sess
 			sb.WriteString("| (no databases) |\n")
 		} else {
 			for _, db := range databases {
-				sb.WriteString(fmt.Sprintf("| %-14s |\n", db.Name))
+				sb.WriteString(fmt.Sprintf("| %-14s |\n", db))
 			}
 		}
 		sb.WriteString("+----------------+\n")
@@ -225,8 +204,8 @@ func (h *QueryHandler) handleSpecialCommands(ast interface{}, sess *session.Sess
 			currentDB = "default"
 		}
 
-		// 通过从系统表查询获取表列表
-		tables, err := h.getTablesInDatabase(currentDB)
+		// 通过catalog获取表列表
+		tables, err := h.catalog.GetAllTables(currentDB)
 		if err != nil {
 			return fmt.Sprintf("Error: %v", err), true
 		}
@@ -269,6 +248,11 @@ func (h *QueryHandler) isVectorizableQuery(plan *optimizer.Plan) bool {
 
 // checkPlanVectorizable 递归检查计划节点是否支持向量化
 func (h *QueryHandler) checkPlanVectorizable(plan *optimizer.Plan) bool {
+	// 检查plan是否为nil
+	if plan == nil {
+		return false
+	}
+
 	// DDL和工具命令不适合向量化
 	switch plan.Type {
 	case optimizer.CreateTablePlan, optimizer.CreateDatabasePlan,

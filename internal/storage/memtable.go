@@ -32,7 +32,33 @@ func NewMemTable(walPath string) (*MemTable, error) {
 
 // Open 实现 Engine 接口
 func (mt *MemTable) Open() error {
-	// MemTable 在创建时已经完成初始化，这里无需额外操作
+	// WAL recovery: 从WAL中恢复数据到内存索引
+	return mt.recoverFromWAL()
+}
+
+// recoverFromWAL 从WAL恢复数据
+func (mt *MemTable) recoverFromWAL() error {
+	// 扫描所有WAL条目 (从0到当前时间)
+	entries, err := mt.wal.Scan(0, 9223372036854775807) // int64最大值
+	if err != nil {
+		return fmt.Errorf("failed to scan WAL for recovery: %w", err)
+	}
+
+	// 按时间戳顺序重放WAL条目
+	for _, entry := range entries {
+		switch entry.OpType {
+		case OpPut:
+			// 恢复PUT操作：直接写入索引，不写WAL (避免重复)
+			mt.index.Put(entry.Key, entry.Value)
+		case OpDelete:
+			// 恢复DELETE操作：从索引删除，不写WAL (避免重复)
+			mt.index.Delete(entry.Key)
+		default:
+			// 未知操作类型，跳过
+			continue
+		}
+	}
+
 	return nil
 }
 

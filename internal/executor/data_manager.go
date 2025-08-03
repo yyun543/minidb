@@ -233,16 +233,29 @@ func (dm *DataManager) createRecord(schema *arrow.Schema, columns []string, valu
 		fieldMap[field.Name] = i
 	}
 
-	// 为每个字段添加值
+	// 为每个字段准备值（使用NULL作为默认值）
+	fieldValues := make([]interface{}, len(schema.Fields()))
+
+	// 首先将所有字段设为NULL
+	for i := range fieldValues {
+		fieldValues[i] = nil
+	}
+
+	// 然后设置实际提供的值
 	for i, column := range columns {
 		if fieldIdx, exists := fieldMap[column]; exists {
-			field := builder.Field(fieldIdx)
 			if i < len(values) {
-				err := dm.appendValue(field, values[i])
-				if err != nil {
-					return nil, err
-				}
+				fieldValues[fieldIdx] = values[i]
 			}
+		}
+	}
+
+	// 为所有字段添加值
+	for i, value := range fieldValues {
+		field := builder.Field(i)
+		err := dm.appendValue(field, value)
+		if err != nil {
+			return nil, err
 		}
 	}
 

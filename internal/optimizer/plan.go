@@ -53,6 +53,8 @@ func (pt PlanType) String() string {
 		return "Limit"
 	case GroupPlan:
 		return "GroupBy"
+	case HavingPlan:
+		return "Having"
 	case CreateDatabasePlan:
 		return "CreateDatabase"
 	case CreateTablePlan:
@@ -248,11 +250,21 @@ func (hp *HavingProperties) Explain() string {
 
 // GroupByProperties 用于 GROUP BY 计划
 type GroupByProperties struct {
-	GroupKeys []ColumnRef // 分组键列表
+	GroupKeys     []ColumnRef     // 分组键列表
+	Aggregations  []AggregateExpr // 聚合表达式列表
+	SelectColumns []ColumnRef     // SELECT列信息（包含别名）
+}
+
+// AggregateExpr 聚合表达式
+type AggregateExpr struct {
+	Function string     // 聚合函数名 (COUNT, SUM, AVG, MIN, MAX)
+	Column   string     // 列名
+	Alias    string     // 别名
+	Expr     Expression // 表达式（如果不是简单列引用）
 }
 
 func (gp *GroupByProperties) Explain() string {
-	return fmt.Sprintf("GroupKeys: %v", gp.GroupKeys)
+	return fmt.Sprintf("GroupKeys: %v, Aggregations: %v", gp.GroupKeys, gp.Aggregations)
 }
 
 // Expression 表达式接口

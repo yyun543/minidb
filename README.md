@@ -224,6 +224,7 @@ INSERT INTO orders VALUES (3, 1, 150, '2024-01-07');
 -- Vectorized SELECT operations
 SELECT * FROM users;
 SELECT name, email FROM users WHERE age > 25;
+SELECT * FROM orders;
 
 -- Cost-optimized JOIN operations
 SELECT u.name, o.amount, o.order_date
@@ -256,13 +257,14 @@ ORDER BY total_spent DESC;
 
 -- Output shows:
 -- Query Execution Plan:
--- --------------------
--- ProjectPlan
---   SortPlan
---     GroupByPlan
---       JoinPlan
---         FilterPlan
---           TableScanPlan
+--------------------
+-- Select
+--   OrderBy
+--     GroupBy
+--       Filter
+--         Join
+--           TableScan
+--           TableScan
 ```
 
 ### Advanced Query Features

@@ -6,6 +6,7 @@ import (
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/catalog"
 	"github.com/yyun543/minidb/internal/executor/operators"
 	"github.com/yyun543/minidb/internal/optimizer"
@@ -59,6 +60,8 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	switch plan.Type {
 	case optimizer.CreateDatabasePlan:
 		return e.executeCreateDatabase(plan, sess)
+	case optimizer.DropDatabasePlan:
+		return e.executeDropDatabase(plan, sess)
 	case optimizer.CreateTablePlan:
 		return e.executeCreateTable(plan, sess)
 	case optimizer.ShowPlan:
@@ -114,6 +117,10 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 
 // buildOperator 根据计划节点构建算子
 func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operators.Operator, error) {
+	if plan == nil {
+		return nil, fmt.Errorf("plan is nil")
+	}
+
 	switch plan.Type {
 	case optimizer.SelectPlan:
 		// SELECT 计划通常有一个子节点
@@ -151,13 +158,22 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 		}
 		return operators.NewFilter(props.Condition, child, ctx), nil
 
+	case optimizer.HavingPlan:
+		props := plan.Properties.(*optimizer.HavingProperties)
+		child, err := e.buildOperator(plan.Children[0], ctx)
+		if err != nil {
+			return nil, err
+		}
+		// HAVING is conceptually similar to filtering, but operates on grouped data
+		return operators.NewFilter(props.Condition, child, ctx), nil
+
 	case optimizer.GroupPlan:
 		props := plan.Properties.(*optimizer.GroupByProperties)
 		child, err := e.buildOperator(plan.Children[0], ctx)
 		if err != nil {
 			return nil, err
 		}
-		return operators.NewGroupBy(props.GroupKeys, child, ctx), nil
+		return operators.NewGroupBy(props.GroupKeys, props.Aggregations, props.SelectColumns, child, ctx), nil
 
 	case optimizer.OrderPlan:
 		props := plan.Properties.(*optimizer.OrderByProperties)
@@ -167,8 +183,39 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 		}
 		return operators.NewOrderBy(props.OrderKeys, child, ctx), nil
 
+	case optimizer.LimitPlan:
+		props := plan.Properties.(*optimizer.LimitProperties)
+		child, err := e.buildOperator(plan.Children[0], ctx)
+		if err != nil {
+			return nil, err
+		}
+		// For now, create a simple limit operator (can be implemented later)
+		// Return child for basic functionality
+		_ = props // avoid unused variable error
+		return child, nil
+
+	case optimizer.DropTablePlan:
+		// For DDL operations, create simple NoOp operator
+		return &NoOpOperator{}, nil
+
+	case optimizer.TransactionPlan:
+		// For transaction operations, create simple NoOp operator
+		return &NoOpOperator{}, nil
+
+	case optimizer.UsePlan:
+		// For USE database operations, create simple NoOp operator
+		return &NoOpOperator{}, nil
+
+	case optimizer.ExplainPlan:
+		// For EXPLAIN operations, create simple NoOp operator
+		return &NoOpOperator{}, nil
+
 	case optimizer.CreateTablePlan:
 		// 对于DDL操作，我们创建一个简单的空操作符
+		return &NoOpOperator{}, nil
+
+	case optimizer.DropDatabasePlan:
+		// 对于DROP DATABASE操作，创建简单的空操作符
 		return &NoOpOperator{}, nil
 
 	case optimizer.InsertPlan:
@@ -184,6 +231,27 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 func (e *ExecutorImpl) getResultHeaders(plan *optimizer.Plan, sess *session.Session) []string {
 	switch plan.Type {
 	case optimizer.SelectPlan:
+		// 递归查找GROUP BY计划（可能在多层嵌套中）
+		groupPlan := e.findGroupByPlan(plan)
+		if groupPlan != nil {
+			groupProps := groupPlan.Properties.(*optimizer.GroupByProperties)
+			headers := make([]string, len(groupProps.SelectColumns))
+			for i, col := range groupProps.SelectColumns {
+				if col.Alias != "" {
+					headers[i] = col.Alias
+				} else if col.Type == optimizer.ColumnRefTypeFunction {
+					headers[i] = fmt.Sprintf("%s(%s)", col.FunctionName, col.Column)
+				} else {
+					if col.Table != "" {
+						headers[i] = fmt.Sprintf("%s.%s", col.Table, col.Column)
+					} else {
+						headers[i] = col.Column
+					}
+				}
+			}
+			return headers
+		}
+
 		props := plan.Properties.(*optimizer.SelectProperties)
 
 		// 处理SELECT *的情况
@@ -217,9 +285,45 @@ func (e *ExecutorImpl) getResultHeaders(plan *optimizer.Plan, sess *session.Sess
 			}
 		}
 		return columns
+
+	case optimizer.GroupPlan:
+		props := plan.Properties.(*optimizer.GroupByProperties)
+		headers := make([]string, len(props.SelectColumns))
+		for i, col := range props.SelectColumns {
+			if col.Alias != "" {
+				headers[i] = col.Alias
+			} else if col.Type == optimizer.ColumnRefTypeFunction {
+				headers[i] = fmt.Sprintf("%s(%s)", col.FunctionName, col.Column)
+			} else {
+				headers[i] = col.Column
+			}
+		}
+		return headers
+
 	default:
 		return nil
 	}
+}
+
+// findGroupByPlan 递归查找计划树中的GroupBy节点
+func (e *ExecutorImpl) findGroupByPlan(plan *optimizer.Plan) *optimizer.Plan {
+	if plan == nil {
+		return nil
+	}
+
+	// 如果当前节点是GroupBy，直接返回
+	if plan.Type == optimizer.GroupPlan {
+		return plan
+	}
+
+	// 递归搜索所有子节点
+	for _, child := range plan.Children {
+		if groupPlan := e.findGroupByPlan(child); groupPlan != nil {
+			return groupPlan
+		}
+	}
+
+	return nil
 }
 
 // executeCreateTable 执行创建表操作
@@ -327,19 +431,11 @@ func (e *ExecutorImpl) executeUpdate(plan *optimizer.Plan, sess *session.Session
 		}
 	}
 
-	// 创建简单的WHERE条件函数（用于ID匹配）
+	// 创建WHERE条件函数，支持动态条件评估
 	var whereCondition func(arrow.Record, int) bool
 	if props.Where != nil {
-		// 简化实现：只支持 id = value 的条件
 		whereCondition = func(record arrow.Record, rowIdx int) bool {
-			// 假设第一列是id列
-			if record.NumCols() > 0 {
-				if arr, ok := record.Column(0).(*array.Int64); ok {
-					// 这里需要根据实际的WHERE条件来判断，简化为匹配特定值
-					return arr.Value(rowIdx) == 2 // 测试中使用的是id=2
-				}
-			}
-			return false
+			return e.evaluateWhereCondition(record, rowIdx, props.Where)
 		}
 	}
 
@@ -362,23 +458,214 @@ func (e *ExecutorImpl) executeUpdate(plan *optimizer.Plan, sess *session.Session
 	}, nil
 }
 
+// evaluateWhereCondition 评估WHERE条件
+func (e *ExecutorImpl) evaluateWhereCondition(record arrow.Record, rowIdx int, whereExpr interface{}) bool {
+	// 如果没有WHERE条件，匹配所有行
+	if whereExpr == nil {
+		return true
+	}
+
+	// 尝试解析为BinaryExpr（如 id = 1）
+	if binExpr, ok := whereExpr.(*parser.BinaryExpr); ok {
+		return e.evaluateBinaryCondition(record, rowIdx, binExpr)
+	}
+
+	// 尝试解析为InExpr（如 amount IN (100, 250)）
+	if inExpr, ok := whereExpr.(*parser.InExpr); ok {
+		return e.evaluateInCondition(record, rowIdx, inExpr)
+	}
+
+	// 对于其他类型的表达式，暂时返回false（保守策略）
+	return false
+}
+
+// evaluateBinaryCondition 评估二元条件表达式
+func (e *ExecutorImpl) evaluateBinaryCondition(record arrow.Record, rowIdx int, expr *parser.BinaryExpr) bool {
+	// 支持多种比较操作符
+	supportedOps := map[string]bool{
+		"=": true, "!=": true, "<>": true,
+		"<": true, "<=": true, ">": true, ">=": true,
+	}
+	if !supportedOps[expr.Operator] {
+		return false
+	}
+
+	// 左操作数应该是列引用
+	leftCol, ok := expr.Left.(*parser.ColumnRef)
+	if !ok {
+		return false
+	}
+
+	// 右操作数应该是字面值
+	var rightValue interface{}
+	switch rightNode := expr.Right.(type) {
+	case *parser.IntegerLiteral:
+		rightValue = rightNode.Value
+	case *parser.StringLiteral:
+		rightValue = rightNode.Value
+	default:
+		return false
+	}
+
+	// 查找列在schema中的位置
+	columnIndex := -1
+	schema := record.Schema()
+	for i, field := range schema.Fields() {
+		if field.Name == leftCol.Column {
+			columnIndex = i
+			break
+		}
+	}
+
+	if columnIndex == -1 {
+		return false // 列不存在
+	}
+
+	// 获取该行该列的实际值
+	column := record.Column(columnIndex)
+	var actualValue interface{}
+
+	switch col := column.(type) {
+	case *array.Int64:
+		if rowIdx < col.Len() {
+			actualValue = col.Value(rowIdx)
+		}
+	case *array.String:
+		if rowIdx < col.Len() {
+			actualValue = col.Value(rowIdx)
+		}
+	default:
+		return false // 不支持的列类型
+	}
+
+	// 根据操作符进行比较
+	return e.compareValues(actualValue, rightValue, expr.Operator)
+}
+
+// compareValues 比较两个值
+func (e *ExecutorImpl) compareValues(left, right interface{}, operator string) bool {
+	switch operator {
+	case "=":
+		return left == right
+	case "!=", "<>":
+		return left != right
+	case "<":
+		return e.compareOrderedValues(left, right) < 0
+	case "<=":
+		return e.compareOrderedValues(left, right) <= 0
+	case ">":
+		return e.compareOrderedValues(left, right) > 0
+	case ">=":
+		return e.compareOrderedValues(left, right) >= 0
+	default:
+		return false
+	}
+}
+
+// compareOrderedValues 比较两个有序值，返回比较结果 (-1, 0, 1)
+func (e *ExecutorImpl) compareOrderedValues(left, right interface{}) int {
+	// 尝试作为int64比较
+	if leftInt, ok := left.(int64); ok {
+		if rightInt, ok := right.(int64); ok {
+			if leftInt < rightInt {
+				return -1
+			} else if leftInt > rightInt {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// 尝试作为字符串比较
+	if leftStr, ok := left.(string); ok {
+		if rightStr, ok := right.(string); ok {
+			if leftStr < rightStr {
+				return -1
+			} else if leftStr > rightStr {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// 不支持的类型比较
+	return 0
+}
+
+// evaluateInCondition 评估IN条件表达式
+func (e *ExecutorImpl) evaluateInCondition(record arrow.Record, rowIdx int, expr *parser.InExpr) bool {
+	// 左操作数应该是列引用
+	leftCol, ok := expr.Left.(*parser.ColumnRef)
+	if !ok {
+		return false
+	}
+
+	// 查找列在schema中的位置
+	columnIndex := -1
+	schema := record.Schema()
+	for i, field := range schema.Fields() {
+		if field.Name == leftCol.Column {
+			columnIndex = i
+			break
+		}
+	}
+
+	if columnIndex == -1 {
+		return false // 列不存在
+	}
+
+	// 获取该行该列的实际值
+	column := record.Column(columnIndex)
+	var actualValue interface{}
+
+	switch col := column.(type) {
+	case *array.Int64:
+		if rowIdx < col.Len() {
+			actualValue = col.Value(rowIdx)
+		}
+	case *array.String:
+		if rowIdx < col.Len() {
+			actualValue = col.Value(rowIdx)
+		}
+	default:
+		return false
+	}
+
+	// 检查值是否在IN列表中
+	for _, valueNode := range expr.Values {
+		var inValue interface{}
+		switch val := valueNode.(type) {
+		case *parser.IntegerLiteral:
+			inValue = val.Value
+		case *parser.StringLiteral:
+			inValue = val.Value
+		default:
+			continue
+		}
+
+		// 如果找到匹配的值
+		if actualValue == inValue {
+			// 对于 IN 操作，找到匹配就返回true
+			// 对于 NOT IN 操作，找到匹配应该返回false
+			return expr.Operator == "IN"
+		}
+	}
+
+	// 没有找到匹配的值
+	// 对于 IN 操作，没找到匹配返回false
+	// 对于 NOT IN 操作，没找到匹配返回true
+	return expr.Operator == "NOT IN"
+}
+
 // executeDelete 执行删除操作
 func (e *ExecutorImpl) executeDelete(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.DeleteProperties)
 
-	// 创建简单的WHERE条件函数（用于ID匹配）
+	// 创建WHERE条件函数，支持动态条件评估
 	var whereCondition func(arrow.Record, int) bool
 	if props.Where != nil {
-		// 简化实现：只支持 id = value 的条件
 		whereCondition = func(record arrow.Record, rowIdx int) bool {
-			// 假设第一列是id列
-			if record.NumCols() > 0 {
-				if arr, ok := record.Column(0).(*array.Int64); ok {
-					// 这里需要根据实际的WHERE条件来判断，简化为匹配特定值
-					return arr.Value(rowIdx) == 2 // 测试中使用的是id=2
-				}
-			}
-			return false
+			return e.evaluateWhereCondition(record, rowIdx, props.Where)
 		}
 	}
 
@@ -417,35 +704,145 @@ func (e *ExecutorImpl) executeCreateDatabase(plan *optimizer.Plan, sess *session
 	}, nil
 }
 
+// executeDropDatabase 执行删除数据库操作
+func (e *ExecutorImpl) executeDropDatabase(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.DropDatabaseProperties)
+
+	err := e.catalog.DropDatabase(props.Database)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
 // executeShow 执行SHOW命令
 func (e *ExecutorImpl) executeShow(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.ShowProperties)
 
 	switch props.Type {
 	case "DATABASES":
-		_, err := e.catalog.GetAllDatabases()
+		databaseNames, err := e.catalog.GetAllDatabases()
 		if err != nil {
 			return nil, err
 		}
 
-		// TODO: 构建数据库结果集
+		// 如果没有数据库，返回空结果集
+		if len(databaseNames) == 0 {
+			return &ResultSet{
+				Headers: []string{"Database"},
+				rows:    []*types.Batch{},
+				curRow:  -1,
+			}, nil
+		}
+
+		// 创建包含数据库名的结果集
+		batch, err := e.createDatabaseListBatch(databaseNames)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create database list batch: %w", err)
+		}
+
 		return &ResultSet{
 			Headers: []string{"Database"},
-			rows:    []*types.Batch{}, // 简化实现
+			rows:    []*types.Batch{batch},
 			curRow:  -1,
 		}, nil
 
 	case "TABLES":
-		// TODO: 实现表列表
+		// 获取当前数据库名
+		currentDB := sess.CurrentDB
+		if currentDB == "" {
+			currentDB = "default"
+		}
+
+		// 从catalog获取表列表
+		tableNames, err := e.catalog.GetAllTables(currentDB)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get table list: %w", err)
+		}
+
+		// 如果没有表，返回空结果集但不出错
+		if len(tableNames) == 0 {
+			return &ResultSet{
+				Headers: []string{"Tables_in_" + currentDB},
+				rows:    []*types.Batch{},
+				curRow:  -1,
+			}, nil
+		}
+
+		// 创建包含表名的结果集
+		batch, err := e.createTableListBatch(tableNames, currentDB)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create table list batch: %w", err)
+		}
+
 		return &ResultSet{
-			Headers: []string{"Tables"},
-			rows:    []*types.Batch{},
+			Headers: []string{"Tables_in_" + currentDB},
+			rows:    []*types.Batch{batch},
 			curRow:  -1,
 		}, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported SHOW type: %s", props.Type)
 	}
+}
+
+// createTableListBatch 创建包含表名列表的批次数据
+func (e *ExecutorImpl) createTableListBatch(tableNames []string, dbName string) (*types.Batch, error) {
+	// 创建Arrow schema，包含一个字符串列
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "Tables_in_" + dbName, Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	// 创建Arrow记录
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	// 填充表名数据
+	stringBuilder := builder.Field(0).(*array.StringBuilder)
+	for _, tableName := range tableNames {
+		stringBuilder.Append(tableName)
+	}
+
+	// 构建记录
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 创建批次
+	batch := types.NewBatch(record)
+	return batch, nil
+}
+
+// createDatabaseListBatch 创建包含数据库名列表的批次数据
+func (e *ExecutorImpl) createDatabaseListBatch(databaseNames []string) (*types.Batch, error) {
+	// 创建Arrow schema，包含一个字符串列
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "Database", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	// 创建Arrow记录
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	// 填充数据库名数据
+	stringBuilder := builder.Field(0).(*array.StringBuilder)
+	for _, dbName := range databaseNames {
+		stringBuilder.Append(dbName)
+	}
+
+	// 构建记录
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 创建批次
+	batch := types.NewBatch(record)
+	return batch, nil
 }
 
 // convertToArrowType 将字符串类型转换为 Arrow 类型

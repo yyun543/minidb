@@ -7,34 +7,42 @@ import (
 	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/types"
+	"strconv"
 )
 
 // GroupBy GROUP BY算子
 type GroupBy struct {
-	groupKeys   []optimizer.ColumnRef // 分组键
-	child       Operator              // 子算子
-	ctx         interface{}
-	resultSent  bool                  // 是否已发送结果
-	initialized bool                  // 是否已初始化
-	groupedData map[string]*GroupData // 分组数据
+	groupKeys     []optimizer.ColumnRef     // 分组键
+	aggregations  []optimizer.AggregateExpr // 聚合表达式
+	selectColumns []optimizer.ColumnRef     // SELECT列信息（包含别名）
+	child         Operator                  // 子算子
+	ctx           interface{}
+	resultSent    bool                  // 是否已发送结果
+	initialized   bool                  // 是否已初始化
+	groupedData   map[string]*GroupData // 分组数据
 }
 
 // GroupData 存储每个分组的数据
 type GroupData struct {
-	keys  []interface{}   // 分组键值
-	count int64           // 行数
-	rows  [][]interface{} // 该分组的所有行数据
+	keys       []interface{}          // 分组键值
+	count      int64                  // 行数
+	rows       [][]interface{}        // 该分组的所有行数据
+	aggregates map[string]interface{} // 聚合计算结果
+	sums       map[string]float64     // SUM计算累计值
+	avgCounts  map[string]int64       // AVG计算行数
 }
 
 // NewGroupBy 创建GROUP BY算子
-func NewGroupBy(groupKeys []optimizer.ColumnRef, child Operator, ctx interface{}) *GroupBy {
+func NewGroupBy(groupKeys []optimizer.ColumnRef, aggregations []optimizer.AggregateExpr, selectColumns []optimizer.ColumnRef, child Operator, ctx interface{}) *GroupBy {
 	return &GroupBy{
-		groupKeys:   groupKeys,
-		child:       child,
-		ctx:         ctx,
-		resultSent:  false,
-		initialized: false,
-		groupedData: make(map[string]*GroupData),
+		groupKeys:     groupKeys,
+		aggregations:  aggregations,
+		selectColumns: selectColumns,
+		child:         child,
+		ctx:           ctx,
+		resultSent:    false,
+		initialized:   false,
+		groupedData:   make(map[string]*GroupData),
 	}
 }
 
@@ -144,12 +152,18 @@ func (op *GroupBy) processGroupBatch(batch *types.Batch) error {
 		if group, exists := op.groupedData[groupKey]; exists {
 			group.count++
 			group.rows = append(group.rows, rowData)
+			op.updateAggregates(group, record, int(rowIdx))
 		} else {
-			op.groupedData[groupKey] = &GroupData{
-				keys:  groupKeyValues,
-				count: 1,
-				rows:  [][]interface{}{rowData},
+			newGroup := &GroupData{
+				keys:       groupKeyValues,
+				count:      1,
+				rows:       [][]interface{}{rowData},
+				aggregates: make(map[string]interface{}),
+				sums:       make(map[string]float64),
+				avgCounts:  make(map[string]int64),
 			}
+			op.updateAggregates(newGroup, record, int(rowIdx))
+			op.groupedData[groupKey] = newGroup
 		}
 	}
 
@@ -168,26 +182,160 @@ func (op *GroupBy) makeGroupKeyString(values []interface{}) string {
 	return result
 }
 
+// updateAggregates 更新聚合计算
+func (op *GroupBy) updateAggregates(group *GroupData, record arrow.Record, rowIdx int) {
+	schema := record.Schema()
+
+	for _, agg := range op.aggregations {
+		aggKey := fmt.Sprintf("%s_%s", agg.Function, agg.Column)
+
+		switch agg.Function {
+		case "COUNT":
+			if agg.Column == "*" {
+				// COUNT(*) 计算所有行
+				group.aggregates[aggKey] = group.count
+			} else {
+				// COUNT(column) 计算非空值
+				colIdx := op.findColumnIndex(schema, agg.Column)
+				if colIdx >= 0 && !record.Column(colIdx).IsNull(rowIdx) {
+					if currentCount, exists := group.aggregates[aggKey]; exists {
+						group.aggregates[aggKey] = currentCount.(int64) + 1
+					} else {
+						group.aggregates[aggKey] = int64(1)
+					}
+				}
+			}
+
+		case "SUM":
+			colIdx := op.findColumnIndex(schema, agg.Column)
+			if colIdx >= 0 && !record.Column(colIdx).IsNull(rowIdx) {
+				value := op.getNumericValue(record.Column(colIdx), rowIdx)
+				if value != nil {
+					group.sums[aggKey] += *value
+					group.aggregates[aggKey] = group.sums[aggKey]
+				}
+			}
+
+		case "AVG":
+			colIdx := op.findColumnIndex(schema, agg.Column)
+			if colIdx >= 0 && !record.Column(colIdx).IsNull(rowIdx) {
+				value := op.getNumericValue(record.Column(colIdx), rowIdx)
+				if value != nil {
+					group.sums[aggKey] += *value
+					group.avgCounts[aggKey]++
+					if group.avgCounts[aggKey] > 0 {
+						group.aggregates[aggKey] = group.sums[aggKey] / float64(group.avgCounts[aggKey])
+					}
+				}
+			}
+
+		case "MIN":
+			colIdx := op.findColumnIndex(schema, agg.Column)
+			if colIdx >= 0 && !record.Column(colIdx).IsNull(rowIdx) {
+				value := op.getNumericValue(record.Column(colIdx), rowIdx)
+				if value != nil {
+					if currentMin, exists := group.aggregates[aggKey]; exists {
+						if *value < currentMin.(float64) {
+							group.aggregates[aggKey] = *value
+						}
+					} else {
+						group.aggregates[aggKey] = *value
+					}
+				}
+			}
+
+		case "MAX":
+			colIdx := op.findColumnIndex(schema, agg.Column)
+			if colIdx >= 0 && !record.Column(colIdx).IsNull(rowIdx) {
+				value := op.getNumericValue(record.Column(colIdx), rowIdx)
+				if value != nil {
+					if currentMax, exists := group.aggregates[aggKey]; exists {
+						if *value > currentMax.(float64) {
+							group.aggregates[aggKey] = *value
+						}
+					} else {
+						group.aggregates[aggKey] = *value
+					}
+				}
+			}
+		}
+	}
+}
+
+// findColumnIndex 在schema中找到列的索引
+func (op *GroupBy) findColumnIndex(schema *arrow.Schema, columnName string) int {
+	for i, field := range schema.Fields() {
+		if field.Name == columnName {
+			return i
+		}
+	}
+	return -1
+}
+
+// getNumericValue 从Arrow列中获取数值
+func (op *GroupBy) getNumericValue(column arrow.Array, rowIdx int) *float64 {
+	if column.IsNull(rowIdx) {
+		return nil
+	}
+
+	switch col := column.(type) {
+	case *array.Int64:
+		val := float64(col.Value(rowIdx))
+		return &val
+	case *array.Float64:
+		val := col.Value(rowIdx)
+		return &val
+	case *array.String:
+		// 尝试将字符串转换为数字
+		strVal := col.Value(rowIdx)
+		if floatVal, err := strconv.ParseFloat(strVal, 64); err == nil {
+			return &floatVal
+		}
+	}
+	return nil
+}
+
 // buildGroupResult 构建分组结果
 func (op *GroupBy) buildGroupResult() (*types.Batch, error) {
 	if len(op.groupedData) == 0 {
 		return nil, nil
 	}
 
-	// 简化实现：创建包含分组键和COUNT的结果
-	// 构建结果schema：分组键列 + COUNT列
+	// 根据selectColumns构建结果schema
 	var fields []arrow.Field
-	for _, key := range op.groupKeys {
-		// 简化：假设所有分组键都是字符串类型
+	for _, col := range op.selectColumns {
+		var fieldName string
+		var fieldType arrow.DataType
+
+		// 使用别名作为列名，如果没有别名则使用原列名
+		if col.Alias != "" {
+			fieldName = col.Alias
+		} else if col.Type == optimizer.ColumnRefTypeFunction {
+			fieldName = fmt.Sprintf("%s(%s)", col.FunctionName, col.Column)
+		} else {
+			fieldName = col.Column
+		}
+
+		// 根据列类型确定Arrow数据类型
+		if col.Type == optimizer.ColumnRefTypeFunction {
+			switch col.FunctionName {
+			case "COUNT":
+				fieldType = arrow.PrimitiveTypes.Int64
+			case "SUM", "AVG", "MIN", "MAX":
+				fieldType = arrow.PrimitiveTypes.Float64
+			default:
+				fieldType = arrow.BinaryTypes.String
+			}
+		} else {
+			// 分组键默认为字符串类型
+			fieldType = arrow.BinaryTypes.String
+		}
+
 		fields = append(fields, arrow.Field{
-			Name: key.Column,
-			Type: arrow.BinaryTypes.String,
+			Name: fieldName,
+			Type: fieldType,
 		})
 	}
-	fields = append(fields, arrow.Field{
-		Name: "COUNT(*)",
-		Type: arrow.PrimitiveTypes.Int64,
-	})
 
 	schema := arrow.NewSchema(fields, nil)
 
@@ -197,18 +345,59 @@ func (op *GroupBy) buildGroupResult() (*types.Batch, error) {
 
 	// 填充数据
 	for _, group := range op.groupedData {
-		// 添加分组键值
-		for i, keyValue := range group.keys {
-			field := builder.Field(i)
-			if strBuilder, ok := field.(*array.StringBuilder); ok {
-				strBuilder.Append(fmt.Sprintf("%v", keyValue))
-			}
-		}
+		for colIdx, col := range op.selectColumns {
+			field := builder.Field(colIdx)
 
-		// 添加COUNT值
-		field := builder.Field(len(group.keys))
-		if intBuilder, ok := field.(*array.Int64Builder); ok {
-			intBuilder.Append(group.count)
+			if col.Type == optimizer.ColumnRefTypeFunction {
+				// 处理聚合函数
+				// 修复聚合函数列名丢失问题
+				column := col.Column
+				if column == "" {
+					// 如果Column为空，从aggregations中查找对应的列名
+					for _, agg := range op.aggregations {
+						if agg.Function == col.FunctionName && agg.Alias == col.Alias {
+							column = agg.Column
+							break
+						}
+					}
+					// 特殊处理COUNT(*)
+					if col.FunctionName == "COUNT" && column == "" {
+						column = "*"
+					}
+				}
+				aggKey := fmt.Sprintf("%s_%s", col.FunctionName, column)
+				value := group.aggregates[aggKey]
+
+				switch col.FunctionName {
+				case "COUNT":
+					if intBuilder, ok := field.(*array.Int64Builder); ok {
+						if value != nil {
+							intBuilder.Append(value.(int64))
+						} else {
+							intBuilder.Append(0)
+						}
+					}
+				case "SUM", "AVG", "MIN", "MAX":
+					if floatBuilder, ok := field.(*array.Float64Builder); ok {
+						if value != nil {
+							floatBuilder.Append(value.(float64))
+						} else {
+							floatBuilder.AppendNull()
+						}
+					}
+				}
+			} else {
+				// 处理分组键
+				if strBuilder, ok := field.(*array.StringBuilder); ok {
+					// 在分组键中找到对应的值
+					for i, key := range op.groupKeys {
+						if key.Column == col.Column {
+							strBuilder.Append(fmt.Sprintf("%v", group.keys[i]))
+							break
+						}
+					}
+				}
+			}
 		}
 	}
 
