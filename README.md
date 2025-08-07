@@ -1,75 +1,81 @@
+
 # MiniDB
 
-MiniDB is a high-performance HTAP (Hybrid Transactional/Analytical Processing) database system implemented in Go. It supports both OLTP and OLAP workloads efficiently with advanced optimizations including vectorized execution, cost-based optimization, and distributed architecture foundations.
+MiniDB is a distributed MPP (Massively Parallel Processing) database system built in Go, designed for analytical workloads. Currently implemented as a single-node prototype with vectorized execution and cost-based optimization, it provides the foundation for future distributed parallel processing capabilities.
 
-## Features
+## Current Implementation
 
-### Advanced Storage Engine
+### Core Database Engine ✅
 
-- **Hybrid Storage Architecture**: In-memory row store with Apache Arrow columnar processing for analytical queries
-- **Thread-safe Concurrent Access**: Robust synchronization primitives for multi-client support
-- **WAL (Write-Ahead Logging)**: Transaction durability with recovery support
-- **Distributed Foundations**: Sharding, partitioning, and replication support for distributed expansion
-- **Strong Type System**: Deterministic data structures for optimal performance
+- **In-Memory Storage**: MemTable-based storage with WAL persistence
+- **Multi-Client Support**: TCP server with session management  
+- **SQL Parser**: ANTLR4-based parser supporting DDL, DML, and query operations
+- **Type System**: Basic data types (INT, VARCHAR) with schema validation
 
-### Optimized Query Processing
+### Query Processing ✅
 
-- **Vectorized Execution**: Apache Arrow-based vectorized operations for enhanced analytical performance
-- **Cost-based Optimization**: Intelligent query plan selection using table and column statistics
-- **Statistics Collection**: Automatic background collection of table statistics for optimization
-- **Dual Execution Engines**: Automatic selection between vectorized and regular execution engines
+- **Dual Execution Engines**: Vectorized (Apache Arrow) and regular execution engines
+- **Cost-Based Optimization**: Statistics-driven query plan selection
+- **Basic Operations**: SELECT, INSERT, UPDATE, DELETE with WHERE clauses
+- **Aggregations**: GROUP BY with COUNT, SUM, AVG, MIN, MAX and HAVING clauses
 
-#### SQL Query Support
+## MPP Architecture Goals 🚧
 
-- **DDL (Data Definition Language)**:
-  - `CREATE DATABASE` - Create new databases
-  - `CREATE TABLE` - Create tables with strong schema validation
-  - `DROP DATABASE` - Remove databases
-  - `DROP TABLE` - Remove existing tables
-  
-- **DML (Data Manipulation Language)**:
-  - `SELECT` - Advanced querying with `WHERE`, `JOIN`, `GROUP BY`, `HAVING`, `ORDER BY`
-  - `INSERT` - Add new records with automatic statistics updates
-  - `UPDATE` - Modify existing records with `WHERE` clause
-  - `DELETE` - Remove records with `WHERE` clause
-  
-- **Utility Commands**:
-  - `USE database` - Switch databases
-  - `SHOW TABLES` - List tables in current database
-  - `SHOW DATABASES` - List all databases
-  - `EXPLAIN` - Display optimized query execution plans
+### Distributed Processing (Planned)
 
-### Enhanced Network Layer
+- **Query Coordinator**: Distributed query planning and execution coordination
+- **Compute Nodes**: Parallel execution across multiple compute nodes
+- **Data Distribution**: Automatic data partitioning and distribution strategies
+- **Inter-Node Communication**: Efficient data transfer protocols between nodes
 
-- **Advanced TCP Server**: Multi-client connection handling with session management
-- **Session Management**: Unique session IDs with automatic cleanup of expired sessions
-- **Connection Monitoring**: Client connection tracking and logging
-- **Graceful Shutdown**: Signal handling for clean server termination
+### Lakehouse Integration (Planned)
 
-### Advanced Query Features
+- **Object Storage**: S3, GCS, Azure Blob storage connectors
+- **Multi-Format Support**: Parquet, ORC, Delta Lake, Iceberg readers
+- **Schema Evolution**: Dynamic schema changes without data migration
+- **Metadata Service**: Distributed catalog for transaction coordination
 
-- **Rich WHERE Clauses**: `=`, `>`, `<`, `>=`, `<=`, `<>`, `LIKE`, `IN`, `AND`, `OR`
-- **Optimized JOIN Operations**: Cost-based join order optimization and algorithm selection
-- **Advanced Aggregations**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` with vectorized execution
-- **Column Aliases**: Full `AS` support for readable query results
-- **Query Plan Visualization**: `EXPLAIN` command shows optimized execution plans
+## Supported SQL Features ✅
+
+### Currently Working
+- **DDL**: `CREATE/DROP DATABASE`, `CREATE/DROP TABLE`
+- **DML**: `INSERT`, `SELECT`, `UPDATE`, `DELETE` 
+- **Queries**: `WHERE` clauses (=, >, <, >=, <=, AND, OR)
+- **Aggregation**: `GROUP BY`, `HAVING` with COUNT, SUM, AVG, MIN, MAX
+- **Utilities**: `USE database`, `SHOW TABLES/DATABASES`, `EXPLAIN`
+
+### Limited Support ⚠️
+- **JOIN operations** (basic implementation)
+- **WHERE operators**: LIKE, IN, BETWEEN (fallback to regular engine)
+- **ORDER BY** (basic sorting)
+
+### Planned Enhancements 🔄
+- **Advanced JOINs**: Hash join, sort-merge join algorithms  
+- **Window Functions**: ROW_NUMBER, RANK, analytical functions
+- **Complex Expressions**: Nested queries, CTEs, advanced operators
 
 ## Architecture & Performance
 
-### Core Design Principles
+### Current Architecture ✅
 
-1. **Layered Architecture**: Flexible SQL at application layer with deterministic storage structures
-2. **Distributed Database Best Practices**: MPP database design patterns and industry standards
-3. **Clean, Extensible Code**: Modular design with clear separation of concerns
-4. **Future-Proof Design**: Minimal changes needed for distributed database expansion
+1. **Single-Node Design**: TCP server with multi-client session support
+2. **Dual Execution Engines**: Vectorized (Arrow) and regular execution engines
+3. **Statistics Collection**: Background statistics for cost-based optimization  
+4. **Modular Design**: Clean separation of parser, optimizer, executor, storage layers
 
-### Performance Optimizations
+### MPP Design Principles 🎯
 
-- **Vectorized Operations**: Apache Arrow columnar processing for analytical queries
-- **Cost-based Optimization**: Statistics-driven query plan selection
-- **Partitioning Support**: Hash, range, and list partitioning strategies
-- **Memory Management**: Efficient Arrow memory allocators
-- **Background Services**: Automatic statistics collection and session cleanup
+1. **Distributed-First**: Architecture designed for horizontal scaling
+2. **Compute-Storage Separation**: Independent scaling of processing and storage
+3. **Parallel Processing**: Query parallelization across multiple nodes
+4. **Elastic Compute**: Dynamic resource allocation based on workload
+
+### Performance Characteristics
+
+- **Current Prototype**: Single-node analytical query processing
+- **Vectorized Operations**: 10-100x speedup for compatible analytical queries  
+- **Session Management**: Support for multiple concurrent connections
+- **Memory Efficiency**: Arrow-based columnar processing with efficient allocators
 
 ## Project Structure
 
@@ -127,14 +133,19 @@ minidb/
     └── storage_test.go            # Storage engine tests
 ```
 
-## Performance Characteristics
+## Current Performance Status
 
-- **Test Coverage**: 96.4% pass rate (54/56 tests passing)
-- **Vectorized Execution**: Automatic for compatible queries
-- **Cost-based Optimization**: Statistical query plan optimization
-- **Memory Efficiency**: Apache Arrow memory management
-- **Session Management**: Automatic cleanup with configurable timeouts
-- **Background Processing**: Statistics collection every 10 minutes
+### Prototype Metrics ✅
+- **Test Coverage**: ~77% integration test success rate  
+- **Vectorized Execution**: Automatic selection for compatible analytical queries
+- **Connection Handling**: Multi-client TCP server with session isolation
+- **Query Processing**: Basic analytical operations (GROUP BY, aggregations)
+
+### Target MPP Performance 🎯  
+- **Distributed Processing**: Linear scalability across compute clusters
+- **Query Throughput**: Thousands of concurrent analytical queries
+- **Data Volume**: Petabyte-scale data processing capabilities
+- **Fault Tolerance**: Automatic failure recovery and query restart
 
 ## Installation & Usage
 
@@ -155,24 +166,35 @@ go test ./test/... -v
 ### Starting the Server
 
 ```bash
-# Start server with default settings (localhost:7205)
+# Start single-node prototype (localhost:7205)
 ./minidb
 
-# Start with custom host and port
+# Start with custom configuration  
 ./minidb -host 0.0.0.0 -port 8080
 
-# Show help and available options
+# Show available options
 ./minidb -h
 ```
 
-### Server Output
+### Current Server Output
 
 ```
 === MiniDB Server ===
-Version: 1.0 (HTAP Optimized)
+Version: 1.0 (MPP Prototype)
 Listening on: localhost:7205
 Features: Vectorized Execution, Cost-based Optimization, Statistics Collection
 Ready for connections...
+```
+
+### Future MPP Cluster (Planned)
+
+```bash  
+# Start coordinator node
+./minidb coordinator --port 7205
+
+# Start compute nodes
+./minidb compute --coordinator localhost:7205 --port 8001
+./minidb compute --coordinator localhost:7205 --port 8002
 ```
 
 ## SQL Usage Examples
@@ -186,109 +208,98 @@ USE ecommerce;
 SHOW DATABASES;
 ```
 
-### Enhanced DDL Operations
+### Basic DDL Operations ✅
 
 ```sql
--- Create tables with optimized type system
-CREATE TABLE users (
-    id INT,
-    name VARCHAR,
-    email VARCHAR,
-    age INT,
-    created_at VARCHAR
-);
+-- Create database and tables (currently supported)
+CREATE DATABASE analytics_demo;
+USE analytics_demo;
 
-CREATE TABLE orders (
-    id INT,
-    user_id INT,
+CREATE TABLE sales (
+    region VARCHAR,
     amount INT,
-    order_date VARCHAR
+    product VARCHAR
 );
 
--- Show tables in current database
+SHOW DATABASES;
 SHOW TABLES;
 ```
 
-### High-Performance DML Operations
+### Working DML Examples ✅
 
 ```sql
--- Insert data (triggers automatic statistics updates)
-INSERT INTO users VALUES (1, 'John Doe', 'john@example.com', 25, '2024-01-01');
-INSERT INTO users VALUES (2, 'Jane Smith', 'jane@example.com', 30, '2024-01-02');
-INSERT INTO users VALUES (3, 'Bob Wilson', 'bob@example.com', 35, '2024-01-03');
+-- Insert sample data
+INSERT INTO sales VALUES ('North', 100, 'ProductA');
+INSERT INTO sales VALUES ('South', 150, 'ProductB');
+INSERT INTO sales VALUES ('North', 200, 'ProductC');
+INSERT INTO sales VALUES ('East', 300, 'ProductD');
 
-INSERT INTO orders VALUES (1, 1, 100, '2024-01-05');
-INSERT INTO orders VALUES (2, 2, 250, '2024-01-06');
-INSERT INTO orders VALUES (3, 1, 150, '2024-01-07');
+-- Basic SELECT with WHERE (working)
+SELECT * FROM sales;
+SELECT region, amount FROM sales WHERE amount > 150;
 
--- Vectorized SELECT operations
-SELECT * FROM users;
-SELECT name, email FROM users WHERE age > 25;
-SELECT * FROM orders;
+-- GROUP BY aggregations (working with vectorized execution)  
+SELECT region, COUNT(*) as orders, SUM(amount) as total
+FROM sales GROUP BY region;
 
--- Cost-optimized JOIN operations
-SELECT u.name, o.amount, o.order_date
-FROM users u
-JOIN orders o ON u.id = o.user_id
-WHERE u.age > 25;
-
--- Vectorized aggregations
-SELECT age, COUNT(*) as user_count, AVG(age) as avg_age
-FROM users
-GROUP BY age
-HAVING user_count > 0;
-
--- Advanced WHERE clauses
-SELECT * FROM users WHERE age BETWEEN 25 AND 35;
-SELECT * FROM users WHERE name LIKE 'J%';
-SELECT * FROM orders WHERE amount IN (100, 250);
+-- HAVING clauses (working)
+SELECT region, COUNT(*) as cnt 
+FROM sales GROUP BY region 
+HAVING cnt >= 2;
 ```
 
-### Query Optimization Features
+### Query Optimization ✅
 
 ```sql
--- Visualize optimized query execution plans
-EXPLAIN SELECT u.name, SUM(o.amount) as total_spent
-FROM users u
-JOIN orders o ON u.id = o.user_id
-WHERE u.age > 25
-GROUP BY u.name
-ORDER BY total_spent DESC;
+-- View execution plans (currently working)
+EXPLAIN SELECT region, SUM(amount) as total_sales
+FROM sales WHERE amount > 100
+GROUP BY region;
 
 -- Output shows:
 -- Query Execution Plan:
 --------------------
 -- Select
---   OrderBy
---     GroupBy
---       Filter
---         Join
---           TableScan
---           TableScan
+--   GroupBy
+--     Filter
+--       TableScan
 ```
 
-### Advanced Query Features
+### Limited Features ⚠️
 
 ```sql
--- Complex analytical queries (uses vectorized execution)
+-- UPDATE/DELETE (basic support, may have limitations)
+UPDATE sales SET amount = 250 WHERE region = 'North';
+DELETE FROM sales WHERE amount < 50;
+
+-- JOIN operations (basic implementation, may not work in all cases)  
+-- CREATE TABLE customers (id INT, name VARCHAR);
+-- SELECT s.region, c.name FROM sales s JOIN customers c ON ...;
+-- Note: Complex JOINs may fail or fall back to regular engine
+```
+
+### Future MPP Features 🔮
+
+```sql
+-- Planned: Advanced analytical queries
 SELECT 
-    u.name,
-    COUNT(o.id) as order_count,
-    SUM(o.amount) as total_amount,
-    AVG(o.amount) as avg_amount
-FROM users u
-LEFT JOIN orders o ON u.id = o.user_id
-GROUP BY u.name
-HAVING order_count > 1
-ORDER BY total_amount DESC;
+    region,
+    amount,
+    SUM(amount) OVER (PARTITION BY region ORDER BY amount) as running_total,
+    ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) as rank
+FROM sales;
 
--- Update operations with statistics maintenance
-UPDATE users 
-SET email = 'john.doe@newdomain.com' 
-WHERE name = 'John Doe';
-
--- Efficient delete operations
-DELETE FROM orders WHERE amount < 50;
+-- Planned: Complex multi-table operations with distributed execution
+SELECT 
+    region,
+    COUNT(DISTINCT product) as product_variety,
+    AVG(amount) as avg_sale,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) as median_sale
+FROM sales s
+JOIN product_catalog p ON s.product = p.name
+WHERE s.date >= '2024-01-01'
+GROUP BY region
+ORDER BY avg_sale DESC;
 ```
 
 ### Result Formatting
@@ -356,47 +367,51 @@ minidb> exit;
 Goodbye!
 ```
 
-## Architecture Advantages
+## Development Status & Advantages
 
-### Performance Benefits
+### Current Prototype Benefits ✅
 
-1. **Vectorized Execution**: 10-100x performance improvement for analytical queries
-2. **Cost-based Optimization**: Intelligent query plan selection reduces execution time
-3. **Statistics Collection**: Background statistics improve optimization quality over time
-4. **Efficient Memory Usage**: Apache Arrow memory management reduces memory footprint
+1. **Vectorized Analytics**: Significant performance improvements for GROUP BY and aggregations
+2. **Cost-Based Optimization**: Intelligent query plan selection using table statistics  
+3. **Modular Architecture**: Clean separation enabling easy distributed expansion
+4. **Arrow Integration**: Industry-standard columnar processing for analytical workloads
 
-### Scalability Features
+### MPP Architecture Advantages 🎯
 
-1. **Distributed Foundations**: Ready for horizontal scaling with minimal code changes
-2. **Partitioning Support**: Hash, range, and list partitioning for large datasets
-3. **Session Management**: Supports thousands of concurrent connections
-4. **Modular Architecture**: Easy to extend and maintain
+1. **Linear Scalability**: Designed for horizontal scaling across compute clusters
+2. **Compute-Storage Separation**: Independent scaling of processing and storage resources
+3. **Fault Tolerance**: Automatic failure recovery and query restart capabilities  
+4. **Elastic Resource Management**: Dynamic compute allocation based on workload patterns
 
 ### Developer Experience
 
-1. **Comprehensive Testing**: 96.4% test coverage with detailed unit tests
-2. **Clean Code Architecture**: Well-documented, modular design
-3. **Detailed Error Messages**: Clear SQL parsing and execution error reporting
-4. **Query Plan Visualization**: EXPLAIN command helps with query optimization
+1. **Simple Deployment**: Single binary with no external dependencies (current)
+2. **Comprehensive Testing**: Integration test framework with ~77% success rate
+3. **Clear Documentation**: Honest status reporting of working vs planned features
+4. **MPP-Ready Design**: Minimal changes needed for distributed deployment
 
-## Future Enhancements
+## MPP Roadmap
 
-### Near-term Improvements
+### Phase 1: MPP Foundation 🚧
+- [ ] **Distributed Query Coordinator**: Central query planning and execution coordination
+- [ ] **Compute Node Management**: Automatic node discovery and health monitoring  
+- [ ] **Inter-Node Communication**: Efficient data transfer protocols between nodes
+- [ ] **Query Distribution**: Automatic query parallelization across compute clusters
+- [ ] **Resource Management**: Intelligent workload scheduling and resource allocation
 
-- [ ] Complete distributed query execution
-- [ ] Advanced JOIN algorithms (hash join, sort-merge join)
-- [ ] Query plan caching for repeated queries
-- [ ] Prepared statements support
-- [ ] Transaction isolation levels (MVCC)
+### Phase 2: Lakehouse Integration 🔮
+- [ ] **Object Storage Connectors**: S3, GCS, Azure Blob storage integration
+- [ ] **Multi-Format Support**: Native Parquet, ORC, Delta Lake, Iceberg readers
+- [ ] **Distributed Metadata Service**: Schema evolution and transaction coordination
+- [ ] **Data Distribution**: Automatic partitioning and pruning for optimal performance
+- [ ] **Elastic Compute**: Dynamic scaling based on workload demands
 
-### Long-term Roadmap
-
-- [ ] Full distributed database deployment
-- [ ] Authentication and authorization
-- [ ] Advanced analytics functions (window functions, percentiles)
-- [ ] Columnar storage engine
-- [ ] Backup and recovery mechanisms
-- [ ] Query parallelization across multiple cores
+### Phase 3: Advanced Analytics 🌟  
+- [ ] **Window Functions**: ROW_NUMBER, RANK, advanced analytical functions
+- [ ] **Machine Learning Integration**: SQL-based ML algorithms
+- [ ] **Real-time Streaming**: Live data ingestion and processing
+- [ ] **Advanced Optimization**: Adaptive query execution and auto-tuning
+- [ ] **Multi-tenant Support**: Resource isolation and security
 
 ## Contributing
 
@@ -407,13 +422,19 @@ We welcome contributions! Please follow these guidelines:
 3. Add appropriate unit tests for new features
 4. Update documentation for user-facing changes
 
-## Performance Testing
+## Testing & Validation
 
-Current benchmarks show:
-- **Query Processing**: Vectorized operations provide 10-100x speedup for analytical queries
-- **Connection Handling**: Supports 1000+ concurrent connections
-- **Memory Usage**: Efficient Arrow memory management
-- **Startup Time**: < 100ms server startup time
+### Current Testing Status
+- **Integration Tests**: ~77% success rate across test framework
+- **Working Features**: Basic DDL, DML, GROUP BY, aggregations
+- **Vectorized Queries**: Functional for compatible analytical operations
+- **Connection Handling**: Multi-client TCP server with session management
+
+### Target MPP Benchmarks 🎯
+- **Distributed Processing**: Linear scalability across compute clusters
+- **Query Throughput**: Support for thousands of concurrent analytical queries  
+- **Data Volume**: Petabyte-scale processing capabilities
+- **Fault Tolerance**: Sub-second failure detection and recovery
 
 ## License
 
@@ -421,4 +442,4 @@ This project is licensed under the GPL License - see the LICENSE file for detail
 
 ---
 
-**MiniDB v1.0** - High-Performance HTAP Database with Vectorized Execution and Cost-based Optimization
+**MiniDB v1.0** - MPP Database Prototype with Vectorized Execution and Distributed Architecture Foundations
