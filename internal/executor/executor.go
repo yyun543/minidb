@@ -150,6 +150,14 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 		}
 		return operators.NewJoin(props.JoinType, props.Condition, left, right, ctx), nil
 
+	case optimizer.ProjectionPlan:
+		props := plan.Properties.(*optimizer.ProjectionProperties)
+		child, err := e.buildOperator(plan.Children[0], ctx)
+		if err != nil {
+			return nil, err
+		}
+		return operators.NewProjection(props.Columns, child, ctx), nil
+
 	case optimizer.FilterPlan:
 		props := plan.Properties.(*optimizer.FilterProperties)
 		child, err := e.buildOperator(plan.Children[0], ctx)
@@ -256,21 +264,10 @@ func (e *ExecutorImpl) getResultHeaders(plan *optimizer.Plan, sess *session.Sess
 
 		// 处理SELECT *的情况
 		if props.All || len(props.Columns) == 0 {
-			// 从子计划（通常是TableScan）获取schema
-			if len(plan.Children) > 0 && plan.Children[0].Type == optimizer.TableScanPlan {
-				tableScanProps := plan.Children[0].Properties.(*optimizer.TableScanProperties)
-				// 从catalog获取表的schema
-				currentDB := sess.CurrentDB
-				if currentDB == "" {
-					currentDB = "default"
-				}
-				if tableMeta, err := e.catalog.GetTable(currentDB, tableScanProps.Table); err == nil {
-					headers := make([]string, len(tableMeta.Schema.Fields()))
-					for i, field := range tableMeta.Schema.Fields() {
-						headers[i] = field.Name
-					}
-					return headers
-				}
+			// 递归查找表扫描节点获取schema
+			headers := e.getSchemaFromPlan(plan.Children[0], sess)
+			if headers != nil {
+				return headers
 			}
 			// fallback: 返回通用列名
 			return []string{"*"}
@@ -285,6 +282,20 @@ func (e *ExecutorImpl) getResultHeaders(plan *optimizer.Plan, sess *session.Sess
 			}
 		}
 		return columns
+
+	case optimizer.ProjectionPlan:
+		props := plan.Properties.(*optimizer.ProjectionProperties)
+		headers := make([]string, len(props.Columns))
+		for i, col := range props.Columns {
+			if col.Alias != "" {
+				headers[i] = col.Alias
+			} else if col.Table != "" {
+				headers[i] = fmt.Sprintf("%s.%s", col.Table, col.Column)
+			} else {
+				headers[i] = col.Column
+			}
+		}
+		return headers
 
 	case optimizer.GroupPlan:
 		props := plan.Properties.(*optimizer.GroupByProperties)
@@ -303,6 +314,50 @@ func (e *ExecutorImpl) getResultHeaders(plan *optimizer.Plan, sess *session.Sess
 	default:
 		return nil
 	}
+}
+
+// getSchemaFromPlan 递归从计划树中获取schema信息
+func (e *ExecutorImpl) getSchemaFromPlan(plan *optimizer.Plan, sess *session.Session) []string {
+	if plan == nil {
+		return nil
+	}
+
+	switch plan.Type {
+	case optimizer.TableScanPlan:
+		// 直接从表扫描获取schema
+		tableScanProps := plan.Properties.(*optimizer.TableScanProperties)
+		currentDB := sess.CurrentDB
+		if currentDB == "" {
+			currentDB = "default"
+		}
+		if tableMeta, err := e.catalog.GetTable(currentDB, tableScanProps.Table); err == nil {
+			headers := make([]string, len(tableMeta.Schema.Fields()))
+			for i, field := range tableMeta.Schema.Fields() {
+				headers[i] = field.Name
+			}
+			return headers
+		}
+	case optimizer.JoinPlan:
+		// 从JOIN获取合并后的schema
+		var allHeaders []string
+		for _, child := range plan.Children {
+			childHeaders := e.getSchemaFromPlan(child, sess)
+			if childHeaders != nil {
+				allHeaders = append(allHeaders, childHeaders...)
+			}
+		}
+		return allHeaders
+	case optimizer.FilterPlan:
+		// 过滤不改变schema，递归到子节点
+		return e.getSchemaFromPlan(plan.Children[0], sess)
+	default:
+		// 其他类型，尝试递归到第一个子节点
+		if len(plan.Children) > 0 {
+			return e.getSchemaFromPlan(plan.Children[0], sess)
+		}
+	}
+
+	return nil
 }
 
 // findGroupByPlan 递归查找计划树中的GroupBy节点

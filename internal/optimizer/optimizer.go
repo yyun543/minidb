@@ -85,8 +85,6 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 	// 如果没有指定列，或者指定了"*"，则认为是SELECT *
 	isSelectAll := len(stmt.Columns) == 0 || (len(stmt.Columns) == 1 && stmt.Columns[0].Column == "*")
 
-	// Debug: fmt.Printf("DEBUG buildSelectPlan: isSelectAll: %v\n", isSelectAll)
-
 	projectPlan.Properties = &SelectProperties{
 		All:     isSelectAll,
 		Columns: convertSelectItems(stmt.Columns),
@@ -118,8 +116,6 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 
 	// 4. 构建GROUP BY
 	if len(stmt.GroupBy) > 0 {
-		// TEST: This should cause an error if this code path is reached
-		// return nil, fmt.Errorf("DEBUG: GROUP BY optimizer code is being executed")
 		groupPlan := NewPlan(GroupPlan)
 		groupKeys := make([]ColumnRef, len(stmt.GroupBy))
 		for i, expr := range stmt.GroupBy {
@@ -227,7 +223,19 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 		currentPlan = limitPlan
 	}
 
-	// 8. 最后添加投影算子
+	// 8. 如果不是SELECT *且没有GROUP BY且没有聚合函数，添加投影算子
+	// GROUP BY查询或包含聚合函数的查询会自己处理列投影，不需要额外的投影操作符
+	hasAggregateFunction := o.hasAggregateFunction(stmt.Columns)
+	if !isSelectAll && len(stmt.GroupBy) == 0 && !hasAggregateFunction {
+		projectionPlan := NewPlan(ProjectionPlan)
+		projectionPlan.Properties = &ProjectionProperties{
+			Columns: convertSelectItems(stmt.Columns),
+		}
+		projectionPlan.AddChild(currentPlan)
+		currentPlan = projectionPlan
+	}
+
+	// 9. 最后添加顶层SELECT算子
 	projectPlan.AddChild(currentPlan)
 
 	return projectPlan, nil
@@ -591,6 +599,20 @@ func convertSelectItems(items []*parser.ColumnItem) []ColumnRef {
 		}
 	}
 	return refs
+}
+
+// hasAggregateFunction 检查SELECT列中是否包含聚合函数
+func (o *Optimizer) hasAggregateFunction(columns []*parser.ColumnItem) bool {
+	for _, col := range columns {
+		if col.Expr != nil {
+			if funcCall, ok := col.Expr.(*parser.FunctionCall); ok {
+				if isAggregateFunction(funcCall.Name) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // isAggregateFunction 检查函数是否为聚合函数

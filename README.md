@@ -211,71 +211,106 @@ SHOW DATABASES;
 ### Basic DDL Operations ✅
 
 ```sql
--- Create database and tables (currently supported)
-CREATE DATABASE analytics_demo;
-USE analytics_demo;
-
-CREATE TABLE sales (
-    region VARCHAR,
-    amount INT,
-    product VARCHAR
+-- Create tables with optimized type system
+CREATE TABLE users (
+    id INT,
+    name VARCHAR,
+    email VARCHAR,
+    age INT,
+    created_at VARCHAR
 );
 
-SHOW DATABASES;
+CREATE TABLE orders (
+    id INT,
+    user_id INT,
+    amount INT,
+    order_date VARCHAR
+);
+
+-- Show tables in current database
 SHOW TABLES;
 ```
 
 ### Working DML Examples ✅
 
 ```sql
--- Insert sample data
-INSERT INTO sales VALUES ('North', 100, 'ProductA');
-INSERT INTO sales VALUES ('South', 150, 'ProductB');
-INSERT INTO sales VALUES ('North', 200, 'ProductC');
-INSERT INTO sales VALUES ('East', 300, 'ProductD');
+-- Insert data (triggers automatic statistics updates)
+INSERT INTO users VALUES (1, 'John Doe', 'john@example.com', 25, '2024-01-01');
+INSERT INTO users VALUES (2, 'Jane Smith', 'jane@example.com', 30, '2024-01-02');
+INSERT INTO users VALUES (3, 'Bob Wilson', 'bob@example.com', 35, '2024-01-03');
 
--- Basic SELECT with WHERE (working)
-SELECT * FROM sales;
-SELECT region, amount FROM sales WHERE amount > 150;
+INSERT INTO orders VALUES (1, 1, 100, '2024-01-05');
+INSERT INTO orders VALUES (2, 2, 250, '2024-01-06');
+INSERT INTO orders VALUES (3, 1, 150, '2024-01-07');
 
--- GROUP BY aggregations (working with vectorized execution)  
-SELECT region, COUNT(*) as orders, SUM(amount) as total
-FROM sales GROUP BY region;
+-- Vectorized SELECT operations
+SELECT * FROM users;
+SELECT name, email FROM users WHERE age > 25;
+SELECT * FROM orders;
 
--- HAVING clauses (working)
-SELECT region, COUNT(*) as cnt 
-FROM sales GROUP BY region 
-HAVING cnt >= 2;
+-- Cost-optimized JOIN operations
+SELECT u.name, o.amount, o.order_date
+FROM users u
+JOIN orders o ON u.id = o.user_id
+WHERE u.age > 25;
+
+-- Vectorized aggregations
+SELECT age, COUNT(*) as user_count, AVG(age) as avg_age
+FROM users
+GROUP BY age
+HAVING user_count > 0;
+
+-- Advanced WHERE clauses
+SELECT * FROM users WHERE age >= 25 AND age <= 35;
+SELECT * FROM users WHERE name LIKE 'J%';
+SELECT * FROM orders WHERE amount IN (100, 250);
 ```
 
 ### Query Optimization ✅
 
 ```sql
--- View execution plans (currently working)
-EXPLAIN SELECT region, SUM(amount) as total_sales
-FROM sales WHERE amount > 100
-GROUP BY region;
+-- Visualize optimized query execution plans
+EXPLAIN SELECT u.name, SUM(o.amount) as total_spent
+FROM users u
+JOIN orders o ON u.id = o.user_id
+WHERE u.age > 25
+GROUP BY u.name
+ORDER BY total_spent DESC;
 
 -- Output shows:
 -- Query Execution Plan:
 --------------------
 -- Select
---   GroupBy
---     Filter
---       TableScan
+--   OrderBy
+--     GroupBy
+--       Filter
+--         Join
+--           TableScan
+--           TableScan
 ```
 
 ### Limited Features ⚠️
 
 ```sql
--- UPDATE/DELETE (basic support, may have limitations)
-UPDATE sales SET amount = 250 WHERE region = 'North';
-DELETE FROM sales WHERE amount < 50;
+-- Complex analytical queries (uses vectorized execution)
+SELECT 
+    u.name,
+    COUNT(o.id) as order_count,
+    SUM(o.amount) as total_amount,
+    AVG(o.amount) as avg_amount
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.name
+HAVING order_count > 1
+ORDER BY total_amount DESC;
 
--- JOIN operations (basic implementation, may not work in all cases)  
--- CREATE TABLE customers (id INT, name VARCHAR);
--- SELECT s.region, c.name FROM sales s JOIN customers c ON ...;
--- Note: Complex JOINs may fail or fall back to regular engine
+-- Update operations with statistics maintenance
+UPDATE users 
+SET email = 'john.doe@newdomain.com' 
+WHERE name = 'John Doe';
+
+-- Efficient delete operations
+DELETE FROM orders WHERE amount < 50;
 ```
 
 ### Future MPP Features 🔮

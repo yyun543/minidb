@@ -10,6 +10,7 @@ type PlanType int
 const (
 	UnknownPlan PlanType = iota
 	SelectPlan
+	ProjectionPlan
 	TableScanPlan
 	FilterPlan
 	HavingPlan
@@ -35,6 +36,8 @@ func (pt PlanType) String() string {
 	switch pt {
 	case SelectPlan:
 		return "Select"
+	case ProjectionPlan:
+		return "Projection"
 	case TableScanPlan:
 		return "TableScan"
 	case FilterPlan:
@@ -146,6 +149,15 @@ type SelectProperties struct {
 
 func (sp *SelectProperties) Explain() string {
 	return fmt.Sprintf("Columns: %v", sp.Columns)
+}
+
+// ProjectionProperties 用于投影计划
+type ProjectionProperties struct {
+	Columns []ColumnRef // 投影的列
+}
+
+func (pp *ProjectionProperties) Explain() string {
+	return fmt.Sprintf("Projection: %v", pp.Columns)
 }
 
 // TableScanProperties 用于表扫描计划

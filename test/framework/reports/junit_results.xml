@@ -1,12 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuite name="MiniDB Test Suite" 
-           tests="6" 
-           failures="1
+           tests="11" 
+           failures="4
 0" 
            errors="0" 
            time="0" 
-           timestamp="2025-08-03T14:31:51+08:00">
+           timestamp="2025-08-12T22:33:15+08:00">
   <testcase classname="MiniDB" name="test_crud_operations" time="2.000">
+    <failure message="Test failed">Assertions: 1, Passed: 0, Failed: 1</failure>
+  </testcase>
+  <testcase classname="MiniDB" name="test_show_tables" time="2.000">
+  </testcase>
+  <testcase classname="MiniDB" name="test_between" time="0.000">
     <failure message="Test failed">Assertions: 1, Passed: 0, Failed: 1</failure>
   </testcase>
   <testcase classname="MiniDB" name="test_where_clause" time="3.000">
@@ -18,5 +23,13 @@
   <testcase classname="MiniDB" name="test_join_operations" time="2.000">
   </testcase>
   <testcase classname="MiniDB" name="test_fixed_issues" time="3.000">
+  </testcase>
+  <testcase classname="MiniDB" name="test_like_header_bug" time="1.000">
+    <failure message="Test failed">Assertions: 1, Passed: 0, Failed: 1</failure>
+  </testcase>
+  <testcase classname="MiniDB" name="test_projection_join_bug" time="0.000">
+    <failure message="Test failed">Assertions: 1, Passed: 0, Failed: 1</failure>
+  </testcase>
+  <testcase classname="MiniDB" name="test_wal_recovery" time="7.000">
   </testcase>
 </testsuite>
