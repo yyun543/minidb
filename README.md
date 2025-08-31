@@ -11,6 +11,7 @@ MiniDB is a distributed MPP (Massively Parallel Processing) database system buil
 - **Multi-Client Support**: TCP server with session management  
 - **SQL Parser**: ANTLR4-based parser supporting DDL, DML, and query operations
 - **Type System**: Basic data types (INT, VARCHAR) with schema validation
+- **Enterprise Logging**: Structured logging with zap library, daily log rotation, and environment-aware configuration
 
 ### Query Processing ✅
 
@@ -62,6 +63,7 @@ MiniDB is a distributed MPP (Massively Parallel Processing) database system buil
 2. **Dual Execution Engines**: Vectorized (Arrow) and regular execution engines
 3. **Statistics Collection**: Background statistics for cost-based optimization  
 4. **Modular Design**: Clean separation of parser, optimizer, executor, storage layers
+5. **Enterprise Logging**: Comprehensive structured logging across all modules with performance monitoring
 
 ### MPP Design Principles 🎯
 
@@ -88,44 +90,70 @@ minidb/
 ├── internal/
 │   ├── catalog/                   # Metadata management
 │   │   ├── catalog.go             # Database/table management with type system
-│   │   ├── metadata.go            # Enhanced metadata with Arrow schema support
-│   │   └── system_tables.go       # System catalog tables
+│   │   └── simple_sql_catalog.go  # SQL catalog implementation
 │   ├── executor/                  # Dual execution engines
 │   │   ├── executor.go            # Regular execution engine
 │   │   ├── vectorized_executor.go # Apache Arrow vectorized execution engine
 │   │   ├── cost_optimizer.go      # Cost-based query optimization
 │   │   ├── data_manager.go        # Data access layer
+│   │   ├── context.go             # Execution context management
+│   │   ├── interface.go           # Executor interfaces
 │   │   └── operators/             # Execution operators
 │   │       ├── table_scan.go      # Optimized table scanning
 │   │       ├── filter.go          # Vectorized filtering
 │   │       ├── join.go            # Cost-optimized joins
-│   │       └── aggregate.go       # Vectorized aggregations
+│   │       ├── aggregate.go       # Vectorized aggregations
+│   │       ├── group_by.go        # GROUP BY operations
+│   │       ├── order_by.go        # ORDER BY operations
+│   │       ├── projection.go      # Column projection
+│   │       └── operator.go        # Base operator interfaces
+│   ├── logger/                    # Enterprise logging system
+│   │   ├── logger.go              # Structured logging with zap
+│   │   ├── config.go              # Environment-aware configuration
+│   │   └── middleware.go          # Request/response logging middleware
 │   ├── optimizer/                 # Advanced query optimizer
 │   │   ├── optimizer.go           # Rule-based and cost-based optimization
 │   │   ├── plan.go                # Enhanced query plan representation
-│   │   └── rules.go               # Optimization rules (predicate pushdown, etc.)
-│   ├── parser/                    # SQL parser
+│   │   ├── rule.go                # Base optimization rule interface
+│   │   ├── predicate_push_down_rule.go   # Predicate pushdown optimization
+│   │   ├── projection_pruning_rule.go    # Projection pruning optimization
+│   │   └── join_reorder_rule.go   # Join reordering optimization
+│   ├── parser/                    # SQL parser with ANTLR4
 │   │   ├── MiniQL.g4              # Comprehensive ANTLR4 grammar
-│   │   ├── gen/                   # ANTLR-generated code
+│   │   ├── miniql_lexer.go        # ANTLR-generated lexer
+│   │   ├── miniql_parser.go       # ANTLR-generated parser
+│   │   ├── miniql_visitor.go      # ANTLR-generated visitor interface
+│   │   ├── miniql_base_visitor.go # ANTLR-generated base visitor
 │   │   ├── parser.go              # SQL parsing with enhanced error handling
-│   │   ├── visitor.go             # AST visitor implementation
 │   │   └── ast.go                 # Complete AST node definitions
+│   ├── session/                   # Session management
+│   │   └── session.go             # Session lifecycle and cleanup
+│   ├── statistics/                # Statistics collection system
+│   │   └── statistics.go          # Table and column statistics management
 │   ├── storage/                   # Advanced storage engine
 │   │   ├── memtable.go            # Enhanced in-memory table
 │   │   ├── distributed.go         # Distributed storage foundations
 │   │   ├── wal.go                 # Write-Ahead Logging
 │   │   ├── storage.go             # Storage engine interfaces
-│   │   └── index.go               # Indexing support (BTree)
+│   │   ├── index.go               # Indexing support (BTree)
+│   │   └── key_manager.go         # Key management utilities
 │   ├── types/                     # Enhanced type system
 │   │   ├── schema.go              # Strong type system with Arrow integration
 │   │   ├── partition.go           # Partitioning strategies for distribution
 │   │   ├── vectorized.go          # Vectorized batch processing
 │   │   └── types.go               # Data type definitions and conversions
-│   ├── statistics/                # Statistics collection system
-│   │   └── statistics.go          # Table and column statistics management
-│   └── session/                   # Session management
-│       └── session.go             # Session lifecycle and cleanup
+│   └── utils/                     # Utility functions
+│       └── utils.go               # Common utilities
+├── logs/                          # Log files directory
+│   └── minidb.log                 # Application logs with rotation
+├── proto/                         # Protocol buffer definitions
+│   └── minidb.proto               # gRPC service definitions (planned)
 └── test/                          # Comprehensive test suite
+    ├── framework/                 # Test automation framework
+    │   ├── integration/           # Integration test suites
+    │   ├── regression/            # Regression test suites
+    │   ├── unit/                  # Unit test suites
+    │   └── utils/                 # Test utilities and helpers
     ├── catalog_test.go            # Catalog functionality tests
     ├── executor_test.go           # Execution engine tests
     ├── optimizer_test.go          # Query optimization tests
@@ -147,6 +175,53 @@ minidb/
 - **Data Volume**: Petabyte-scale data processing capabilities
 - **Fault Tolerance**: Automatic failure recovery and query restart
 
+## Logging & Observability
+
+### Enterprise Logging System ✅
+
+MiniDB includes a comprehensive logging system built with industry best practices:
+
+- **Structured Logging**: Uses Uber's zap library for high-performance structured logging
+- **Environment-Aware Configuration**: 
+  - Development: Debug-level logging for detailed troubleshooting
+  - Production: Info-level logging to minimize log volume
+  - Test: Error-level logging for clean test output
+- **Daily Log Rotation**: Automatic log rotation with configurable retention policies
+- **Performance Monitoring**: Detailed timing measurements for all database operations
+- **Component-Based Logging**: Easy identification of log sources across all modules
+- **Error Tracking**: Comprehensive error logging with context and stack traces
+
+### Logging Configuration
+
+The logging system automatically configures based on the `ENVIRONMENT` variable:
+
+```bash
+# Development environment (detailed logs)
+ENVIRONMENT=development ./minidb
+
+# Production environment (optimized logs)  
+ENVIRONMENT=production ./minidb
+
+# Test environment (minimal logs)
+ENVIRONMENT=test ./minidb
+```
+
+### Log Output Examples
+
+```
+# Server startup
+2024-08-31T10:15:30.123Z INFO server/main.go:45 Starting MiniDB server {"version": "1.0", "port": 7205, "environment": "development"}
+
+# Query execution with timing
+2024-08-31T10:15:45.456Z INFO executor/executor.go:89 Query executed successfully {"sql": "SELECT * FROM users", "execution_time": "2.5ms", "rows_returned": 150}
+
+# Parser operations
+2024-08-31T10:15:46.789Z INFO parser/parser.go:73 SQL parsing completed successfully {"sql": "INSERT INTO users VALUES (1, 'John')", "node_type": "*parser.InsertStmt", "total_parsing_time": "0.8ms"}
+
+# Storage operations
+2024-08-31T10:15:47.012Z INFO storage/wal.go:67 WAL entry written successfully {"operation": "INSERT", "table": "users", "write_duration": "0.3ms"}
+```
+
 ## Installation & Usage
 
 ### Building MiniDB
@@ -155,6 +230,9 @@ minidb/
 # Clone the repository
 git clone <repository-url>
 cd minidb
+
+# Install dependencies (zap logging, lumberjack rotation)
+go mod download
 
 # Build the optimized server
 go build -o minidb ./cmd/server
@@ -182,7 +260,8 @@ go test ./test/... -v
 === MiniDB Server ===
 Version: 1.0 (MPP Prototype)
 Listening on: localhost:7205
-Features: Vectorized Execution, Cost-based Optimization, Statistics Collection
+Features: Vectorized Execution, Cost-based Optimization, Statistics Collection, Enterprise Logging
+Logging: Structured logging enabled with daily rotation (logs/minidb.log)
 Ready for connections...
 ```
 
@@ -410,6 +489,7 @@ Goodbye!
 2. **Cost-Based Optimization**: Intelligent query plan selection using table statistics  
 3. **Modular Architecture**: Clean separation enabling easy distributed expansion
 4. **Arrow Integration**: Industry-standard columnar processing for analytical workloads
+5. **Enterprise Logging**: Comprehensive structured logging with performance monitoring and error tracking
 
 ### MPP Architecture Advantages 🎯
 
@@ -424,6 +504,7 @@ Goodbye!
 2. **Comprehensive Testing**: Integration test framework with ~77% success rate
 3. **Clear Documentation**: Honest status reporting of working vs planned features
 4. **MPP-Ready Design**: Minimal changes needed for distributed deployment
+5. **Production-Ready Logging**: Enterprise-grade observability and debugging capabilities
 
 ## MPP Roadmap
 

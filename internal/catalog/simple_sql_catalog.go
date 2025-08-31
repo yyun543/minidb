@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
 	"github.com/apache/arrow/go/v18/arrow/ipc"
 	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/yyun543/minidb/internal/logger"
 	"github.com/yyun543/minidb/internal/storage"
+	"go.uber.org/zap"
 )
 
 // SQLRunner SQL执行接口（简化版）
@@ -32,91 +35,199 @@ type SimpleSQLCatalog struct {
 
 // NewSimpleSQLCatalog 创建简化的SQL-based catalog
 func NewSimpleSQLCatalog(engine storage.Engine) *SimpleSQLCatalog {
-	return &SimpleSQLCatalog{
+	logger.WithComponent("catalog").Info("Creating SimpleSQLCatalog instance",
+		zap.String("engine_type", fmt.Sprintf("%T", engine)))
+
+	catalog := &SimpleSQLCatalog{
 		engine:    engine,
 		databases: make(map[string]*DatabaseInfo),
 		tables:    make(map[string]map[string]*TableInfo),
 	}
+
+	logger.WithComponent("catalog").Info("SimpleSQLCatalog instance created successfully")
+	return catalog
 }
 
 // SetSQLRunner 设置SQL执行器
 func (c *SimpleSQLCatalog) SetSQLRunner(runner SQLRunner) {
+	logger.WithComponent("catalog").Info("Setting SQL runner for SimpleSQLCatalog",
+		zap.String("runner_type", fmt.Sprintf("%T", runner)))
+
 	c.sqlRunner = runner
+
+	logger.WithComponent("catalog").Info("SQL runner set successfully for SimpleSQLCatalog")
 }
 
 // Init 初始化catalog
 func (c *SimpleSQLCatalog) Init() error {
+	logger.WithComponent("catalog").Info("Initializing SimpleSQLCatalog")
+
+	start := time.Now()
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	// 如果有SQL执行器，使用SQL初始化
 	if c.sqlRunner != nil {
-		return c.initWithSQL()
+		logger.WithComponent("catalog").Info("SQL runner available, using SQL-based initialization")
+		err := c.initWithSQL()
+		if err != nil {
+			logger.WithComponent("catalog").Error("SQL-based initialization failed",
+				zap.Duration("duration", time.Since(start)),
+				zap.Error(err))
+		} else {
+			logger.WithComponent("catalog").Info("SimpleSQLCatalog initialized successfully with SQL",
+				zap.Duration("initialization_time", time.Since(start)))
+		}
+		return err
 	}
 
 	// 否则使用简单初始化
-	return c.simpleInit()
+	logger.WithComponent("catalog").Info("No SQL runner available, using simple initialization")
+	err := c.simpleInit()
+	if err != nil {
+		logger.WithComponent("catalog").Error("Simple initialization failed",
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
+	} else {
+		logger.WithComponent("catalog").Info("SimpleSQLCatalog initialized successfully with simple mode",
+			zap.Duration("initialization_time", time.Since(start)))
+	}
+	return err
 }
 
 // initWithSQL 使用SQL初始化（未来的完整实现）
 func (c *SimpleSQLCatalog) initWithSQL() error {
+	logger.WithComponent("catalog").Info("Starting SQL-based catalog initialization")
+
 	// TODO: 使用SQL创建系统表
 	// 1. CREATE DATABASE IF NOT EXISTS sys;
 	// 2. CREATE TABLE IF NOT EXISTS sys.databases (id INT, name STRING);
 	// 3. CREATE TABLE IF NOT EXISTS sys.tables (...);
 	// 4. INSERT initial data...
 
+	logger.WithComponent("catalog").Warn("SQL-based initialization not fully implemented yet, falling back to simple initialization")
 	// 暂时先用简单初始化
 	return c.simpleInit()
 }
 
 // simpleInit 简单初始化（向后兼容）
 func (c *SimpleSQLCatalog) simpleInit() error {
+	logger.WithComponent("catalog").Info("Starting simple catalog initialization")
+
+	start := time.Now()
+
 	// 创建系统数据库
+	logger.WithComponent("catalog").Debug("Creating system databases")
 	c.databases["sys"] = &DatabaseInfo{Name: "sys"}
 	c.databases["default"] = &DatabaseInfo{Name: "default"}
 
 	// 初始化表映射
 	c.tables["sys"] = make(map[string]*TableInfo)
 	c.tables["default"] = make(map[string]*TableInfo)
+	logger.WithComponent("catalog").Debug("System databases and table mappings created")
 
 	// 创建系统表
+	systemTableStart := time.Now()
 	if err := c.createSystemTables(); err != nil {
+		logger.WithComponent("catalog").Error("Failed to create system tables",
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return fmt.Errorf("failed to create system tables: %w", err)
 	}
+	logger.WithComponent("catalog").Debug("System tables created successfully",
+		zap.Duration("system_tables_duration", time.Since(systemTableStart)))
 
 	// 从存储引擎恢复catalog元数据 (WAL recovery)
+	recoveryStart := time.Now()
 	if err := c.recoverCatalogMetadata(); err != nil {
+		logger.WithComponent("catalog").Error("Failed to recover catalog metadata",
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return fmt.Errorf("failed to recover catalog metadata: %w", err)
 	}
+	logger.WithComponent("catalog").Info("Catalog metadata recovered successfully",
+		zap.Duration("recovery_duration", time.Since(recoveryStart)))
+
+	// 确保系统数据库和表在恢复后仍然存在（防御性编程）
+	c.ensureSystemEntitiesExist()
+
+	totalDuration := time.Since(start)
+	logger.WithComponent("catalog").Info("Simple catalog initialization completed",
+		zap.Duration("total_duration", totalDuration),
+		zap.Int("databases_count", len(c.databases)),
+		zap.Int("sys_tables_count", len(c.tables["sys"])),
+		zap.Int("default_tables_count", len(c.tables["default"])))
 
 	return nil
 }
 
+// ensureSystemEntitiesExist 确保系统数据库和表存在
+func (c *SimpleSQLCatalog) ensureSystemEntitiesExist() {
+	// 确保系统数据库存在
+	if c.databases["sys"] == nil {
+		c.databases["sys"] = &DatabaseInfo{Name: "sys"}
+	}
+	if c.databases["default"] == nil {
+		c.databases["default"] = &DatabaseInfo{Name: "default"}
+	}
+
+	// 确保系统数据库的表映射存在
+	if c.tables["sys"] == nil {
+		c.tables["sys"] = make(map[string]*TableInfo)
+	}
+	if c.tables["default"] == nil {
+		c.tables["default"] = make(map[string]*TableInfo)
+	}
+
+	// 确保系统表存在
+	if c.tables["sys"]["schemata"] == nil {
+		schemataSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "schema_name", Type: arrow.BinaryTypes.String},
+		}, nil)
+		c.tables["sys"]["schemata"] = &TableInfo{
+			Database: "sys",
+			Name:     "schemata",
+			Schema:   schemataSchema,
+		}
+	}
+
+	if c.tables["sys"]["table_catalog"] == nil {
+		tableCatalogSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "table_schema", Type: arrow.BinaryTypes.String},
+			{Name: "table_name", Type: arrow.BinaryTypes.String},
+		}, nil)
+		c.tables["sys"]["table_catalog"] = &TableInfo{
+			Database: "sys",
+			Name:     "table_catalog",
+			Schema:   tableCatalogSchema,
+		}
+	}
+}
+
 // createSystemTables 创建系统表
 func (c *SimpleSQLCatalog) createSystemTables() error {
-	// 创建 databases 系统表的 schema
-	databasesSchema := arrow.NewSchema([]arrow.Field{
-		{Name: "name", Type: arrow.BinaryTypes.String},
+	// 创建 schemata 系统表的 schema (替代 databases)
+	schemataSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "schema_name", Type: arrow.BinaryTypes.String},
 	}, nil)
 
-	// 创建 tables 系统表的 schema
-	tablesSchema := arrow.NewSchema([]arrow.Field{
-		{Name: "database_name", Type: arrow.BinaryTypes.String},
+	// 创建 table_catalog 系统表的 schema (替代 tables)
+	tableCatalogSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
 		{Name: "table_name", Type: arrow.BinaryTypes.String},
 	}, nil)
 
 	// 添加系统表到内存缓存
-	c.tables["sys"]["databases"] = &TableInfo{
+	c.tables["sys"]["schemata"] = &TableInfo{
 		Database: "sys",
-		Name:     "databases",
-		Schema:   databasesSchema,
+		Name:     "schemata",
+		Schema:   schemataSchema,
 	}
 
-	c.tables["sys"]["tables"] = &TableInfo{
+	c.tables["sys"]["table_catalog"] = &TableInfo{
 		Database: "sys",
-		Name:     "tables",
-		Schema:   tablesSchema,
+		Name:     "table_catalog",
+		Schema:   tableCatalogSchema,
 	}
 
 	return nil
@@ -124,29 +235,53 @@ func (c *SimpleSQLCatalog) createSystemTables() error {
 
 // CreateDatabase 通过SQL创建数据库
 func (c *SimpleSQLCatalog) CreateDatabase(name string) error {
+	logger.WithComponent("catalog").Info("Creating database",
+		zap.String("database", name))
+
+	start := time.Now()
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	// 检查是否已存在
 	if _, exists := c.databases[name]; exists {
+		logger.WithComponent("catalog").Warn("Database creation failed - database already exists",
+			zap.String("database", name))
 		return fmt.Errorf("database '%s' already exists", name)
 	}
 
 	// 如果有SQL执行器，使用SQL
 	if c.sqlRunner != nil {
-		sql := fmt.Sprintf("INSERT INTO sys.databases (name) VALUES ('%s')", name)
+		logger.WithComponent("catalog").Debug("Using SQL runner to create database",
+			zap.String("database", name))
+		sql := fmt.Sprintf("INSERT INTO sys.schemata (schema_name) VALUES ('%s')", name)
 		_, err := c.sqlRunner.ExecuteSQL(sql)
 		if err != nil {
 			// SQL执行失败，记录日志但继续使用简单方式
+			logger.WithComponent("catalog").Warn("SQL execution failed for database creation, falling back to simple mode",
+				zap.String("database", name),
+				zap.String("sql", sql),
+				zap.Error(err))
+			// Note: Also keeping fmt.Printf for backward compatibility
 			fmt.Printf("SQL execution failed, falling back to simple mode: %v\n", err)
+		} else {
+			logger.WithComponent("catalog").Debug("Database created successfully via SQL",
+				zap.String("database", name))
 		}
 	}
 
 	// 持久化数据库元数据到存储引擎 (WAL支持)
+	persistStart := time.Now()
 	err := c.persistDatabaseMetadata(name)
 	if err != nil {
+		logger.WithComponent("catalog").Error("Failed to persist database metadata",
+			zap.String("database", name),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return fmt.Errorf("failed to persist database metadata: %w", err)
 	}
+	logger.WithComponent("catalog").Debug("Database metadata persisted successfully",
+		zap.String("database", name),
+		zap.Duration("persist_duration", time.Since(persistStart)))
 
 	// 更新内存缓存
 	c.databases[name] = &DatabaseInfo{Name: name}
@@ -171,11 +306,11 @@ func (c *SimpleSQLCatalog) DropDatabase(name string) error {
 	// 如果有SQL执行器，使用SQL删除
 	if c.sqlRunner != nil {
 		// 删除表记录
-		sql1 := fmt.Sprintf("DELETE FROM sys.tables WHERE db_name = '%s'", name)
+		sql1 := fmt.Sprintf("DELETE FROM sys.table_catalog WHERE table_schema = '%s'", name)
 		c.sqlRunner.ExecuteSQL(sql1)
 
 		// 删除数据库记录
-		sql2 := fmt.Sprintf("DELETE FROM sys.databases WHERE name = '%s'", name)
+		sql2 := fmt.Sprintf("DELETE FROM sys.schemata WHERE schema_name = '%s'", name)
 		c.sqlRunner.ExecuteSQL(sql2)
 	}
 
@@ -206,7 +341,7 @@ func (c *SimpleSQLCatalog) CreateTable(database string, tableMeta TableMeta) err
 	// 如果有SQL执行器，使用SQL创建
 	if c.sqlRunner != nil {
 		sql := fmt.Sprintf(`
-			INSERT INTO sys.tables (db_name, table_name, chunk_count, schema_info) 
+			INSERT INTO sys.table_catalog (table_schema, table_name, chunk_count, schema_info) 
 			VALUES ('%s', '%s', %d, 'schema_placeholder')`,
 			database, tableMeta.Table, tableMeta.ChunkCount)
 		c.sqlRunner.ExecuteSQL(sql)
@@ -239,9 +374,9 @@ func (c *SimpleSQLCatalog) GetTable(database, table string) (TableMeta, error) {
 	// 优先尝试SQL查询（如果有执行器）
 	if c.sqlRunner != nil {
 		sql := fmt.Sprintf(`
-			SELECT db_name, table_name, chunk_count 
-			FROM sys.tables 
-			WHERE db_name = '%s' AND table_name = '%s'`,
+			SELECT table_schema, table_name, chunk_count 
+			FROM sys.table_catalog 
+			WHERE table_schema = '%s' AND table_name = '%s'`,
 			database, table)
 
 		result, err := c.sqlRunner.ExecuteSQL(sql)
@@ -275,20 +410,12 @@ func (c *SimpleSQLCatalog) GetAllDatabases() ([]string, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	// 优先尝试SQL查询
-	if c.sqlRunner != nil {
-		result, err := c.sqlRunner.ExecuteSQL("SELECT name FROM sys.databases ORDER BY name")
-		if err == nil && result != nil {
-			// 解析结果（简化处理）
-			// return parseStringArray(result)
-		}
-	}
-
-	// 回退到内存缓存
+	// 直接从内存缓存获取，这是权威数据源
 	databases := make([]string, 0, len(c.databases))
 	for name := range c.databases {
 		databases = append(databases, name)
 	}
+
 	return databases, nil
 }
 
@@ -299,7 +426,7 @@ func (c *SimpleSQLCatalog) GetAllTables(database string) ([]string, error) {
 
 	// 优先尝试SQL查询
 	if c.sqlRunner != nil {
-		sql := fmt.Sprintf("SELECT table_name FROM sys.tables WHERE db_name = '%s' ORDER BY table_name", database)
+		sql := fmt.Sprintf("SELECT table_name FROM sys.table_catalog WHERE table_schema = '%s' ORDER BY table_name", database)
 		result, err := c.sqlRunner.ExecuteSQL(sql)
 		if err == nil && result != nil {
 			// 解析结果（简化处理）
@@ -359,8 +486,8 @@ func (c *SimpleSQLCatalog) storeTableMetadataRecord(key []byte, dbName, tableNam
 	// 创建专门的表元数据schema
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "key", Type: arrow.BinaryTypes.String},
-		{Name: "database", Type: arrow.BinaryTypes.String},
-		{Name: "table", Type: arrow.BinaryTypes.String},
+		{Name: "table_schema", Type: arrow.BinaryTypes.String}, // 重命名 database -> table_schema
+		{Name: "table_name", Type: arrow.BinaryTypes.String},   // 重命名 table -> table_name
 		{Name: "type", Type: arrow.BinaryTypes.String},
 		{Name: "chunk_count", Type: arrow.PrimitiveTypes.Int64},
 		{Name: "schema_data", Type: arrow.BinaryTypes.Binary}, // 存储二进制schema数据
@@ -664,7 +791,7 @@ func (c *SimpleSQLCatalog) DropTable(database, table string) error {
 
 	// 使用SQL删除
 	if c.sqlRunner != nil {
-		sql := fmt.Sprintf("DELETE FROM sys.tables WHERE db_name = '%s' AND table_name = '%s'", database, table)
+		sql := fmt.Sprintf("DELETE FROM sys.table_catalog WHERE table_schema = '%s' AND table_name = '%s'", database, table)
 		c.sqlRunner.ExecuteSQL(sql)
 	}
 
@@ -686,9 +813,9 @@ func (c *SimpleSQLCatalog) UpdateTable(dbName string, table TableMeta) error {
 	// 使用SQL更新
 	if c.sqlRunner != nil {
 		sql := fmt.Sprintf(`
-			UPDATE sys.tables 
+			UPDATE sys.table_catalog 
 			SET chunk_count = %d 
-			WHERE db_name = '%s' AND table_name = '%s'`,
+			WHERE table_schema = '%s' AND table_name = '%s'`,
 			table.ChunkCount, dbName, table.Table)
 		c.sqlRunner.ExecuteSQL(sql)
 	}

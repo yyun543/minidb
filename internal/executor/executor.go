@@ -3,16 +3,19 @@ package executor
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
 	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/catalog"
 	"github.com/yyun543/minidb/internal/executor/operators"
+	"github.com/yyun543/minidb/internal/logger"
 	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/session"
 	"github.com/yyun543/minidb/internal/types"
+	"go.uber.org/zap"
 )
 
 // NoOpOperator 空操作符，用于DDL等不需要返回数据的操作
@@ -41,9 +44,32 @@ type BaseExecutor = ExecutorImpl
 
 // NewExecutor 创建执行器实例
 func NewExecutor(cat *catalog.Catalog) *ExecutorImpl {
-	return &ExecutorImpl{
+	logger.WithComponent("executor").Info("Creating new executor instance")
+
+	start := time.Now()
+	executor := &ExecutorImpl{
 		catalog:     cat,
 		dataManager: NewDataManager(cat),
+	}
+
+	logger.WithComponent("executor").Info("Executor instance created successfully",
+		zap.Duration("creation_time", time.Since(start)))
+
+	return executor
+}
+
+// logExecutionResult 记录执行结果
+func (e *ExecutorImpl) logExecutionResult(operation string, start time.Time, err error) {
+	duration := time.Since(start)
+	if err != nil {
+		logger.WithComponent("executor").Error("Query execution failed",
+			zap.String("operation", operation),
+			zap.Duration("duration", duration),
+			zap.Error(err))
+	} else {
+		logger.WithComponent("executor").Info("Query executed successfully",
+			zap.String("operation", operation),
+			zap.Duration("execution_duration", duration))
 	}
 }
 
@@ -56,63 +82,138 @@ func NewExecutorWithDataManager(cat *catalog.Catalog, dm *DataManager) *Executor
 
 // Execute 执行查询计划
 func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	logger.WithComponent("executor").Info("Executing query plan",
+		zap.String("plan_type", string(plan.Type)),
+		zap.Int64("session_id", sess.ID))
+
+	start := time.Now()
+
 	// 为 DDL/DML 操作特别处理
 	switch plan.Type {
 	case optimizer.CreateDatabasePlan:
-		return e.executeCreateDatabase(plan, sess)
+		logger.WithComponent("executor").Debug("Executing CREATE DATABASE plan")
+		result, err := e.executeCreateDatabase(plan, sess)
+		e.logExecutionResult("CREATE DATABASE", start, err)
+		return result, err
 	case optimizer.DropDatabasePlan:
-		return e.executeDropDatabase(plan, sess)
+		logger.WithComponent("executor").Debug("Executing DROP DATABASE plan")
+		result, err := e.executeDropDatabase(plan, sess)
+		e.logExecutionResult("DROP DATABASE", start, err)
+		return result, err
 	case optimizer.CreateTablePlan:
-		return e.executeCreateTable(plan, sess)
+		logger.WithComponent("executor").Debug("Executing CREATE TABLE plan")
+		result, err := e.executeCreateTable(plan, sess)
+		e.logExecutionResult("CREATE TABLE", start, err)
+		return result, err
 	case optimizer.ShowPlan:
-		return e.executeShow(plan, sess)
+		logger.WithComponent("executor").Debug("Executing SHOW plan")
+		result, err := e.executeShow(plan, sess)
+		e.logExecutionResult("SHOW", start, err)
+		return result, err
 	case optimizer.InsertPlan:
-		return e.executeInsert(plan, sess)
+		logger.WithComponent("executor").Debug("Executing INSERT plan")
+		result, err := e.executeInsert(plan, sess)
+		e.logExecutionResult("INSERT", start, err)
+		return result, err
 	case optimizer.UpdatePlan:
-		return e.executeUpdate(plan, sess)
+		logger.WithComponent("executor").Debug("Executing UPDATE plan")
+		result, err := e.executeUpdate(plan, sess)
+		e.logExecutionResult("UPDATE", start, err)
+		return result, err
 	case optimizer.DeletePlan:
-		return e.executeDelete(plan, sess)
+		logger.WithComponent("executor").Debug("Executing DELETE plan")
+		result, err := e.executeDelete(plan, sess)
+		e.logExecutionResult("DELETE", start, err)
+		return result, err
 	}
+
+	logger.WithComponent("executor").Debug("Executing query plan with operator tree",
+		zap.String("plan_type", string(plan.Type)))
 
 	// 创建执行上下文
+	ctxStart := time.Now()
 	ctx := NewContext(e.catalog, sess, e.dataManager)
+	logger.WithComponent("executor").Debug("Execution context created",
+		zap.Duration("context_creation_time", time.Since(ctxStart)))
 
 	// 构建执行算子树
+	buildStart := time.Now()
 	op, err := e.buildOperator(plan, ctx)
 	if err != nil {
+		logger.WithComponent("executor").Error("Failed to build operator tree",
+			zap.String("plan_type", string(plan.Type)),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return nil, err
 	}
+	logger.WithComponent("executor").Debug("Operator tree built successfully",
+		zap.Duration("build_duration", time.Since(buildStart)))
 
 	// 初始化算子
+	initStart := time.Now()
 	if err := op.Init(ctx); err != nil {
+		logger.WithComponent("executor").Error("Failed to initialize operator",
+			zap.String("plan_type", string(plan.Type)),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return nil, err
 	}
+	logger.WithComponent("executor").Debug("Operator initialized successfully",
+		zap.Duration("init_duration", time.Since(initStart)))
 
 	// 执行查询并收集结果
+	execStart := time.Now()
 	var batches []*types.Batch
+	batchCount := 0
 	for {
 		batch, err := op.Next()
 		if err != nil {
+			logger.WithComponent("executor").Error("Error during batch execution",
+				zap.String("plan_type", string(plan.Type)),
+				zap.Int("batches_processed", batchCount),
+				zap.Duration("duration", time.Since(start)),
+				zap.Error(err))
 			return nil, err
 		}
 		if batch == nil {
 			break
 		}
 		batches = append(batches, batch)
+		batchCount++
 	}
+	logger.WithComponent("executor").Debug("Query execution completed",
+		zap.Int("batches_collected", batchCount),
+		zap.Duration("execution_duration", time.Since(execStart)))
 
 	// 关闭算子
+	closeStart := time.Now()
 	if err := op.Close(); err != nil {
+		logger.WithComponent("executor").Error("Failed to close operator",
+			zap.String("plan_type", string(plan.Type)),
+			zap.Error(err))
 		return nil, err
 	}
+	logger.WithComponent("executor").Debug("Operator closed successfully",
+		zap.Duration("close_duration", time.Since(closeStart)))
 
 	// 构建结果集
+	resultStart := time.Now()
 	headers := e.getResultHeaders(plan, sess)
-	return &ResultSet{
+	result := &ResultSet{
 		Headers: headers,
 		rows:    batches,
 		curRow:  -1,
-	}, nil
+	}
+
+	totalDuration := time.Since(start)
+	logger.WithComponent("executor").Info("Query plan execution completed successfully",
+		zap.String("plan_type", string(plan.Type)),
+		zap.Int("result_batches", len(batches)),
+		zap.Int("result_columns", len(headers)),
+		zap.Duration("total_duration", totalDuration),
+		zap.Duration("result_building_duration", time.Since(resultStart)))
+
+	return result, nil
 }
 
 // buildOperator 根据计划节点构建算子

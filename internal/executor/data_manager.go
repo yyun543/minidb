@@ -95,6 +95,11 @@ func (dm *DataManager) GetTableData(dbName, tableName string) ([]*types.Batch, e
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 
+	// 特殊处理系统表
+	if dbName == "sys" {
+		return dm.getSystemTableData(tableName)
+	}
+
 	// 获取表元数据
 	tableMeta, err := dm.catalog.GetTable(dbName, tableName)
 	if err != nil {
@@ -117,6 +122,144 @@ func (dm *DataManager) GetTableData(dbName, tableName string) ([]*types.Batch, e
 	}
 
 	return batches, nil
+}
+
+// getSystemTableData 获取系统表数据
+func (dm *DataManager) getSystemTableData(tableName string) ([]*types.Batch, error) {
+	switch tableName {
+	case "schemata":
+		return dm.getSchemataData()
+	case "table_catalog":
+		return dm.getTableCatalogData()
+	default:
+		return nil, fmt.Errorf("unknown system table: %s", tableName)
+	}
+}
+
+// getSchemataData 获取schemata系统表数据（数据库列表）
+func (dm *DataManager) getSchemataData() ([]*types.Batch, error) {
+	// 获取所有数据库
+	databases, err := dm.catalog.GetAllDatabases()
+	if err != nil {
+		return nil, err
+	}
+
+	// 确保系统数据库存在（防御性编程）
+	systemDbs := []string{"sys", "default"}
+	dbSet := make(map[string]bool)
+
+	// 将现有数据库加入集合
+	for _, db := range databases {
+		dbSet[db] = true
+	}
+
+	// 添加缺失的系统数据库
+	for _, sysDb := range systemDbs {
+		if !dbSet[sysDb] {
+			databases = append(databases, sysDb)
+		}
+	}
+
+	// 创建schemata表的schema
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "schema_name", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	// 创建Arrow记录
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	nameBuilder := builder.Field(0).(*array.StringBuilder)
+
+	// 添加所有数据库名称
+	for _, dbName := range databases {
+		nameBuilder.Append(dbName)
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 转换为Batch
+	batch := types.NewBatch(record)
+	return []*types.Batch{batch}, nil
+}
+
+// getTableCatalogData 获取table_catalog系统表数据（表列表）
+func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
+	// 创建table_catalog表的schema
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	// 创建Arrow记录
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	schemaBuilder := builder.Field(0).(*array.StringBuilder)
+	nameBuilder := builder.Field(1).(*array.StringBuilder)
+
+	// 首先添加系统表（确保它们总是出现）
+	systemTables := []struct {
+		schema string
+		table  string
+	}{
+		{"sys", "schemata"},
+		{"sys", "table_catalog"},
+	}
+
+	for _, sysTable := range systemTables {
+		schemaBuilder.Append(sysTable.schema)
+		nameBuilder.Append(sysTable.table)
+	}
+
+	// 获取所有数据库
+	databases, err := dm.catalog.GetAllDatabases()
+	if err != nil {
+		return nil, err
+	}
+
+	// 确保系统数据库存在（防御性编程）
+	systemDbs := []string{"sys", "default"}
+	dbSet := make(map[string]bool)
+
+	// 将现有数据库加入集合
+	for _, db := range databases {
+		dbSet[db] = true
+	}
+
+	// 添加缺失的系统数据库
+	for _, sysDb := range systemDbs {
+		if !dbSet[sysDb] {
+			databases = append(databases, sysDb)
+		}
+	}
+
+	// 为每个数据库获取表列表
+	for _, dbName := range databases {
+		tables, err := dm.catalog.GetAllTables(dbName)
+		if err != nil {
+			continue // 跳过获取失败的数据库
+		}
+
+		// 跳过系统表（已经在上面添加过了）
+		for _, tableName := range tables {
+			if dbName == "sys" && (tableName == "schemata" || tableName == "table_catalog") {
+				continue // 跳过已添加的系统表
+			}
+			schemaBuilder.Append(dbName)
+			nameBuilder.Append(tableName)
+		}
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 转换为Batch
+	batch := types.NewBatch(record)
+	return []*types.Batch{batch}, nil
 }
 
 // UpdateData 更新表中的数据

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/ipc"
 	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/yyun543/minidb/internal/logger"
+	"go.uber.org/zap"
 )
 
 // MemTable 实现基于内存的存储引擎，支持 WAL 日志和内存索引
@@ -19,30 +22,66 @@ type MemTable struct {
 
 // NewMemTable 创建新的 MemTable 实例
 func NewMemTable(walPath string) (*MemTable, error) {
+	logger.WithComponent("memtable").Info("Creating new MemTable instance",
+		zap.String("wal_path", walPath))
+
+	start := time.Now()
 	wal, err := NewWAL(walPath)
 	if err != nil {
+		logger.WithComponent("memtable").Error("Failed to create WAL for MemTable",
+			zap.String("wal_path", walPath),
+			zap.Error(err))
 		return nil, fmt.Errorf("failed to create WAL: %v", err)
 	}
 
-	return &MemTable{
+	memTable := &MemTable{
 		wal:   wal,
 		index: NewIndex(),
-	}, nil
+	}
+
+	logger.WithComponent("memtable").Info("MemTable instance created successfully",
+		zap.String("wal_path", walPath),
+		zap.Duration("creation_time", time.Since(start)))
+
+	return memTable, nil
 }
 
 // Open 实现 Engine 接口
 func (mt *MemTable) Open() error {
-	// WAL recovery: 从WAL中恢复数据到内存索引
-	return mt.recoverFromWAL()
+	logger.WithComponent("memtable").Info("Opening MemTable and starting WAL recovery")
+
+	start := time.Now()
+	err := mt.recoverFromWAL()
+	if err != nil {
+		logger.WithComponent("memtable").Error("Failed to open MemTable",
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
+	} else {
+		logger.WithComponent("memtable").Info("MemTable opened successfully",
+			zap.Duration("recovery_time", time.Since(start)))
+	}
+	return err
 }
 
 // recoverFromWAL 从WAL恢复数据
 func (mt *MemTable) recoverFromWAL() error {
+	logger.WithComponent("memtable").Info("Starting WAL recovery")
+
+	start := time.Now()
 	// 扫描所有WAL条目 (从0到当前时间)
 	entries, err := mt.wal.Scan(0, 9223372036854775807) // int64最大值
 	if err != nil {
+		logger.WithComponent("memtable").Error("Failed to scan WAL entries for recovery",
+			zap.Error(err))
 		return fmt.Errorf("failed to scan WAL for recovery: %w", err)
 	}
+
+	logger.WithComponent("memtable").Info("WAL entries scanned, starting recovery replay",
+		zap.Int("total_entries", len(entries)))
+
+	putCount := 0
+	deleteCount := 0
+	skippedCount := 0
 
 	// 按时间戳顺序重放WAL条目
 	for _, entry := range entries {
@@ -50,92 +89,178 @@ func (mt *MemTable) recoverFromWAL() error {
 		case OpPut:
 			// 恢复PUT操作：直接写入索引，不写WAL (避免重复)
 			mt.index.Put(entry.Key, entry.Value)
+			putCount++
 		case OpDelete:
 			// 恢复DELETE操作：从索引删除，不写WAL (避免重复)
 			mt.index.Delete(entry.Key)
+			deleteCount++
 		default:
 			// 未知操作类型，跳过
+			logger.WithComponent("memtable").Warn("Unknown WAL operation type during recovery",
+				zap.Uint8("op_type", uint8(entry.OpType)),
+				zap.Int64("timestamp", entry.Timestamp))
+			skippedCount++
 			continue
 		}
 	}
+
+	recoveryDuration := time.Since(start)
+	logger.WithComponent("memtable").Info("WAL recovery completed",
+		zap.Int("total_entries", len(entries)),
+		zap.Int("put_operations", putCount),
+		zap.Int("delete_operations", deleteCount),
+		zap.Int("skipped_operations", skippedCount),
+		zap.Duration("recovery_duration", recoveryDuration))
 
 	return nil
 }
 
 // Close 实现 Engine 接口
 func (mt *MemTable) Close() error {
+	logger.WithComponent("memtable").Info("Closing MemTable")
+
 	mt.mutex.Lock()
 	defer mt.mutex.Unlock()
 
 	// 清理索引
 	mt.index.Clear()
+	logger.WithComponent("memtable").Debug("MemTable index cleared")
 
 	// 关闭 WAL
-	return mt.wal.Close()
+	err := mt.wal.Close()
+	if err != nil {
+		logger.WithComponent("memtable").Error("Failed to close MemTable WAL",
+			zap.Error(err))
+	} else {
+		logger.WithComponent("memtable").Info("MemTable closed successfully")
+	}
+	return err
 }
 
 // Get 实现 Engine 接口
 func (mt *MemTable) Get(key []byte) (arrow.Record, error) {
+	logger.WithComponent("memtable").Debug("Getting record from MemTable",
+		zap.String("key", string(key)))
+
+	start := time.Now()
 	mt.mutex.RLock()
 	defer mt.mutex.RUnlock()
 
 	// 从索引中查找
 	value, exists := mt.index.Get(key)
 	if !exists {
+		logger.WithComponent("memtable").Debug("Record not found in MemTable",
+			zap.String("key", string(key)),
+			zap.Duration("lookup_duration", time.Since(start)))
 		return nil, nil
 	}
 
-	// TODO 将字节数组转换为 Arrow Record
-	// 注意：这里假设 value 中存储的是序列化的 Arrow Record
-	// 实际实现中需要添加序列化/反序列化逻辑
+	// 将字节数组转换为 Arrow Record
 	record, err := deserializeRecord(value)
 	if err != nil {
+		logger.WithComponent("memtable").Error("Failed to deserialize record from MemTable",
+			zap.String("key", string(key)),
+			zap.Int("value_size", len(value)),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return nil, fmt.Errorf("failed to deserialize record: %v", err)
 	}
+
+	logger.WithComponent("memtable").Debug("Record retrieved successfully from MemTable",
+		zap.String("key", string(key)),
+		zap.Int("value_size", len(value)),
+		zap.Duration("get_duration", time.Since(start)))
 
 	return *record, nil
 }
 
 // Put 实现 Engine 接口
 func (mt *MemTable) Put(key []byte, record *arrow.Record) error {
+	logger.WithComponent("memtable").Debug("Putting record into MemTable",
+		zap.String("key", string(key)),
+		zap.Int64("record_rows", (*record).NumRows()))
+
+	start := time.Now()
 	mt.mutex.Lock()
 	defer mt.mutex.Unlock()
 
 	// 序列化 Arrow Record
+	serializeStart := time.Now()
 	value, err := serializeRecord(*record)
 	if err != nil {
+		logger.WithComponent("memtable").Error("Failed to serialize record for MemTable",
+			zap.String("key", string(key)),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return fmt.Errorf("failed to serialize record: %v", err)
 	}
+	serializeDuration := time.Since(serializeStart)
 
 	// 写入 WAL
+	walStart := time.Now()
 	if err := mt.wal.AppendPut(key, value); err != nil {
+		logger.WithComponent("memtable").Error("Failed to append PUT to WAL",
+			zap.String("key", string(key)),
+			zap.Int("value_size", len(value)),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return fmt.Errorf("failed to append to WAL: %v", err)
 	}
+	walDuration := time.Since(walStart)
 
 	// 更新内存索引
 	mt.index.Put(key, value)
+
+	totalDuration := time.Since(start)
+	logger.WithComponent("memtable").Info("Record put into MemTable successfully",
+		zap.String("key", string(key)),
+		zap.Int("serialized_size", len(value)),
+		zap.Int64("record_rows", (*record).NumRows()),
+		zap.Duration("serialize_duration", serializeDuration),
+		zap.Duration("wal_duration", walDuration),
+		zap.Duration("total_duration", totalDuration))
 
 	return nil
 }
 
 // Delete 实现 Engine 接口
 func (mt *MemTable) Delete(key []byte) error {
+	logger.WithComponent("memtable").Debug("Deleting record from MemTable",
+		zap.String("key", string(key)))
+
+	start := time.Now()
 	mt.mutex.Lock()
 	defer mt.mutex.Unlock()
 
 	// 写入 WAL
+	walStart := time.Now()
 	if err := mt.wal.AppendDelete(key); err != nil {
+		logger.WithComponent("memtable").Error("Failed to append DELETE to WAL",
+			zap.String("key", string(key)),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return fmt.Errorf("failed to append delete to WAL: %v", err)
 	}
+	walDuration := time.Since(walStart)
 
 	// 从索引中删除
 	mt.index.Delete(key)
+
+	totalDuration := time.Since(start)
+	logger.WithComponent("memtable").Info("Record deleted from MemTable successfully",
+		zap.String("key", string(key)),
+		zap.Duration("wal_duration", walDuration),
+		zap.Duration("total_duration", totalDuration))
 
 	return nil
 }
 
 // Scan 实现 Engine 接口
 func (mt *MemTable) Scan(start []byte, end []byte) (RecordIterator, error) {
+	logger.WithComponent("memtable").Debug("Starting MemTable scan",
+		zap.String("start_key", string(start)),
+		zap.String("end_key", string(end)))
+
 	mt.mutex.RLock()
 	defer mt.mutex.RUnlock()
 
@@ -144,6 +269,10 @@ func (mt *MemTable) Scan(start []byte, end []byte) (RecordIterator, error) {
 		table:    mt,
 		iterator: mt.index.NewIterator(start, end),
 	}
+
+	logger.WithComponent("memtable").Debug("MemTable scan iterator created",
+		zap.String("start_key", string(start)),
+		zap.String("end_key", string(end)))
 
 	return it, nil
 }

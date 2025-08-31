@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/bwmarrin/snowflake"
+	"github.com/yyun543/minidb/internal/logger"
+	"go.uber.org/zap"
 )
 
 // Session 表示一个数据库会话
@@ -25,15 +27,24 @@ type SessionManager struct {
 
 // NewSessionManager 创建新的会话管理器
 func NewSessionManager() (*SessionManager, error) {
+	logger.WithComponent("session").Info("Creating new session manager")
+
 	// 创建Snowflake节点，节点ID使用1
 	node, err := snowflake.NewNode(1)
 	if err != nil {
+		logger.WithComponent("session").Error("Failed to create Snowflake node for session manager",
+			zap.Error(err))
 		return nil, err
 	}
 
-	return &SessionManager{
+	manager := &SessionManager{
 		node: node,
-	}, nil
+	}
+
+	logger.WithComponent("session").Info("Session manager created successfully",
+		zap.Int64("snowflake_node_id", 1))
+
+	return manager, nil
 }
 
 // CreateSession 创建新会话
@@ -45,6 +56,11 @@ func (m *SessionManager) CreateSession() *Session {
 		Variables:    make(map[string]interface{}),
 	}
 	m.sessions.Store(session.ID, session)
+
+	logger.WithComponent("session").Info("New session created",
+		zap.Int64("session_id", session.ID),
+		zap.Time("created_at", session.CreatedAt))
+
 	return session
 }
 

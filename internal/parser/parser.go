@@ -3,8 +3,11 @@ package parser
 import (
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/antlr4-go/antlr/v4"
+	"github.com/yyun543/minidb/internal/logger"
+	"go.uber.org/zap"
 )
 
 // MiniQLVisitorImpl 是 MiniQL 的访问器实现
@@ -14,30 +17,63 @@ type MiniQLVisitorImpl struct {
 
 // Parse 是对外主要接口，传入 SQL 字符串返回 AST 节点
 func Parse(sql string) (Node, error) {
+	logger.WithComponent("parser").Debug("Starting SQL parsing",
+		zap.String("sql", sql),
+		zap.Int("sql_length", len(sql)))
+
+	start := time.Now()
+
 	// 创建词法分析器
+	lexerStart := time.Now()
 	input := antlr.NewInputStream(sql)
 	lexer := NewMiniQLLexer(input)
 	lexer.RemoveErrorListeners()
 	lexer.AddErrorListener(antlr.NewDiagnosticErrorListener(true))
+	logger.WithComponent("parser").Debug("Lexer created successfully",
+		zap.Duration("lexer_creation_time", time.Since(lexerStart)))
 
 	// 创建语法分析器
+	parserStart := time.Now()
 	stream := antlr.NewCommonTokenStream(lexer, antlr.TokenDefaultChannel)
 	parser := NewMiniQLParser(stream)
 	parser.RemoveErrorListeners()
 	parser.AddErrorListener(antlr.NewDiagnosticErrorListener(true))
+	logger.WithComponent("parser").Debug("Parser created successfully",
+		zap.Duration("parser_creation_time", time.Since(parserStart)))
 
 	// 生成语法树，并开始访问
+	parseTreeStart := time.Now()
 	parseTree := parser.Parse()
+	logger.WithComponent("parser").Debug("Parse tree generated",
+		zap.Duration("parse_tree_generation_time", time.Since(parseTreeStart)))
+
+	visitorStart := time.Now()
 	visitor := &MiniQLVisitorImpl{}
 	result := visitor.Visit(parseTree)
 	if result == nil {
+		logger.WithComponent("parser").Error("Failed to parse SQL - visitor returned nil",
+			zap.String("sql", sql),
+			zap.Duration("duration", time.Since(start)))
 		return nil, fmt.Errorf("解析SQL失败")
 	}
 
+	logger.WithComponent("parser").Debug("AST visitor completed",
+		zap.Duration("visitor_duration", time.Since(visitorStart)))
+
 	node, ok := result.(Node)
 	if !ok {
+		logger.WithComponent("parser").Error("Parse result type assertion failed",
+			zap.String("sql", sql),
+			zap.String("result_type", fmt.Sprintf("%T", result)),
+			zap.Duration("duration", time.Since(start)))
 		return nil, fmt.Errorf("解析结果类型错误")
 	}
+
+	totalDuration := time.Since(start)
+	logger.WithComponent("parser").Info("SQL parsing completed successfully",
+		zap.String("sql", sql),
+		zap.String("node_type", fmt.Sprintf("%T", node)),
+		zap.Duration("total_parsing_time", totalDuration))
 
 	return node, nil
 }
@@ -57,22 +93,33 @@ func (v *MiniQLVisitorImpl) VisitParse(ctx *ParseContext) interface{} {
 
 // VisitSqlStatement 访问 SQL 语句节点
 func (v *MiniQLVisitorImpl) VisitSqlStatement(ctx *SqlStatementContext) interface{} {
+	logger.WithComponent("parser").Debug("Visiting SQL statement",
+		zap.String("statement_text", ctx.GetText()))
+
 	// 按照语法规则定义的顺序检查
 	if ctx.DmlStatement() != nil {
+		logger.WithComponent("parser").Debug("Processing DML statement")
 		return v.Visit(ctx.DmlStatement())
 	}
 	if ctx.DqlStatement() != nil {
+		logger.WithComponent("parser").Debug("Processing DQL statement")
 		return v.Visit(ctx.DqlStatement())
 	}
 	if ctx.DdlStatement() != nil {
+		logger.WithComponent("parser").Debug("Processing DDL statement")
 		return v.Visit(ctx.DdlStatement())
 	}
 	if ctx.DclStatement() != nil {
+		logger.WithComponent("parser").Debug("Processing DCL statement")
 		return v.Visit(ctx.DclStatement())
 	}
 	if ctx.UtilityStatement() != nil {
+		logger.WithComponent("parser").Debug("Processing utility statement")
 		return v.Visit(ctx.UtilityStatement())
 	}
+
+	logger.WithComponent("parser").Warn("Unrecognized SQL statement type",
+		zap.String("statement_text", ctx.GetText()))
 	return nil
 }
 
@@ -145,6 +192,8 @@ func (v *MiniQLVisitorImpl) VisitUtilityStatement(ctx *UtilityStatementContext) 
 
 // VisitCreateDatabase 访问 CREATE DATABASE 语句
 func (v *MiniQLVisitorImpl) VisitCreateDatabase(ctx *CreateDatabaseContext) interface{} {
+	logger.WithComponent("parser").Debug("Processing CREATE DATABASE statement")
+
 	// 1. 创建 CreateDatabaseStmt 节点
 	stmt := &CreateDatabaseStmt{
 		BaseNode: BaseNode{nodeType: CreateDatabaseNode},
@@ -160,7 +209,11 @@ func (v *MiniQLVisitorImpl) VisitCreateDatabase(ctx *CreateDatabaseContext) inte
 			case *Identifier:
 				stmt.Database = t.Value
 			}
+			logger.WithComponent("parser").Info("CREATE DATABASE statement parsed successfully",
+				zap.String("database_name", stmt.Database))
 		}
+	} else {
+		logger.WithComponent("parser").Error("CREATE DATABASE missing database name")
 	}
 
 	return stmt
@@ -168,6 +221,8 @@ func (v *MiniQLVisitorImpl) VisitCreateDatabase(ctx *CreateDatabaseContext) inte
 
 // VisitCreateTable 访问 CREATE TABLE 语句
 func (v *MiniQLVisitorImpl) VisitCreateTable(ctx *CreateTableContext) interface{} {
+	logger.WithComponent("parser").Debug("Processing CREATE TABLE statement")
+
 	// 创建 CreateTableStmt 节点
 	stmt := &CreateTableStmt{
 		BaseNode: BaseNode{nodeType: CreateTableNode},
@@ -202,6 +257,11 @@ func (v *MiniQLVisitorImpl) VisitCreateTable(ctx *CreateTableContext) interface{
 			}
 		}
 	}
+
+	logger.WithComponent("parser").Info("CREATE TABLE statement parsed successfully",
+		zap.String("table_name", stmt.Table),
+		zap.Int("column_count", len(stmt.Columns)),
+		zap.Int("constraint_count", len(stmt.Constraints)))
 
 	return stmt
 }
@@ -353,6 +413,8 @@ func (v *MiniQLVisitorImpl) VisitDropDatabase(ctx *DropDatabaseContext) interfac
 
 // VisitInsertStatement 访问 INSERT 语句节点
 func (v *MiniQLVisitorImpl) VisitInsertStatement(ctx *InsertStatementContext) interface{} {
+	logger.WithComponent("parser").Debug("Processing INSERT statement")
+
 	// 创建 InsertStmt 节点
 	stmt := &InsertStmt{
 		BaseNode: BaseNode{nodeType: InsertNode},
@@ -380,6 +442,11 @@ func (v *MiniQLVisitorImpl) VisitInsertStatement(ctx *InsertStatementContext) in
 		}
 	}
 
+	logger.WithComponent("parser").Info("INSERT statement parsed successfully",
+		zap.String("table_name", stmt.Table),
+		zap.Int("column_count", len(stmt.Columns)),
+		zap.Int("value_count", len(stmt.Values)))
+
 	return stmt
 }
 
@@ -388,6 +455,8 @@ func (v *MiniQLVisitorImpl) VisitUpdateStatement(ctx *UpdateStatementContext) in
 	if ctx == nil {
 		return nil
 	}
+
+	logger.WithComponent("parser").Debug("Processing UPDATE statement")
 
 	// 创建UPDATE语句节点
 	stmt := &UpdateStmt{
@@ -431,11 +500,18 @@ func (v *MiniQLVisitorImpl) VisitUpdateStatement(ctx *UpdateStatementContext) in
 		}
 	}
 
+	logger.WithComponent("parser").Info("UPDATE statement parsed successfully",
+		zap.String("table_name", stmt.Table),
+		zap.Int("assignment_count", len(stmt.Assignments)),
+		zap.Bool("has_where", stmt.Where != nil))
+
 	return stmt
 }
 
 // VisitDeleteStatement 访问 DELETE 语句节点
 func (v *MiniQLVisitorImpl) VisitDeleteStatement(ctx *DeleteStatementContext) interface{} {
+	logger.WithComponent("parser").Debug("Processing DELETE statement")
+
 	// 创建 DeleteStmt 节点
 	stmt := &DeleteStmt{
 		BaseNode: BaseNode{nodeType: DeleteNode},
@@ -465,6 +541,10 @@ func (v *MiniQLVisitorImpl) VisitDeleteStatement(ctx *DeleteStatementContext) in
 		}
 	}
 
+	logger.WithComponent("parser").Info("DELETE statement parsed successfully",
+		zap.String("table_name", stmt.Table),
+		zap.Bool("has_where", stmt.Where != nil))
+
 	return stmt
 }
 
@@ -473,6 +553,11 @@ func (v *MiniQLVisitorImpl) VisitSelectStatement(ctx *SelectStatementContext) in
 	if ctx == nil {
 		return nil
 	}
+
+	logger.WithComponent("parser").Debug("Processing SELECT statement",
+		zap.String("select_text", ctx.GetText()))
+
+	start := time.Now()
 
 	// 创建 SelectStmt 节点
 	stmt := &SelectStmt{
@@ -573,6 +658,19 @@ func (v *MiniQLVisitorImpl) VisitSelectStatement(ctx *SelectStatementContext) in
 			stmt.Limit = limit
 		}
 	}
+
+	duration := time.Since(start)
+	logger.WithComponent("parser").Info("SELECT statement parsed successfully",
+		zap.String("from_table", stmt.From),
+		zap.String("from_alias", stmt.FromAlias),
+		zap.Int("column_count", len(stmt.Columns)),
+		zap.Int("join_count", len(stmt.Joins)),
+		zap.Bool("has_where", stmt.Where != nil),
+		zap.Bool("has_group_by", len(stmt.GroupBy) > 0),
+		zap.Bool("has_having", stmt.Having != nil),
+		zap.Bool("has_order_by", len(stmt.OrderBy) > 0),
+		zap.Int64("limit_value", stmt.Limit),
+		zap.Duration("parse_duration", duration))
 
 	return stmt
 }
@@ -1107,6 +1205,8 @@ func (v *MiniQLVisitorImpl) VisitUseStatement(ctx *UseStatementContext) interfac
 		return nil
 	}
 
+	logger.WithComponent("parser").Debug("Processing USE statement")
+
 	// 获取数据库名
 	var dbName string
 	if ctx.Identifier() != nil {
@@ -1114,6 +1214,9 @@ func (v *MiniQLVisitorImpl) VisitUseStatement(ctx *UseStatementContext) interfac
 			dbName = result.(string)
 		}
 	}
+
+	logger.WithComponent("parser").Info("USE statement parsed successfully",
+		zap.String("database_name", dbName))
 
 	// 返回 UseStmt 节点
 	return &UseStmt{
@@ -1124,10 +1227,16 @@ func (v *MiniQLVisitorImpl) VisitUseStatement(ctx *UseStatementContext) interfac
 
 // VisitShowDatabases 访问 SHOW DATABASES 语句
 func (v *MiniQLVisitorImpl) VisitShowDatabases(ctx *ShowDatabasesContext) interface{} {
+	logger.WithComponent("parser").Debug("Processing SHOW DATABASES statement")
+
 	// 直接返回 ShowDatabasesStmt 节点，无需任何中间对象
-	return &ShowDatabasesStmt{
+	stmt := &ShowDatabasesStmt{
 		BaseNode: BaseNode{nodeType: ShowDatabasesNode},
 	}
+
+	logger.WithComponent("parser").Info("SHOW DATABASES statement parsed successfully")
+
+	return stmt
 }
 
 // VisitShowTables 访问 SHOW TABLES 语句节点
@@ -1136,11 +1245,17 @@ func (v *MiniQLVisitorImpl) VisitShowTables(ctx *ShowTablesContext) interface{} 
 		return nil
 	}
 
+	logger.WithComponent("parser").Debug("Processing SHOW TABLES statement")
+
 	// 返回 ShowTablesStmt 节点
-	return &ShowTablesStmt{
+	stmt := &ShowTablesStmt{
 		BaseNode: BaseNode{nodeType: ShowTablesNode},
 		Database: "",
 	}
+
+	logger.WithComponent("parser").Info("SHOW TABLES statement parsed successfully")
+
+	return stmt
 }
 
 // VisitExplainStatement 访问 EXPLAIN 语句节点
@@ -1258,13 +1373,27 @@ func (v *MiniQLVisitorImpl) VisitLiteral(ctx *LiteralContext) interface{} {
 	// 根据字面量类型创建对应的节点
 	switch {
 	case ctx.INTEGER_LITERAL() != nil:
-		val, _ := strconv.ParseInt(ctx.INTEGER_LITERAL().GetText(), 10, 64)
+		text := ctx.INTEGER_LITERAL().GetText()
+		val, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			logger.WithComponent("parser").Error("Failed to parse integer literal",
+				zap.String("text", text),
+				zap.Error(err))
+			return nil
+		}
 		return &IntegerLiteral{
 			BaseNode: BaseNode{nodeType: IntegerLiteralNode},
 			Value:    val,
 		}
 	case ctx.FLOAT_LITERAL() != nil:
-		val, _ := strconv.ParseFloat(ctx.FLOAT_LITERAL().GetText(), 64)
+		text := ctx.FLOAT_LITERAL().GetText()
+		val, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			logger.WithComponent("parser").Error("Failed to parse float literal",
+				zap.String("text", text),
+				zap.Error(err))
+			return nil
+		}
 		return &FloatLiteral{
 			BaseNode: BaseNode{nodeType: FloatLiteralNode},
 			Value:    val,
@@ -1272,12 +1401,19 @@ func (v *MiniQLVisitorImpl) VisitLiteral(ctx *LiteralContext) interface{} {
 	case ctx.STRING_LITERAL() != nil:
 		// 去除字符串两端的引号
 		text := ctx.STRING_LITERAL().GetText()
+		if len(text) < 2 {
+			logger.WithComponent("parser").Error("Invalid string literal format",
+				zap.String("text", text))
+			return nil
+		}
 		value := text[1 : len(text)-1]
 		return &StringLiteral{
 			BaseNode: BaseNode{nodeType: StringLiteralNode},
 			Value:    value,
 		}
 	default:
+		logger.WithComponent("parser").Warn("Unrecognized literal type",
+			zap.String("context", ctx.GetText()))
 		return nil
 	}
 }

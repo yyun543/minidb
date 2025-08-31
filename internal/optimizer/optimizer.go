@@ -3,8 +3,11 @@ package optimizer
 import (
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/yyun543/minidb/internal/logger"
 	"github.com/yyun543/minidb/internal/parser"
+	"go.uber.org/zap"
 )
 
 // Optimizer 查询优化器
@@ -14,6 +17,8 @@ type Optimizer struct {
 
 // NewOptimizer 创建新的优化器实例
 func NewOptimizer() *Optimizer {
+	logger.WithComponent("optimizer").Info("Creating new query optimizer")
+
 	opt := &Optimizer{
 		rules: make([]Rule, 0),
 	}
@@ -23,21 +28,57 @@ func NewOptimizer() *Optimizer {
 		&JoinReorderRule{},       // Join重排序
 		&ProjectionPruningRule{}, // 投影剪枝
 	)
+
+	logger.WithComponent("optimizer").Info("Query optimizer created successfully",
+		zap.Int("rules_count", len(opt.rules)))
+
 	return opt
 }
 
 // Optimize 优化查询
 func (o *Optimizer) Optimize(stmt parser.Node) (*Plan, error) {
+	logger.WithComponent("optimizer").Debug("Starting query optimization",
+		zap.String("statement_type", fmt.Sprintf("%T", stmt)))
+
+	start := time.Now()
+
 	// 1. 构建初始计划
+	buildStart := time.Now()
 	plan, err := o.buildPlan(stmt)
 	if err != nil {
+		logger.WithComponent("optimizer").Error("Failed to build initial plan",
+			zap.String("statement_type", fmt.Sprintf("%T", stmt)),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
 		return nil, err
 	}
+	logger.WithComponent("optimizer").Debug("Initial plan built successfully",
+		zap.String("plan_type", string(plan.Type)),
+		zap.Duration("build_duration", time.Since(buildStart)))
 
 	// 2. 应用优化规则
+	rulesStart := time.Now()
+	appliedRules := 0
 	for _, rule := range o.rules {
+		ruleStart := time.Now()
+		originalPlan := plan
 		plan = rule.Apply(plan)
+		if plan != originalPlan {
+			appliedRules++
+			logger.WithComponent("optimizer").Debug("Optimization rule applied",
+				zap.String("rule_type", fmt.Sprintf("%T", rule)),
+				zap.Duration("rule_duration", time.Since(ruleStart)))
+		}
 	}
+
+	totalDuration := time.Since(start)
+	logger.WithComponent("optimizer").Info("Query optimization completed",
+		zap.String("statement_type", fmt.Sprintf("%T", stmt)),
+		zap.String("final_plan_type", string(plan.Type)),
+		zap.Int("rules_applied", appliedRules),
+		zap.Int("total_rules", len(o.rules)),
+		zap.Duration("rules_duration", time.Since(rulesStart)),
+		zap.Duration("total_duration", totalDuration))
 
 	return plan, nil
 }
