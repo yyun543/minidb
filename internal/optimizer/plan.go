@@ -23,6 +23,8 @@ const (
 	GroupPlan
 	CreateDatabasePlan
 	CreateTablePlan
+	CreateIndexPlan
+	DropIndexPlan
 	DropDatabasePlan
 	DropTablePlan
 	TransactionPlan
@@ -62,6 +64,10 @@ func (pt PlanType) String() string {
 		return "CreateDatabase"
 	case CreateTablePlan:
 		return "CreateTable"
+	case CreateIndexPlan:
+		return "CreateIndex"
+	case DropIndexPlan:
+		return "DropIndex"
 	case DropDatabasePlan:
 		return "DropDatabase"
 	case DropTablePlan:
@@ -387,6 +393,37 @@ type DropTableProperties struct {
 }
 
 func (p *DropTableProperties) Explain() string {
+	return fmt.Sprintf("Table: %s", p.Table)
+}
+
+// CreateIndexProperties 用于 CREATE INDEX 计划
+type CreateIndexProperties struct {
+	Name     string   // 索引名
+	Table    string   // 表名
+	Columns  []string // 索引列
+	IsUnique bool     // 是否唯一索引
+}
+
+func (p *CreateIndexProperties) Explain() string {
+	return fmt.Sprintf("Index: %s, Table: %s, Columns: %v, Unique: %v", p.Name, p.Table, p.Columns, p.IsUnique)
+}
+
+// DropIndexProperties 用于 DROP INDEX 计划
+type DropIndexProperties struct {
+	Name  string // 索引名
+	Table string // 表名
+}
+
+func (p *DropIndexProperties) Explain() string {
+	return fmt.Sprintf("Index: %s, Table: %s", p.Name, p.Table)
+}
+
+// ShowIndexesProperties 用于 SHOW INDEXES 计划
+type ShowIndexesProperties struct {
+	Table string // 表名
+}
+
+func (p *ShowIndexesProperties) Explain() string {
 	return fmt.Sprintf("Table: %s", p.Table)
 }
 

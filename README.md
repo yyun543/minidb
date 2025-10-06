@@ -39,11 +39,12 @@ MiniDB is a distributed MPP (Massively Parallel Processing) database system buil
 ## Supported SQL Features ✅
 
 ### Currently Working
-- **DDL**: `CREATE/DROP DATABASE`, `CREATE/DROP TABLE`
-- **DML**: `INSERT`, `SELECT`, `UPDATE`, `DELETE` 
+- **DDL**: `CREATE/DROP DATABASE`, `CREATE/DROP TABLE`, `CREATE/DROP INDEX`
+- **DML**: `INSERT`, `SELECT`, `UPDATE`, `DELETE`
 - **Queries**: `WHERE` clauses (=, >, <, >=, <=, AND, OR)
 - **Aggregation**: `GROUP BY`, `HAVING` with COUNT, SUM, AVG, MIN, MAX
-- **Utilities**: `USE database`, `SHOW TABLES/DATABASES`, `EXPLAIN`
+- **Indexes**: `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `SHOW INDEXES`
+- **Utilities**: `USE database`, `SHOW TABLES/DATABASES/INDEXES`, `EXPLAIN`
 
 ### Limited Support ⚠️
 - **JOIN operations** (basic implementation)
@@ -308,6 +309,19 @@ CREATE TABLE orders (
 
 -- Show tables in current database
 SHOW TABLES;
+
+-- Create indexes for query optimization
+CREATE INDEX idx_users_email ON users (email);
+CREATE UNIQUE INDEX idx_users_id ON users (id);
+CREATE INDEX idx_orders_user_id ON orders (user_id);
+CREATE INDEX idx_composite ON users (name, email);
+
+-- Show all indexes on a table
+SHOW INDEXES ON users;
+SHOW INDEXES FROM orders;
+
+-- Drop indexes
+DROP INDEX idx_users_email ON users;
 ```
 
 ### Working DML Examples ✅

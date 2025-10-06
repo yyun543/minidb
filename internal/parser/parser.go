@@ -156,6 +156,9 @@ func (v *MiniQLVisitorImpl) VisitDdlStatement(ctx *DdlStatementContext) interfac
 	if ctx.CreateIndex() != nil {
 		return v.Visit(ctx.CreateIndex())
 	}
+	if ctx.DropIndex() != nil {
+		return v.Visit(ctx.DropIndex())
+	}
 	if ctx.DropDatabase() != nil {
 		return v.Visit(ctx.DropDatabase())
 	}
@@ -183,6 +186,9 @@ func (v *MiniQLVisitorImpl) VisitUtilityStatement(ctx *UtilityStatementContext) 
 	}
 	if ctx.ShowTables() != nil {
 		return v.Visit(ctx.ShowTables())
+	}
+	if ctx.ShowIndexes() != nil {
+		return v.Visit(ctx.ShowIndexes())
 	}
 	if ctx.ExplainStatement() != nil {
 		return v.Visit(ctx.ExplainStatement())
@@ -332,10 +338,15 @@ func (v *MiniQLVisitorImpl) VisitTableConstraint(ctx *TableConstraintContext) in
 
 // VisitCreateIndex 访问 CREATE INDEX 语句
 func (v *MiniQLVisitorImpl) VisitCreateIndex(ctx *CreateIndexContext) interface{} {
+	logger.WithComponent("parser").Debug("Processing CREATE INDEX statement")
+
 	// 创建 CreateIndexStmt 节点
 	stmt := &CreateIndexStmt{
 		BaseNode: BaseNode{nodeType: CreateIndexNode},
 	}
+
+	// 检查是否是 UNIQUE INDEX
+	stmt.IsUnique = ctx.UNIQUE() != nil
 
 	// 获取索引名
 	if ctx.Identifier() != nil {
@@ -369,6 +380,45 @@ func (v *MiniQLVisitorImpl) VisitCreateIndex(ctx *CreateIndexContext) interface{
 			}
 		}
 	}
+
+	logger.WithComponent("parser").Info("CREATE INDEX statement parsed successfully",
+		zap.String("index_name", stmt.Name),
+		zap.String("table_name", stmt.Table),
+		zap.Strings("columns", stmt.Columns),
+		zap.Bool("is_unique", stmt.IsUnique))
+
+	return stmt
+}
+
+// VisitDropIndex 访问 DROP INDEX 语句
+func (v *MiniQLVisitorImpl) VisitDropIndex(ctx *DropIndexContext) interface{} {
+	logger.WithComponent("parser").Debug("Processing DROP INDEX statement")
+
+	// 创建 DropIndexStmt 节点
+	stmt := &DropIndexStmt{
+		BaseNode: BaseNode{nodeType: DropIndexNode},
+	}
+
+	// 获取索引名
+	if ctx.Identifier() != nil {
+		stmt.Name = ctx.Identifier().GetText()
+	}
+
+	// 获取表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			switch t := result.(type) {
+			case string:
+				stmt.Table = t
+			case *Identifier:
+				stmt.Table = t.Value
+			}
+		}
+	}
+
+	logger.WithComponent("parser").Info("DROP INDEX statement parsed successfully",
+		zap.String("index_name", stmt.Name),
+		zap.String("table_name", stmt.Table))
 
 	return stmt
 }
@@ -1254,6 +1304,37 @@ func (v *MiniQLVisitorImpl) VisitShowTables(ctx *ShowTablesContext) interface{} 
 	}
 
 	logger.WithComponent("parser").Info("SHOW TABLES statement parsed successfully")
+
+	return stmt
+}
+
+// VisitShowIndexes 访问 SHOW INDEXES 语句节点
+func (v *MiniQLVisitorImpl) VisitShowIndexes(ctx *ShowIndexesContext) interface{} {
+	if ctx == nil {
+		return nil
+	}
+
+	logger.WithComponent("parser").Debug("Processing SHOW INDEXES statement")
+
+	// 创建 ShowIndexesStmt 节点
+	stmt := &ShowIndexesStmt{
+		BaseNode: BaseNode{nodeType: ShowIndexesNode},
+	}
+
+	// 获取表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			switch t := result.(type) {
+			case string:
+				stmt.Table = t
+			case *Identifier:
+				stmt.Table = t.Value
+			}
+		}
+	}
+
+	logger.WithComponent("parser").Info("SHOW INDEXES statement parsed successfully",
+		zap.String("table_name", stmt.Table))
 
 	return stmt
 }

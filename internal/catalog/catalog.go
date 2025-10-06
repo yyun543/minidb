@@ -134,6 +134,16 @@ type TableMeta struct {
 	Schema     *arrow.Schema
 }
 
+// IndexMeta 索引元数据
+type IndexMeta struct {
+	Database  string   // 所属数据库
+	Table     string   // 所属表
+	Name      string   // 索引名称
+	Columns   []string // 索引列
+	IsUnique  bool     // 是否唯一索引
+	IndexType string   // 索引类型 (BTREE, HASH, etc.)
+}
+
 // SessionManager 接口定义（用于适配器）
 type SessionManager interface {
 	CreateSession() Session

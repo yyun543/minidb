@@ -98,6 +98,10 @@ func (o *Optimizer) buildPlan(node parser.Node) (*Plan, error) {
 		return o.buildCreateDatabasePlan(n)
 	case *parser.CreateTableStmt:
 		return o.buildCreateTablePlan(n)
+	case *parser.CreateIndexStmt:
+		return o.buildCreateIndexPlan(n)
+	case *parser.DropIndexStmt:
+		return o.buildDropIndexPlan(n)
 	case *parser.DropDatabaseStmt:
 		return o.buildDropDatabasePlan(n)
 	case *parser.DropTableStmt:
@@ -110,6 +114,8 @@ func (o *Optimizer) buildPlan(node parser.Node) (*Plan, error) {
 		return o.buildShowDatabasesPlan(n)
 	case *parser.ShowTablesStmt:
 		return o.buildShowTablesPlan(n)
+	case *parser.ShowIndexesStmt:
+		return o.buildShowIndexesPlan(n)
 	case *parser.ExplainStmt:
 		return o.buildExplainPlan(n)
 	default:
@@ -666,4 +672,52 @@ func isAggregateFunction(funcName string) bool {
 		"MAX":   true,
 	}
 	return aggregateFunctions[strings.ToUpper(funcName)]
+}
+
+// buildCreateIndexPlan 构建 CREATE INDEX 计划
+func (o *Optimizer) buildCreateIndexPlan(stmt *parser.CreateIndexStmt) (*Plan, error) {
+	logger.WithComponent("optimizer").Debug("Building CREATE INDEX plan",
+		zap.String("index_name", stmt.Name),
+		zap.String("table", stmt.Table))
+
+	return &Plan{
+		Type: CreateIndexPlan,
+		Properties: &CreateIndexProperties{
+			Name:     stmt.Name,
+			Table:    stmt.Table,
+			Columns:  stmt.Columns,
+			IsUnique: stmt.IsUnique,
+		},
+		Children: nil,
+	}, nil
+}
+
+// buildDropIndexPlan 构建 DROP INDEX 计划
+func (o *Optimizer) buildDropIndexPlan(stmt *parser.DropIndexStmt) (*Plan, error) {
+	logger.WithComponent("optimizer").Debug("Building DROP INDEX plan",
+		zap.String("index_name", stmt.Name),
+		zap.String("table", stmt.Table))
+
+	return &Plan{
+		Type: DropIndexPlan,
+		Properties: &DropIndexProperties{
+			Name:  stmt.Name,
+			Table: stmt.Table,
+		},
+		Children: nil,
+	}, nil
+}
+
+// buildShowIndexesPlan 构建 SHOW INDEXES 计划
+func (o *Optimizer) buildShowIndexesPlan(stmt *parser.ShowIndexesStmt) (*Plan, error) {
+	logger.WithComponent("optimizer").Debug("Building SHOW INDEXES plan",
+		zap.String("table", stmt.Table))
+
+	return &Plan{
+		Type: ShowPlan,
+		Properties: &ShowIndexesProperties{
+			Table: stmt.Table,
+		},
+		Children: nil,
+	}, nil
 }

@@ -62,6 +62,7 @@ VERBOSE: V E R B O S E;
 UNIQUE: U N I Q U E;
 DEFAULT: D E F A U L T;
 INDEX: I N D E X;
+INDEXES: I N D E X E S;
 
 // 数据类型关键字（必须放在IDENTIFIER前）
 INTEGER_TYPE: I N T E G E R;
@@ -154,6 +155,7 @@ ddlStatement
  : createDatabase
  | createTable
  | createIndex
+ | dropIndex
  | dropTable
  | dropDatabase
  ;
@@ -176,6 +178,7 @@ utilityStatement
  : useStatement
  | showDatabases
  | showTables
+ | showIndexes
  | explainStatement
  ;
 
@@ -206,7 +209,11 @@ tableConstraint
  ;
 
 createIndex
- : CREATE INDEX identifier ON tableName LEFT_PAREN identifierList RIGHT_PAREN
+ : CREATE UNIQUE? INDEX identifier ON tableName LEFT_PAREN identifierList RIGHT_PAREN
+ ;
+
+dropIndex
+ : DROP INDEX identifier ON tableName
  ;
 
 dropTable
@@ -339,6 +346,10 @@ showDatabases
 
 showTables
  : SHOW TABLES
+ ;
+
+showIndexes
+ : SHOW INDEXES (ON | FROM) tableName
  ;
 
 explainStatement

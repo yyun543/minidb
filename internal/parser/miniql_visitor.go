@@ -1,7 +1,6 @@
-// Code generated from /Users/yasonlee/codes/minidb/internal/parser/MiniQL.g4 by ANTLR 4.13.2. DO NOT EDIT.
+// Code generated from MiniQL.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
 package parser // MiniQL
-
 import "github.com/antlr4-go/antlr/v4"
 
 // A complete Visitor for a parse tree produced by MiniQLParser.
@@ -46,6 +45,9 @@ type MiniQLVisitor interface {
 
 	// Visit a parse tree produced by MiniQLParser#createIndex.
 	VisitCreateIndex(ctx *CreateIndexContext) interface{}
+
+	// Visit a parse tree produced by MiniQLParser#dropIndex.
+	VisitDropIndex(ctx *DropIndexContext) interface{}
 
 	// Visit a parse tree produced by MiniQLParser#dropTable.
 	VisitDropTable(ctx *DropTableContext) interface{}
@@ -145,6 +147,9 @@ type MiniQLVisitor interface {
 
 	// Visit a parse tree produced by MiniQLParser#showTables.
 	VisitShowTables(ctx *ShowTablesContext) interface{}
+
+	// Visit a parse tree produced by MiniQLParser#showIndexes.
+	VisitShowIndexes(ctx *ShowIndexesContext) interface{}
 
 	// Visit a parse tree produced by MiniQLParser#explainStatement.
 	VisitExplainStatement(ctx *ExplainStatementContext) interface{}

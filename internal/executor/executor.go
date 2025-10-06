@@ -105,6 +105,16 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 		result, err := e.executeCreateTable(plan, sess)
 		e.logExecutionResult("CREATE TABLE", start, err)
 		return result, err
+	case optimizer.CreateIndexPlan:
+		logger.WithComponent("executor").Debug("Executing CREATE INDEX plan")
+		result, err := e.executeCreateIndex(plan, sess)
+		e.logExecutionResult("CREATE INDEX", start, err)
+		return result, err
+	case optimizer.DropIndexPlan:
+		logger.WithComponent("executor").Debug("Executing DROP INDEX plan")
+		result, err := e.executeDropIndex(plan, sess)
+		e.logExecutionResult("DROP INDEX", start, err)
+		return result, err
 	case optimizer.ShowPlan:
 		logger.WithComponent("executor").Debug("Executing SHOW plan")
 		result, err := e.executeShow(plan, sess)
@@ -1033,4 +1043,60 @@ func (e *ExecutorImpl) convertSQLTypeToArrow(sqlType string) arrow.DataType {
 	default:
 		return arrow.BinaryTypes.String
 	}
+}
+
+// executeCreateIndex 执行创建索引操作
+func (e *ExecutorImpl) executeCreateIndex(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.CreateIndexProperties)
+
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// 创建索引元数据
+	indexMeta := catalog.IndexMeta{
+		Database:  currentDB,
+		Table:     props.Table,
+		Name:      props.Name,
+		Columns:   props.Columns,
+		IsUnique:  props.IsUnique,
+		IndexType: "BTREE", // 默认使用B树索引
+	}
+
+	// 调用catalog创建索引
+	err := e.catalog.CreateIndex(indexMeta)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create index: %w", err)
+	}
+
+	// 返回成功结果
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// executeDropIndex 执行删除索引操作
+func (e *ExecutorImpl) executeDropIndex(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.DropIndexProperties)
+
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// 调用catalog删除索引
+	err := e.catalog.DropIndex(currentDB, props.Table, props.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to drop index: %w", err)
+	}
+
+	// 返回成功结果
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
 }

@@ -322,6 +322,41 @@ func (h *QueryHandler) handleSpecialCommands(ast interface{}, sess *session.Sess
 		return sb.String(), true
 	}
 
+	// 处理SHOW INDEXES命令
+	if showIndexesStmt, ok := ast.(*parser.ShowIndexesStmt); ok {
+		currentDB := sess.CurrentDB
+		if currentDB == "" {
+			currentDB = "default"
+		}
+
+		// 通过catalog获取索引列表
+		indexes, err := h.catalog.GetAllIndexes(currentDB, showIndexesStmt.Table)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err), true
+		}
+
+		var sb strings.Builder
+		sb.WriteString("+----------------+----------------+----------------+----------------+\n")
+		sb.WriteString("| Index Name     | Table          | Columns        | Unique         |\n")
+		sb.WriteString("+----------------+----------------+----------------+----------------+\n")
+
+		if len(indexes) == 0 {
+			sb.WriteString("| (no indexes)                                                     |\n")
+		} else {
+			for _, idx := range indexes {
+				columnsStr := strings.Join(idx.Columns, ",")
+				uniqueStr := "NO"
+				if idx.IsUnique {
+					uniqueStr = "YES"
+				}
+				sb.WriteString(fmt.Sprintf("| %-14s | %-14s | %-14s | %-14s |\n",
+					idx.Name, idx.Table, columnsStr, uniqueStr))
+			}
+		}
+		sb.WriteString("+----------------+----------------+----------------+----------------+\n")
+		return sb.String(), true
+	}
+
 	// 处理EXPLAIN命令
 	if explainStmt, ok := ast.(*parser.ExplainStmt); ok {
 		// 优化被解释的查询

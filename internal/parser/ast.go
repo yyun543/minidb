@@ -23,11 +23,13 @@ const (
 	CreateDatabaseNode
 	CreateTableNode
 	CreateIndexNode
+	DropIndexNode
 	DropTableNode
 	DropDatabaseNode
 	UseNode
 	ShowDatabasesNode
 	ShowTablesNode
+	ShowIndexesNode
 	ExplainNode
 	ErrorNode
 
@@ -233,6 +235,19 @@ type CreateIndexStmt struct {
 	Table    string   // 表名
 	Columns  []string // 索引列
 	IsUnique bool     // 是否唯一索引
+}
+
+// DropIndexStmt DROP INDEX语句节点
+type DropIndexStmt struct {
+	BaseNode
+	Name  string // 索引名
+	Table string // 表名
+}
+
+// ShowIndexesStmt SHOW INDEXES语句节点
+type ShowIndexesStmt struct {
+	BaseNode
+	Table string // 表名
 }
 
 // BinaryExpr 二元表达式节点
