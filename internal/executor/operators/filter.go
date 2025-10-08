@@ -33,26 +33,30 @@ func (op *Filter) Init(ctx interface{}) error {
 
 // Next 获取下一批数据
 func (op *Filter) Next() (*types.Batch, error) {
-	// 获取子算子数据
-	batch, err := op.child.Next()
-	if err != nil {
-		return nil, err
-	}
-	if batch == nil {
-		return nil, nil
-	}
+	// 循环直到找到匹配的行或所有数据处理完
+	for {
+		// 获取子算子数据
+		batch, err := op.child.Next()
+		if err != nil {
+			return nil, err
+		}
+		if batch == nil {
+			return nil, nil
+		}
 
-	// 应用过滤条件
-	filteredRecord, err := op.applyFilter(batch.Record())
-	if err != nil {
-		return nil, err
-	}
+		// 应用过滤条件
+		filteredRecord, err := op.applyFilter(batch.Record())
+		if err != nil {
+			return nil, err
+		}
 
-	if filteredRecord == nil || filteredRecord.NumRows() == 0 {
-		return nil, nil
-	}
+		// 如果过滤结果为空，继续处理下一个 batch
+		if filteredRecord == nil || filteredRecord.NumRows() == 0 {
+			continue
+		}
 
-	return types.NewBatch(filteredRecord), nil
+		return types.NewBatch(filteredRecord), nil
+	}
 }
 
 // Close 关闭算子

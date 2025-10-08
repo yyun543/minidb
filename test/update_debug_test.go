@@ -16,17 +16,18 @@ import (
 // 这是一个failing test，用来重现并修复UPDATE问题
 func TestUpdateDataPersistence(t *testing.T) {
 	// 创建独立的存储引擎，避免干扰其他测试
-	engine, err := storage.NewMemTable("test_update_debug.wal")
+	storageEngine, err := storage.NewParquetEngine("./test_data/test_update_debug")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
 	// 创建catalog和session
-	cat := catalog.NewCatalog(engine)
-	err = cat.LegacyInit()
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
 	if err != nil {
-		cat = catalog.CreateTemporaryCatalog(engine)
+		t.Fatalf("Failed to initialize catalog: %v", err)
 	}
 
 	sessMgr, err := session.NewSessionManager()
@@ -116,13 +117,18 @@ func TestUpdateDataPersistence(t *testing.T) {
 // TestUpdateDataPersistenceMinimal 最简化的UPDATE测试，仅测试单一字段更新
 func TestUpdateDataPersistenceMinimal(t *testing.T) {
 	// 使用不同的文件名避免冲突
-	engine, err := storage.NewMemTable("test_update_minimal.wal")
+	storageEngine, err := storage.NewParquetEngine("./test_data/test_update_minimal.wal")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()

@@ -366,7 +366,7 @@ valueList
  ;
 
 tableName
- : identifier
+ : identifier (DOT identifier)?
  ;
 
 identifier

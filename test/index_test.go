@@ -15,15 +15,20 @@ import (
 
 // TestIndexOperations tests comprehensive index DDL and DQL operations
 func TestIndexOperations(t *testing.T) {
-	// Setup test environment
-	storageEngine, err := storage.NewMemTable("test_index.wal")
+	// Setup test environment - v2.0 Parquet
+	storageEngine, err := storage.NewParquetEngine("./test_data/index_test")
 	require.NoError(t, err)
 	defer storageEngine.Close()
 
 	err = storageEngine.Open()
 	require.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(storageEngine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	exec := executor.NewExecutor(cat)
 	opt := optimizer.NewOptimizer()
 
@@ -273,14 +278,20 @@ func TestIndexParser(t *testing.T) {
 
 // TestIndexCatalogIntegration tests index metadata management in catalog
 func TestIndexCatalogIntegration(t *testing.T) {
-	storageEngine, err := storage.NewMemTable("test_index_catalog.wal")
+	// v2.0 Parquet engine
+	storageEngine, err := storage.NewParquetEngine("./test_data/index_catalog_test")
 	require.NoError(t, err)
 	defer storageEngine.Close()
 
 	err = storageEngine.Open()
 	require.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(storageEngine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 
 	t.Run("CreateAndGetIndex", func(t *testing.T) {
 		// First create a table

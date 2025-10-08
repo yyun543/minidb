@@ -1,6 +1,8 @@
 package operators
 
 import (
+	"context"
+
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/catalog"
@@ -8,7 +10,8 @@ import (
 	"github.com/yyun543/minidb/internal/types"
 )
 
-// TableScan 表扫描算子
+// TableScan 表扫描算子 (v2.0)
+// 使用 StorageEngine.Scan() 而非 key-based Get()
 type TableScan struct {
 	database    string
 	table       string
@@ -31,7 +34,7 @@ func NewTableScan(database, table string, catalog *catalog.Catalog) *TableScan {
 	}
 }
 
-// Init 初始化算子
+// Init 初始化算子 (v2.0)
 func (op *TableScan) Init(ctx interface{}) error {
 	// 获取表结构
 	table, err := op.catalog.GetTable(op.database, op.table)
@@ -42,8 +45,8 @@ func (op *TableScan) Init(ctx interface{}) error {
 	// 使用表的 Schema
 	op.schema = table.Schema
 
-	// 直接从存储引擎读取数据
-	if ctxType := ctx; ctxType != nil {
+	// 从存储引擎读取数据 (v2.0: 使用 Scan)
+	if ctx != nil {
 		batches, err := op.getTableDataFromStorage()
 		if err != nil {
 			return err
@@ -73,36 +76,35 @@ func (op *TableScan) Close() error {
 	return nil
 }
 
-// getTableDataFromStorage 从存储引擎获取表数据
+// getTableDataFromStorage 从存储引擎获取表数据 (v2.0)
 func (op *TableScan) getTableDataFromStorage() ([]*types.Batch, error) {
-	// 获取表元数据
-	tableMeta, err := op.catalog.GetTable(op.database, op.table)
+	// 获取存储引擎
+	storageEngine := op.catalog.GetStorageEngine()
+	if storageEngine == nil {
+		// 如果没有存储引擎，返回空结果（用于系统表等特殊情况）
+		return []*types.Batch{}, nil
+	}
+
+	// 使用 StorageEngine.Scan() 扫描表数据
+	ctx := context.Background()
+	iter, err := storageEngine.Scan(ctx, op.database, op.table, []storage.Filter{})
 	if err != nil {
 		return nil, err
 	}
+	defer iter.Close()
 
-	// 创建KeyManager
-	keyManager := storage.NewKeyManager()
-	engine := op.catalog.GetEngine()
-
-	// 获取所有数据块
+	// 收集所有批次
 	var batches []*types.Batch
-	maxChunks := tableMeta.ChunkCount
-	if maxChunks == 0 {
-		maxChunks = 1
-	}
-
-	for i := int64(0); i < maxChunks; i++ {
-		key := keyManager.TableChunkKey(op.database, op.table, i)
-		record, err := engine.Get(key)
-		if err != nil {
-			return nil, err
-		}
-
-		if record != nil && record.NumRows() > 0 {
+	for iter.Next() {
+		record := iter.Record()
+		if record.NumRows() > 0 {
 			batch := types.NewBatch(record)
 			batches = append(batches, batch)
 		}
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, err
 	}
 
 	return batches, nil

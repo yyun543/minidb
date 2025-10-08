@@ -13,18 +13,19 @@ import (
 )
 
 func TestGroupByFunctionality(t *testing.T) {
-	// 创建存储引擎和测试环境
-	engine, err := storage.NewMemTable("group_by_test.wal")
+	// 创建 v2.0 Parquet 存储引擎
+	storageEngine, err := storage.NewParquetEngine("./test_data/group_by_test")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
 	// 创建catalog和session
-	cat := catalog.NewCatalog(engine)
-	err = cat.LegacyInit()
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
 	if err != nil {
-		cat = catalog.CreateTemporaryCatalog(engine)
+		t.Fatalf("Failed to initialize catalog: %v", err)
 	}
 
 	sessMgr, err := session.NewSessionManager()

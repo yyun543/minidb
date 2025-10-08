@@ -1399,16 +1399,26 @@ func (v *MiniQLVisitorImpl) VisitValueList(ctx *ValueListContext) interface{} {
 	return values
 }
 
-// VisitTableName 访问表名节点
+// VisitTableName 访问表名节点，支持 database.table 格式
 func (v *MiniQLVisitorImpl) VisitTableName(ctx *TableNameContext) interface{} {
 	if ctx == nil {
 		return nil
 	}
-	// 直接访问标识符节点并返回其文本值
-	if id := ctx.Identifier(); id != nil {
-		return v.Visit(id)
+	// 获取所有标识符（可能是 [table] 或 [database, table]）
+	identifiers := ctx.AllIdentifier()
+	if len(identifiers) == 0 {
+		return nil
 	}
-	return nil
+
+	if len(identifiers) == 1 {
+		// 单个标识符：table
+		return v.Visit(identifiers[0])
+	}
+
+	// 两个标识符：database.table
+	database := v.Visit(identifiers[0]).(string)
+	table := v.Visit(identifiers[1]).(string)
+	return database + "." + table
 }
 
 // VisitIdentifier 访问标识符节点

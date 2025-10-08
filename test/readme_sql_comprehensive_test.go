@@ -39,15 +39,20 @@ func getArrayValue(arr arrow.Array, index int) string {
 // TestReadmeAllSQL 基于README.md中的所有SQL示例进行全面测试
 // 确保每条SQL都能正确运行并产生预期结果
 func TestReadmeAllSQL(t *testing.T) {
-	// 创建测试环境 - 使用时间戳确保唯一的WAL文件名
-	walFileName := fmt.Sprintf("readme_comprehensive_%d.wal", time.Now().UnixNano())
-	engine, err := storage.NewMemTable(walFileName)
+	// 创建 v2.0 Parquet 存储引擎 - 使用时间戳确保唯一目录
+	dataDir := fmt.Sprintf("./test_data/readme_comprehensive_%d", time.Now().UnixNano())
+	storageEngine, err := storage.NewParquetEngine(dataDir)
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()
@@ -324,17 +329,22 @@ func TestReadmeAllSQL(t *testing.T) {
 	// Verify server restart simulation (check persistence)
 	t.Log("Testing server restart simulation...")
 
-	// Close the first engine before opening the second to avoid WAL conflicts
-	engine.Close()
+	// Close the first engine before opening the second
+	storageEngine.Close()
 
-	// 创建新的引擎实例来模拟重启 - 使用相同的WAL文件名
-	engine2, err := storage.NewMemTable(walFileName)
+	// 创建新的引擎实例来模拟重启 - 使用相同的数据目录
+	storageEngine2, err := storage.NewParquetEngine(dataDir)
 	assert.NoError(t, err)
-	defer engine2.Close()
-	err = engine2.Open()
+	defer storageEngine2.Close()
+	err = storageEngine2.Open()
 	assert.NoError(t, err)
 
-	cat2 := catalog.CreateTemporaryCatalog(engine2)
+	cat2 := catalog.NewCatalog()
+	cat2.SetStorageEngine(storageEngine2)
+	err = cat2.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog2: %v", err)
+	}
 	sess2 := sessMgr.CreateSession()
 	sess2.CurrentDB = "ecommerce"
 	exec2 := executor.NewExecutor(cat2)

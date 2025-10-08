@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/apache/arrow/go/v18/arrow"
@@ -12,24 +14,26 @@ import (
 	"github.com/yyun543/minidb/internal/types"
 )
 
-// DataManager 管理表数据的存储和查询
+// DataManager 管理表数据的存储和查询 (v2.0)
+// 使用新的 StorageEngine 接口，通过 database/table 访问而非 key
 type DataManager struct {
-	catalog    *catalog.Catalog
-	engine     storage.Engine
-	keyManager *storage.KeyManager
-	mu         sync.RWMutex
+	catalog       *catalog.Catalog
+	storageEngine storage.StorageEngine
+	mu            sync.RWMutex
 }
 
-// NewDataManager 创建新的数据管理器
+// NewDataManager 创建新的数据管理器 (v2.0)
 func NewDataManager(catalog *catalog.Catalog) *DataManager {
+	// Get the storage engine from catalog
+	storageEngine := catalog.GetStorageEngine()
+
 	return &DataManager{
-		catalog:    catalog,
-		engine:     catalog.GetEngine(),
-		keyManager: storage.NewKeyManager(),
+		catalog:       catalog,
+		storageEngine: storageEngine,
 	}
 }
 
-// InsertData 插入数据到表中
+// InsertData 插入数据到表中 (v2.0)
 func (dm *DataManager) InsertData(dbName, tableName string, columns []string, values []interface{}) error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
@@ -40,12 +44,6 @@ func (dm *DataManager) InsertData(dbName, tableName string, columns []string, va
 		return fmt.Errorf("table not found: %w", err)
 	}
 
-	// 获取现有数据
-	chunks, err := dm.getTableChunks(dbName, tableName, tableMeta.ChunkCount)
-	if err != nil {
-		return err
-	}
-
 	// 创建新记录
 	newRecord, err := dm.createRecord(tableMeta.Schema, columns, values)
 	if err != nil {
@@ -53,72 +51,51 @@ func (dm *DataManager) InsertData(dbName, tableName string, columns []string, va
 	}
 	defer newRecord.Release()
 
-	// 如果有现有数据，合并记录
-	var finalRecord arrow.Record
-	if len(chunks) > 0 && chunks[0] != nil {
-		finalRecord, err = dm.mergeRecords(chunks[0].Record(), newRecord)
-		if err != nil {
-			return err
-		}
-		defer finalRecord.Release()
-	} else {
-		newRecord.Retain()
-		finalRecord = newRecord
-	}
-
-	// 创建Chunk并存储
-	chunk := types.NewChunk(finalRecord, 0, int64(finalRecord.NumRows()))
-	defer chunk.Release()
-
-	key := dm.keyManager.TableChunkKey(dbName, tableName, 0)
-	record := chunk.Record()
-	err = dm.engine.Put(key, &record)
+	// 使用 StorageEngine.Write 写入数据
+	ctx := context.Background()
+	err = dm.storageEngine.Write(ctx, dbName, tableName, newRecord)
 	if err != nil {
-		return err
-	}
-
-	// 更新表元数据中的ChunkCount（如果需要）
-	if tableMeta.ChunkCount == 0 {
-		// 更新catalog中的表信息
-		tableMeta.ChunkCount = 1
-		err := dm.catalog.UpdateTable(dbName, tableMeta)
-		if err != nil {
-			return fmt.Errorf("failed to update table metadata: %w", err)
-		}
+		return fmt.Errorf("failed to write data: %w", err)
 	}
 
 	return nil
 }
 
-// GetTableData 获取表的所有数据
+// GetTableData 获取表的所有数据 (v2.0)
 func (dm *DataManager) GetTableData(dbName, tableName string) ([]*types.Batch, error) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 
-	// 特殊处理系统表
+	// 特殊处理系统表：支持 "sys.table" 或直接 dbName="sys"
 	if dbName == "sys" {
 		return dm.getSystemTableData(tableName)
 	}
-
-	// 获取表元数据
-	tableMeta, err := dm.catalog.GetTable(dbName, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("table not found: %w", err)
+	// 兼容处理：如果tableName格式为 "sys.xxx"，解析并调用系统表处理
+	if strings.HasPrefix(tableName, "sys.") {
+		sysTable := strings.TrimPrefix(tableName, "sys.")
+		return dm.getSystemTableData(sysTable)
 	}
 
-	// 获取所有数据块
-	chunks, err := dm.getTableChunks(dbName, tableName, tableMeta.ChunkCount)
+	// 使用 StorageEngine.Scan 读取数据
+	ctx := context.Background()
+	iter, err := dm.storageEngine.Scan(ctx, dbName, tableName, []storage.Filter{})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to scan table: %w", err)
 	}
+	defer iter.Close()
 
-	// 转换为Batch
+	// 收集所有批次
 	var batches []*types.Batch
-	for _, chunk := range chunks {
-		if chunk != nil && chunk.NumRows() > 0 {
-			batch := types.NewBatch(chunk.Record())
+	for iter.Next() {
+		record := iter.Record()
+		if record.NumRows() > 0 {
+			batch := types.NewBatch(record)
 			batches = append(batches, batch)
 		}
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("iterator error: %w", err)
 	}
 
 	return batches, nil
@@ -131,6 +108,14 @@ func (dm *DataManager) getSystemTableData(tableName string) ([]*types.Batch, err
 		return dm.getSchemataData()
 	case "table_catalog":
 		return dm.getTableCatalogData()
+	case "columns":
+		return dm.getColumnsData()
+	case "index_metadata":
+		return dm.getIndexMetadataData()
+	case "delta_log":
+		return dm.getDeltaLogData()
+	case "table_files":
+		return dm.getTableFilesData()
 	default:
 		return nil, fmt.Errorf("unknown system table: %s", tableName)
 	}
@@ -144,16 +129,14 @@ func (dm *DataManager) getSchemataData() ([]*types.Batch, error) {
 		return nil, err
 	}
 
-	// 确保系统数据库存在（防御性编程）
+	// 确保系统数据库存在
 	systemDbs := []string{"sys", "default"}
 	dbSet := make(map[string]bool)
 
-	// 将现有数据库加入集合
 	for _, db := range databases {
 		dbSet[db] = true
 	}
 
-	// 添加缺失的系统数据库
 	for _, sysDb := range systemDbs {
 		if !dbSet[sysDb] {
 			databases = append(databases, sysDb)
@@ -172,7 +155,6 @@ func (dm *DataManager) getSchemataData() ([]*types.Batch, error) {
 
 	nameBuilder := builder.Field(0).(*array.StringBuilder)
 
-	// 添加所有数据库名称
 	for _, dbName := range databases {
 		nameBuilder.Append(dbName)
 	}
@@ -180,7 +162,6 @@ func (dm *DataManager) getSchemataData() ([]*types.Batch, error) {
 	record := builder.NewRecord()
 	defer record.Release()
 
-	// 转换为Batch
 	batch := types.NewBatch(record)
 	return []*types.Batch{batch}, nil
 }
@@ -193,7 +174,6 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 		{Name: "table_name", Type: arrow.BinaryTypes.String},
 	}, nil)
 
-	// 创建Arrow记录
 	pool := memory.NewGoAllocator()
 	builder := array.NewRecordBuilder(pool, schema)
 	defer builder.Release()
@@ -201,13 +181,17 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 	schemaBuilder := builder.Field(0).(*array.StringBuilder)
 	nameBuilder := builder.Field(1).(*array.StringBuilder)
 
-	// 首先添加系统表（确保它们总是出现）
+	// 添加系统表
 	systemTables := []struct {
 		schema string
 		table  string
 	}{
 		{"sys", "schemata"},
 		{"sys", "table_catalog"},
+		{"sys", "columns"},
+		{"sys", "index_metadata"},
+		{"sys", "delta_log"},
+		{"sys", "table_files"},
 	}
 
 	for _, sysTable := range systemTables {
@@ -221,16 +205,12 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 		return nil, err
 	}
 
-	// 确保系统数据库存在（防御性编程）
+	// 确保系统数据库存在
 	systemDbs := []string{"sys", "default"}
 	dbSet := make(map[string]bool)
-
-	// 将现有数据库加入集合
 	for _, db := range databases {
 		dbSet[db] = true
 	}
-
-	// 添加缺失的系统数据库
 	for _, sysDb := range systemDbs {
 		if !dbSet[sysDb] {
 			databases = append(databases, sysDb)
@@ -241,13 +221,18 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 	for _, dbName := range databases {
 		tables, err := dm.catalog.GetAllTables(dbName)
 		if err != nil {
-			continue // 跳过获取失败的数据库
+			continue
 		}
 
-		// 跳过系统表（已经在上面添加过了）
+		// 系统表已经在上面添加过了，这里跳过
+		systemTableSet := map[string]bool{
+			"schemata": true, "table_catalog": true, "columns": true,
+			"index_metadata": true, "delta_log": true, "table_files": true,
+		}
+
 		for _, tableName := range tables {
-			if dbName == "sys" && (tableName == "schemata" || tableName == "table_catalog") {
-				continue // 跳过已添加的系统表
+			if dbName == "sys" && systemTableSet[tableName] {
+				continue
 			}
 			schemaBuilder.Append(dbName)
 			nameBuilder.Append(tableName)
@@ -257,114 +242,335 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 	record := builder.NewRecord()
 	defer record.Release()
 
-	// 转换为Batch
 	batch := types.NewBatch(record)
 	return []*types.Batch{batch}, nil
 }
 
-// UpdateData 更新表中的数据
-func (dm *DataManager) UpdateData(dbName, tableName string, assignments map[string]interface{}, whereCondition func(arrow.Record, int) bool) error {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
+// getColumnsData 获取columns系统表数据（所有表的列信息）
+func (dm *DataManager) getColumnsData() ([]*types.Batch, error) {
+	// 创建columns表的schema
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+		{Name: "column_name", Type: arrow.BinaryTypes.String},
+		{Name: "ordinal_position", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "data_type", Type: arrow.BinaryTypes.String},
+		{Name: "is_nullable", Type: arrow.BinaryTypes.String},
+	}, nil)
 
-	// 获取表元数据
-	tableMeta, err := dm.catalog.GetTable(dbName, tableName)
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	schemaBuilder := builder.Field(0).(*array.StringBuilder)
+	tableBuilder := builder.Field(1).(*array.StringBuilder)
+	columnBuilder := builder.Field(2).(*array.StringBuilder)
+	positionBuilder := builder.Field(3).(*array.Int64Builder)
+	typeBuilder := builder.Field(4).(*array.StringBuilder)
+	nullableBuilder := builder.Field(5).(*array.StringBuilder)
+
+	// 获取所有数据库
+	databases, err := dm.catalog.GetAllDatabases()
 	if err != nil {
-		return fmt.Errorf("table not found: %w", err)
+		return nil, err
 	}
 
-	// 获取现有数据
-	chunks, err := dm.getTableChunks(dbName, tableName, tableMeta.ChunkCount)
-	if err != nil {
-		return err
-	}
-
-	if len(chunks) == 0 || chunks[0] == nil {
-		return nil // 没有数据可更新
-	}
-
-	oldRecord := chunks[0].Record()
-	newRecord, err := dm.updateRecord(oldRecord, assignments, whereCondition)
-	if err != nil {
-		return err
-	}
-	defer newRecord.Release()
-
-	// 存储更新后的数据
-	chunk := types.NewChunk(newRecord, 0, int64(newRecord.NumRows()))
-	defer chunk.Release()
-
-	key := dm.keyManager.TableChunkKey(dbName, tableName, 0)
-	record := chunk.Record()
-	return dm.engine.Put(key, &record)
-}
-
-// DeleteData 删除表中的数据
-func (dm *DataManager) DeleteData(dbName, tableName string, whereCondition func(arrow.Record, int) bool) error {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
-
-	// 获取表元数据
-	tableMeta, err := dm.catalog.GetTable(dbName, tableName)
-	if err != nil {
-		return fmt.Errorf("table not found: %w", err)
-	}
-
-	// 获取现有数据
-	chunks, err := dm.getTableChunks(dbName, tableName, tableMeta.ChunkCount)
-	if err != nil {
-		return err
-	}
-
-	if len(chunks) == 0 || chunks[0] == nil {
-		return nil // 没有数据可删除
-	}
-
-	oldRecord := chunks[0].Record()
-	newRecord, err := dm.filterRecord(oldRecord, whereCondition)
-	if err != nil {
-		return err
-	}
-	defer newRecord.Release()
-
-	// 存储过滤后的数据
-	chunk := types.NewChunk(newRecord, 0, int64(newRecord.NumRows()))
-	defer chunk.Release()
-
-	key := dm.keyManager.TableChunkKey(dbName, tableName, 0)
-	record := chunk.Record()
-	return dm.engine.Put(key, &record)
-}
-
-// 获取表的所有数据块
-func (dm *DataManager) getTableChunks(dbName, tableName string, chunkCount int64) ([]*types.Chunk, error) {
-	var chunks []*types.Chunk
-
-	// 至少尝试读取第一个chunk
-	maxChunks := chunkCount
-	if maxChunks == 0 {
-		maxChunks = 1
-	}
-
-	for i := int64(0); i < maxChunks; i++ {
-		key := dm.keyManager.TableChunkKey(dbName, tableName, i)
-		record, err := dm.engine.Get(key)
+	// 为每个数据库获取表列表和列信息
+	for _, dbName := range databases {
+		tables, err := dm.catalog.GetAllTables(dbName)
 		if err != nil {
-			return nil, err
+			continue
 		}
 
-		if record != nil {
-			chunk := types.NewChunk(record, i, int64(record.NumRows()))
-			chunks = append(chunks, chunk)
-		} else {
-			chunks = append(chunks, nil)
+		for _, tableName := range tables {
+			tableMeta, err := dm.catalog.GetTable(dbName, tableName)
+			if err != nil {
+				continue
+			}
+
+			// 遍历表的列
+			for i, field := range tableMeta.Schema.Fields() {
+				schemaBuilder.Append(dbName)
+				tableBuilder.Append(tableName)
+				columnBuilder.Append(field.Name)
+				positionBuilder.Append(int64(i + 1))
+				typeBuilder.Append(field.Type.String())
+				if field.Nullable {
+					nullableBuilder.Append("YES")
+				} else {
+					nullableBuilder.Append("NO")
+				}
+			}
 		}
 	}
 
-	return chunks, nil
+	record := builder.NewRecord()
+	defer record.Release()
+
+	batch := types.NewBatch(record)
+	return []*types.Batch{batch}, nil
 }
 
-// 创建新记录
+// getIndexesData 获取indexes系统表数据（所有索引信息）
+func (dm *DataManager) getIndexMetadataData() ([]*types.Batch, error) {
+	// 创建indexes表的schema
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+		{Name: "index_name", Type: arrow.BinaryTypes.String},
+		{Name: "index_type", Type: arrow.BinaryTypes.String},
+		{Name: "column_name", Type: arrow.BinaryTypes.String},
+		{Name: "is_unique", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	schemaBuilder := builder.Field(0).(*array.StringBuilder)
+	tableBuilder := builder.Field(1).(*array.StringBuilder)
+	indexNameBuilder := builder.Field(2).(*array.StringBuilder)
+	indexTypeBuilder := builder.Field(3).(*array.StringBuilder)
+	columnBuilder := builder.Field(4).(*array.StringBuilder)
+	uniqueBuilder := builder.Field(5).(*array.StringBuilder)
+
+	// 获取所有数据库
+	databases, err := dm.catalog.GetAllDatabases()
+	if err != nil {
+		return nil, err
+	}
+
+	// 为每个数据库获取索引信息
+	for _, dbName := range databases {
+		tables, err := dm.catalog.GetAllTables(dbName)
+		if err != nil {
+			continue
+		}
+
+		for _, tableName := range tables {
+			indexes, err := dm.catalog.GetAllIndexes(dbName, tableName)
+			if err != nil {
+				continue
+			}
+
+			for _, indexInfo := range indexes {
+				// 每个索引可能有多个列
+				for _, columnName := range indexInfo.Columns {
+					schemaBuilder.Append(dbName)
+					tableBuilder.Append(indexInfo.Table)
+					indexNameBuilder.Append(indexInfo.Name)
+					indexTypeBuilder.Append(indexInfo.IndexType)
+					columnBuilder.Append(columnName)
+					if indexInfo.IsUnique {
+						uniqueBuilder.Append("YES")
+					} else {
+						uniqueBuilder.Append("NO")
+					}
+				}
+			}
+		}
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	batch := types.NewBatch(record)
+	return []*types.Batch{batch}, nil
+}
+
+// getDeltaLogData 获取delta_log系统表数据（Delta Log版本历史）
+func (dm *DataManager) getDeltaLogData() ([]*types.Batch, error) {
+	// 创建delta_log表的schema
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+		{Name: "version", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "operation", Type: arrow.BinaryTypes.String},
+		{Name: "file_path", Type: arrow.BinaryTypes.String},
+		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "file_size", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	schemaBuilder := builder.Field(0).(*array.StringBuilder)
+	tableBuilder := builder.Field(1).(*array.StringBuilder)
+	versionBuilder := builder.Field(2).(*array.Int64Builder)
+	operationBuilder := builder.Field(3).(*array.StringBuilder)
+	filePathBuilder := builder.Field(4).(*array.StringBuilder)
+	rowCountBuilder := builder.Field(5).(*array.Int64Builder)
+	fileSizeBuilder := builder.Field(6).(*array.Int64Builder)
+
+	// 从 Storage Engine 获取 Delta Log (使用类型断言访问 ParquetEngine)
+	if pe, ok := dm.storageEngine.(*storage.ParquetEngine); ok {
+		deltaLog := pe.GetDeltaLog()
+		if deltaLog != nil {
+			// 获取所有日志条目
+			entries := deltaLog.GetAllEntries()
+
+			// 填充数据
+			for _, entry := range entries {
+				// Parse table_id: "database.table"
+				parts := strings.Split(entry.TableID, ".")
+				var dbName, tableName string
+				if len(parts) == 2 {
+					dbName = parts[0]
+					tableName = parts[1]
+				} else {
+					dbName = "default"
+					tableName = entry.TableID
+				}
+
+				schemaBuilder.Append(dbName)
+				tableBuilder.Append(tableName)
+				versionBuilder.Append(entry.Version)
+				operationBuilder.Append(string(entry.Operation))
+				filePathBuilder.Append(entry.FilePath)
+				rowCountBuilder.Append(entry.RowCount)
+				fileSizeBuilder.Append(entry.FileSize)
+			}
+		}
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	batch := types.NewBatch(record)
+	return []*types.Batch{batch}, nil
+}
+
+// getTableFilesData 获取table_files系统表数据（表的物理文件信息）
+func (dm *DataManager) getTableFilesData() ([]*types.Batch, error) {
+	// 创建table_files表的schema
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+		{Name: "file_path", Type: arrow.BinaryTypes.String},
+		{Name: "file_size", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "status", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	schemaBuilder := builder.Field(0).(*array.StringBuilder)
+	tableBuilder := builder.Field(1).(*array.StringBuilder)
+	filePathBuilder := builder.Field(2).(*array.StringBuilder)
+	fileSizeBuilder := builder.Field(3).(*array.Int64Builder)
+	rowCountBuilder := builder.Field(4).(*array.Int64Builder)
+	statusBuilder := builder.Field(5).(*array.StringBuilder)
+
+	// 从 Storage Engine 获取 Delta Log (使用类型断言访问 ParquetEngine)
+	if pe, ok := dm.storageEngine.(*storage.ParquetEngine); ok {
+		deltaLog := pe.GetDeltaLog()
+		if deltaLog != nil {
+			// 获取所有表
+			tables := deltaLog.ListTables()
+
+			// 为每个表获取活跃文件
+			for _, tableID := range tables {
+				// Parse table_id: "database.table"
+				parts := strings.Split(tableID, ".")
+				var dbName, tableName string
+				if len(parts) == 2 {
+					dbName = parts[0]
+					tableName = parts[1]
+				} else {
+					dbName = "default"
+					tableName = tableID
+				}
+
+				// 获取最新快照以获取活跃文件
+				snapshot, err := deltaLog.GetSnapshot(tableID, -1)
+				if err != nil {
+					continue
+				}
+
+				// 填充活跃文件信息
+				for _, file := range snapshot.Files {
+					schemaBuilder.Append(dbName)
+					tableBuilder.Append(tableName)
+					filePathBuilder.Append(file.Path)
+					fileSizeBuilder.Append(file.Size)
+					rowCountBuilder.Append(file.RowCount)
+					statusBuilder.Append("ACTIVE")
+				}
+			}
+		}
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	batch := types.NewBatch(record)
+	return []*types.Batch{batch}, nil
+}
+
+// UpdateData 更新表中的数据 (v2.0) - DEPRECATED
+// Use UpdateDataWithFilters instead
+func (dm *DataManager) UpdateData(dbName, tableName string, assignments map[string]interface{}, whereCondition func(arrow.Record, int) bool) error {
+	// Fallback to UpdateDataWithFilters with empty filters
+	return dm.UpdateDataWithFilters(dbName, tableName, assignments, []storage.Filter{})
+}
+
+// UpdateDataWithFilters 使用storage.Filter更新表中的数据 (v2.0)
+func (dm *DataManager) UpdateDataWithFilters(dbName, tableName string, assignments map[string]interface{}, filters []storage.Filter) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	// Get table metadata
+	_, err := dm.catalog.GetTable(dbName, tableName)
+	if err != nil {
+		return fmt.Errorf("table not found: %w", err)
+	}
+
+	// Use the storage engine's Update method (Copy-on-Write)
+	ctx := context.Background()
+	updatedCount, err := dm.storageEngine.Update(ctx, dbName, tableName, filters, assignments)
+	if err != nil {
+		return fmt.Errorf("failed to update table: %w", err)
+	}
+
+	_ = updatedCount // Successfully updated
+
+	return nil
+}
+
+// DeleteData 删除表中的数据 (v2.0) - DEPRECATED
+// Use DeleteDataWithFilters instead
+func (dm *DataManager) DeleteData(dbName, tableName string, whereCondition func(arrow.Record, int) bool) error {
+	// Fallback to DeleteDataWithFilters with empty filters
+	return dm.DeleteDataWithFilters(dbName, tableName, []storage.Filter{})
+}
+
+// DeleteDataWithFilters 使用storage.Filter删除表中的数据 (v2.0)
+func (dm *DataManager) DeleteDataWithFilters(dbName, tableName string, filters []storage.Filter) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	// Get table metadata
+	_, err := dm.catalog.GetTable(dbName, tableName)
+	if err != nil {
+		return fmt.Errorf("table not found: %w", err)
+	}
+
+	// Use the storage engine's Delete method (Delta Log integration)
+	ctx := context.Background()
+	deletedCount, err := dm.storageEngine.Delete(ctx, dbName, tableName, filters)
+	if err != nil {
+		return fmt.Errorf("failed to delete from table: %w", err)
+	}
+
+	_ = deletedCount // Successfully deleted
+
+	return nil
+}
+
+// createRecord 创建新记录
 func (dm *DataManager) createRecord(schema *arrow.Schema, columns []string, values []interface{}) (arrow.Record, error) {
 	pool := memory.NewGoAllocator()
 	builder := array.NewRecordBuilder(pool, schema)
@@ -376,15 +582,13 @@ func (dm *DataManager) createRecord(schema *arrow.Schema, columns []string, valu
 		fieldMap[field.Name] = i
 	}
 
-	// 为每个字段准备值（使用NULL作为默认值）
+	// 为每个字段准备值
 	fieldValues := make([]interface{}, len(schema.Fields()))
-
-	// 首先将所有字段设为NULL
 	for i := range fieldValues {
 		fieldValues[i] = nil
 	}
 
-	// 然后设置实际提供的值
+	// 设置实际提供的值
 	for i, column := range columns {
 		if fieldIdx, exists := fieldMap[column]; exists {
 			if i < len(values) {
@@ -405,44 +609,7 @@ func (dm *DataManager) createRecord(schema *arrow.Schema, columns []string, valu
 	return builder.NewRecord(), nil
 }
 
-// 合并两个记录
-func (dm *DataManager) mergeRecords(oldRecord, newRecord arrow.Record) (arrow.Record, error) {
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, oldRecord.Schema())
-	defer builder.Release()
-
-	// 复制旧数据
-	for colIdx := int64(0); colIdx < oldRecord.NumCols(); colIdx++ {
-		oldCol := oldRecord.Column(int(colIdx))
-		field := builder.Field(int(colIdx))
-
-		for rowIdx := int64(0); rowIdx < oldRecord.NumRows(); rowIdx++ {
-			value := dm.getValueFromArray(oldCol, int(rowIdx))
-			err := dm.appendValue(field, value)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	// 复制新数据
-	for colIdx := int64(0); colIdx < newRecord.NumCols(); colIdx++ {
-		newCol := newRecord.Column(int(colIdx))
-		field := builder.Field(int(colIdx))
-
-		for rowIdx := int64(0); rowIdx < newRecord.NumRows(); rowIdx++ {
-			value := dm.getValueFromArray(newCol, int(rowIdx))
-			err := dm.appendValue(field, value)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	return builder.NewRecord(), nil
-}
-
-// 更新记录
+// updateRecord 更新记录
 func (dm *DataManager) updateRecord(oldRecord arrow.Record, assignments map[string]interface{}, whereCondition func(arrow.Record, int) bool) (arrow.Record, error) {
 	pool := memory.NewGoAllocator()
 	builder := array.NewRecordBuilder(pool, oldRecord.Schema())
@@ -480,34 +647,7 @@ func (dm *DataManager) updateRecord(oldRecord arrow.Record, assignments map[stri
 	return builder.NewRecord(), nil
 }
 
-// 过滤记录
-func (dm *DataManager) filterRecord(oldRecord arrow.Record, whereCondition func(arrow.Record, int) bool) (arrow.Record, error) {
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, oldRecord.Schema())
-	defer builder.Release()
-
-	// 处理每一行
-	for rowIdx := int64(0); rowIdx < oldRecord.NumRows(); rowIdx++ {
-		shouldKeep := whereCondition == nil || !whereCondition(oldRecord, int(rowIdx))
-
-		if shouldKeep {
-			for colIdx := int64(0); colIdx < oldRecord.NumCols(); colIdx++ {
-				field := builder.Field(int(colIdx))
-				oldCol := oldRecord.Column(int(colIdx))
-				value := dm.getValueFromArray(oldCol, int(rowIdx))
-
-				err := dm.appendValue(field, value)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	return builder.NewRecord(), nil
-}
-
-// 从Array中获取值
+// getValueFromArray 从Array中获取值
 func (dm *DataManager) getValueFromArray(arr arrow.Array, index int) interface{} {
 	switch arr := arr.(type) {
 	case *array.Int64:
@@ -523,7 +663,7 @@ func (dm *DataManager) getValueFromArray(arr arrow.Array, index int) interface{}
 	}
 }
 
-// 向字段添加值
+// appendValue 向字段添加值
 func (dm *DataManager) appendValue(field array.Builder, value interface{}) error {
 	switch field := field.(type) {
 	case *array.Int64Builder:

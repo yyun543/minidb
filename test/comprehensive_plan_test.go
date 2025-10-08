@@ -15,13 +15,19 @@ import (
 
 // TestComprehensivePlanTypes 测试各种可能导致"Unknown plan type"的SQL语句
 func TestComprehensivePlanTypes(t *testing.T) {
-	engine, err := storage.NewMemTable("comprehensive_plan_test.wal")
+	// 创建 v2.0 Parquet 存储引擎
+	storageEngine, err := storage.NewParquetEngine("./test_data/comprehensive_plan_test")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()

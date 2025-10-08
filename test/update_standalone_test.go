@@ -15,13 +15,18 @@ import (
 // TestUpdateStandalone 独立的UPDATE测试，验证UPDATE修复是否有效
 func TestUpdateStandalone(t *testing.T) {
 	// 创建完全独立的测试环境
-	engine, err := storage.NewMemTable("update_standalone.wal")
+	storageEngine, err := storage.NewParquetEngine("./test_data/update_standalone.wal")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()
@@ -103,13 +108,18 @@ func TestUpdateStandalone(t *testing.T) {
 
 // TestUpdateMultipleColumns 测试多列UPDATE
 func TestUpdateMultipleColumns(t *testing.T) {
-	engine, err := storage.NewMemTable("update_multi.wal")
+	storageEngine, err := storage.NewParquetEngine("./test_data/update_multi.wal")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()

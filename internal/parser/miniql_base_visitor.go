@@ -1,6 +1,7 @@
 // Code generated from MiniQL.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
 package parser // MiniQL
+
 import "github.com/antlr4-go/antlr/v4"
 
 type BaseMiniQLVisitor struct {

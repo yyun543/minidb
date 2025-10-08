@@ -15,13 +15,18 @@ import (
 
 // TestUnknownPlanTypeIssue 测试导致"不支持的计划节点类型: Unknown"错误的查询
 func TestUnknownPlanTypeIssue(t *testing.T) {
-	engine, err := storage.NewMemTable("unknown_plan_test.wal")
+	storageEngine, err := storage.NewParquetEngine("./test_data/unknown_plan_test.wal")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()

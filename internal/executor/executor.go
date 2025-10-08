@@ -14,6 +14,7 @@ import (
 	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/session"
+	"github.com/yyun543/minidb/internal/storage"
 	"github.com/yyun543/minidb/internal/types"
 	"go.uber.org/zap"
 )
@@ -226,6 +227,28 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	return result, nil
 }
 
+// parseTableReference 解析表引用，支持 "database.table" 或 "table" 格式
+func (e *ExecutorImpl) parseTableReference(tableRef string, currentDB string) (string, string) {
+	parts := strings.Split(tableRef, ".")
+	if len(parts) == 2 {
+		// "database.table" 格式
+		logger.WithComponent("executor").Debug("Parsed qualified table reference",
+			zap.String("input", tableRef),
+			zap.String("database", parts[0]),
+			zap.String("table", parts[1]))
+		return parts[0], parts[1]
+	}
+	// "table" 格式，使用当前数据库
+	if currentDB == "" {
+		currentDB = "default"
+	}
+	logger.WithComponent("executor").Debug("Parsed unqualified table reference",
+		zap.String("input", tableRef),
+		zap.String("database", currentDB),
+		zap.String("table", tableRef))
+	return currentDB, tableRef
+}
+
 // buildOperator 根据计划节点构建算子
 func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operators.Operator, error) {
 	if plan == nil {
@@ -242,12 +265,14 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 
 	case optimizer.TableScanPlan:
 		props := plan.Properties.(*optimizer.TableScanProperties)
-		// 从上下文中获取当前数据库
-		currentDB := ctx.Session.CurrentDB
-		if currentDB == "" {
-			currentDB = "default"
-		}
-		return operators.NewTableScan(currentDB, props.Table, e.catalog), nil
+		// 解析表引用：支持 "database.table" 或 "table" 格式
+		dbName, tableName := e.parseTableReference(props.Table, ctx.Session.CurrentDB)
+		logger.WithComponent("executor").Info("Building TableScan operator",
+			zap.String("props.Table", props.Table),
+			zap.String("currentDB", ctx.Session.CurrentDB),
+			zap.String("resolved_db", dbName),
+			zap.String("resolved_table", tableName))
+		return operators.NewTableScan(dbName, tableName, e.catalog), nil
 
 	case optimizer.JoinPlan:
 		props := plan.Properties.(*optimizer.JoinProperties)
@@ -597,22 +622,17 @@ func (e *ExecutorImpl) executeUpdate(plan *optimizer.Plan, sess *session.Session
 		}
 	}
 
-	// 创建WHERE条件函数，支持动态条件评估
-	var whereCondition func(arrow.Record, int) bool
-	if props.Where != nil {
-		whereCondition = func(record arrow.Record, rowIdx int) bool {
-			return e.evaluateWhereCondition(record, rowIdx, props.Where)
-		}
-	}
+	// 将WHERE表达式转换为storage.Filter
+	filters := e.whereToFilters(props.Where)
 
-	// 使用 DataManager 更新数据
 	// 使用会话中的当前数据库
 	currentDB := sess.CurrentDB
 	if currentDB == "" {
 		currentDB = "default"
 	}
 
-	err := e.dataManager.UpdateData(currentDB, props.Table, assignments, whereCondition)
+	// 使用 DataManager 更新数据（传递filters而不是whereCondition）
+	err := e.dataManager.UpdateDataWithFilters(currentDB, props.Table, assignments, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -827,22 +847,17 @@ func (e *ExecutorImpl) evaluateInCondition(record arrow.Record, rowIdx int, expr
 func (e *ExecutorImpl) executeDelete(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.DeleteProperties)
 
-	// 创建WHERE条件函数，支持动态条件评估
-	var whereCondition func(arrow.Record, int) bool
-	if props.Where != nil {
-		whereCondition = func(record arrow.Record, rowIdx int) bool {
-			return e.evaluateWhereCondition(record, rowIdx, props.Where)
-		}
-	}
+	// 将WHERE表达式转换为storage.Filter
+	filters := e.whereToFilters(props.Where)
 
-	// 使用 DataManager 删除数据
 	// 使用会话中的当前数据库
 	currentDB := sess.CurrentDB
 	if currentDB == "" {
 		currentDB = "default"
 	}
 
-	err := e.dataManager.DeleteData(currentDB, props.Table, whereCondition)
+	// 使用 DataManager 删除数据（传递filters而不是whereCondition）
+	err := e.dataManager.DeleteDataWithFilters(currentDB, props.Table, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -888,72 +903,112 @@ func (e *ExecutorImpl) executeDropDatabase(plan *optimizer.Plan, sess *session.S
 
 // executeShow 执行SHOW命令
 func (e *ExecutorImpl) executeShow(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
-	props := plan.Properties.(*optimizer.ShowProperties)
+	// 使用类型断言判断是ShowProperties还是ShowIndexesProperties
+	switch props := plan.Properties.(type) {
+	case *optimizer.ShowProperties:
+		// 处理 SHOW DATABASES 和 SHOW TABLES
+		switch props.Type {
+		case "DATABASES":
+			databaseNames, err := e.catalog.GetAllDatabases()
+			if err != nil {
+				return nil, err
+			}
 
-	switch props.Type {
-	case "DATABASES":
-		databaseNames, err := e.catalog.GetAllDatabases()
-		if err != nil {
-			return nil, err
-		}
+			// 如果没有数据库，返回空结果集
+			if len(databaseNames) == 0 {
+				return &ResultSet{
+					Headers: []string{"Database"},
+					rows:    []*types.Batch{},
+					curRow:  -1,
+				}, nil
+			}
 
-		// 如果没有数据库，返回空结果集
-		if len(databaseNames) == 0 {
+			// 创建包含数据库名的结果集
+			batch, err := e.createDatabaseListBatch(databaseNames)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create database list batch: %w", err)
+			}
+
 			return &ResultSet{
 				Headers: []string{"Database"},
-				rows:    []*types.Batch{},
+				rows:    []*types.Batch{batch},
 				curRow:  -1,
 			}, nil
+
+		case "TABLES":
+			// 获取当前数据库名
+			currentDB := sess.CurrentDB
+			if currentDB == "" {
+				currentDB = "default"
+			}
+
+			// 从catalog获取表列表
+			tableNames, err := e.catalog.GetAllTables(currentDB)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get table list: %w", err)
+			}
+
+			// 如果没有表，返回空结果集但不出错
+			if len(tableNames) == 0 {
+				return &ResultSet{
+					Headers: []string{"Tables_in_" + currentDB},
+					rows:    []*types.Batch{},
+					curRow:  -1,
+				}, nil
+			}
+
+			// 创建包含表名的结果集
+			batch, err := e.createTableListBatch(tableNames, currentDB)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create table list batch: %w", err)
+			}
+
+			return &ResultSet{
+				Headers: []string{"Tables_in_" + currentDB},
+				rows:    []*types.Batch{batch},
+				curRow:  -1,
+			}, nil
+
+		default:
+			return nil, fmt.Errorf("unsupported SHOW type: %s", props.Type)
 		}
 
-		// 创建包含数据库名的结果集
-		batch, err := e.createDatabaseListBatch(databaseNames)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create database list batch: %w", err)
-		}
-
-		return &ResultSet{
-			Headers: []string{"Database"},
-			rows:    []*types.Batch{batch},
-			curRow:  -1,
-		}, nil
-
-	case "TABLES":
-		// 获取当前数据库名
+	case *optimizer.ShowIndexesProperties:
+		// 处理 SHOW INDEXES
 		currentDB := sess.CurrentDB
 		if currentDB == "" {
 			currentDB = "default"
 		}
 
-		// 从catalog获取表列表
-		tableNames, err := e.catalog.GetAllTables(currentDB)
+		// 从catalog获取索引列表
+		indexes, err := e.catalog.GetAllIndexes(currentDB, props.Table)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get table list: %w", err)
+			return nil, fmt.Errorf("failed to get indexes: %w", err)
 		}
 
-		// 如果没有表，返回空结果集但不出错
-		if len(tableNames) == 0 {
+		// 如果没有索引，返回空结果集
+		if len(indexes) == 0 {
 			return &ResultSet{
-				Headers: []string{"Tables_in_" + currentDB},
+				Headers: []string{"Table", "Index_name", "Column_name", "Is_unique"},
 				rows:    []*types.Batch{},
 				curRow:  -1,
 			}, nil
 		}
 
-		// 创建包含表名的结果集
-		batch, err := e.createTableListBatch(tableNames, currentDB)
+		// 创建包含索引信息的结果集
+		batch, err := e.createIndexListBatch(indexes, props.Table)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create table list batch: %w", err)
+			return nil, fmt.Errorf("failed to create index list batch: %w", err)
 		}
 
 		return &ResultSet{
-			Headers: []string{"Tables_in_" + currentDB},
+			Headers: []string{"Table", "Index_name", "Column_name", "Is_unique"},
 			rows:    []*types.Batch{batch},
 			curRow:  -1,
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("unsupported SHOW type: %s", props.Type)
+		return nil, fmt.Errorf("unsupported SHOW properties type: %T", props)
 	}
 }
 
@@ -1000,6 +1055,50 @@ func (e *ExecutorImpl) createDatabaseListBatch(databaseNames []string) (*types.B
 	stringBuilder := builder.Field(0).(*array.StringBuilder)
 	for _, dbName := range databaseNames {
 		stringBuilder.Append(dbName)
+	}
+
+	// 构建记录
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 创建批次
+	batch := types.NewBatch(record)
+	return batch, nil
+}
+
+// createIndexListBatch 创建包含索引信息的批次数据
+func (e *ExecutorImpl) createIndexListBatch(indexes []catalog.IndexMeta, tableName string) (*types.Batch, error) {
+	// 创建Arrow schema，包含四个字符串列
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "Table", Type: arrow.BinaryTypes.String},
+		{Name: "Index_name", Type: arrow.BinaryTypes.String},
+		{Name: "Column_name", Type: arrow.BinaryTypes.String},
+		{Name: "Is_unique", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	// 创建Arrow记录
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	// 获取各列的builder
+	tableBuilder := builder.Field(0).(*array.StringBuilder)
+	indexNameBuilder := builder.Field(1).(*array.StringBuilder)
+	columnNameBuilder := builder.Field(2).(*array.StringBuilder)
+	isUniqueBuilder := builder.Field(3).(*array.StringBuilder)
+
+	// 填充索引数据
+	for _, index := range indexes {
+		for _, column := range index.Columns {
+			tableBuilder.Append(tableName)
+			indexNameBuilder.Append(index.Name)
+			columnNameBuilder.Append(column)
+			if index.IsUnique {
+				isUniqueBuilder.Append("YES")
+			} else {
+				isUniqueBuilder.Append("NO")
+			}
+		}
 	}
 
 	// 构建记录
@@ -1099,4 +1198,80 @@ func (e *ExecutorImpl) executeDropIndex(plan *optimizer.Plan, sess *session.Sess
 		rows:    []*types.Batch{},
 		curRow:  -1,
 	}, nil
+}
+
+// whereToFilters converts WHERE expression to storage.Filter slice
+func (e *ExecutorImpl) whereToFilters(whereExpr interface{}) []storage.Filter {
+	if whereExpr == nil {
+		logger.Debug("whereToFilters: no WHERE clause")
+		return []storage.Filter{}
+	}
+
+	var filters []storage.Filter
+
+	// Handle BinaryExpr (e.g., "name = 'John'" or "age > 25")
+	if binExpr, ok := whereExpr.(*parser.BinaryExpr); ok {
+		filter := e.binaryExprToFilter(binExpr)
+		if filter != nil {
+			filters = append(filters, *filter)
+			logger.Debug("whereToFilters: converted BinaryExpr to filter",
+				zap.String("column", filter.Column),
+				zap.String("operator", filter.Operator),
+				zap.Any("value", filter.Value))
+		} else {
+			logger.Warn("whereToFilters: failed to convert BinaryExpr to filter")
+		}
+	} else {
+		logger.Warn("whereToFilters: WHERE expression is not a BinaryExpr",
+			zap.String("type", fmt.Sprintf("%T", whereExpr)))
+	}
+
+	// Handle AND expressions (multiple filters)
+	// TODO: Add support for OR, NOT, and complex expressions
+
+	return filters
+}
+
+// binaryExprToFilter converts a binary expression to a storage.Filter
+func (e *ExecutorImpl) binaryExprToFilter(expr *parser.BinaryExpr) *storage.Filter {
+	// Left side should be a column reference
+	var column string
+	if colRef, ok := expr.Left.(*parser.ColumnRef); ok {
+		column = colRef.Column
+	} else {
+		logger.Warn("binaryExprToFilter: left side is not a column reference",
+			zap.String("type", fmt.Sprintf("%T", expr.Left)))
+		return nil // Cannot convert non-column reference
+	}
+
+	// Operator mapping
+	operator := expr.Operator
+
+	// Right side should be a literal value
+	var value interface{}
+	switch right := expr.Right.(type) {
+	case *parser.StringLiteral:
+		value = right.Value
+	case *parser.IntegerLiteral:
+		value = right.Value
+	case *parser.FloatLiteral:
+		value = right.Value
+	case *parser.BooleanLiteral:
+		value = right.Value
+	default:
+		logger.Warn("binaryExprToFilter: right side is not a literal",
+			zap.String("type", fmt.Sprintf("%T", expr.Right)))
+		return nil // Cannot convert non-literal value
+	}
+
+	logger.Debug("binaryExprToFilter: successfully converted",
+		zap.String("column", column),
+		zap.String("operator", operator),
+		zap.Any("value", value))
+
+	return &storage.Filter{
+		Column:   column,
+		Operator: operator,
+		Value:    value,
+	}
 }

@@ -18,7 +18,7 @@ import (
 )
 
 // Helper functions
-func getArrayValue(arr arrow.Array, index int) string {
+func getShowTablesArrayValue(arr arrow.Array, index int) string {
 	if arr.IsNull(index) {
 		return "NULL"
 	}
@@ -59,7 +59,7 @@ func formatBatch(batch *types.Batch, headers []string) string {
 				output.WriteString(", ")
 			}
 			array := record.Column(int(col))
-			output.WriteString(getArrayValue(array, int(row)))
+			output.WriteString(getShowTablesArrayValue(array, int(row)))
 		}
 		output.WriteString("] ")
 	}
@@ -68,13 +68,19 @@ func formatBatch(batch *types.Batch, headers []string) string {
 
 // TestShowTablesIssue 测试SHOW TABLES命令应该显示已创建的表
 func TestShowTablesIssue(t *testing.T) {
-	engine, err := storage.NewMemTable("show_tables_test.wal")
+	// 创建 v2.0 Parquet 存储引擎
+	storageEngine, err := storage.NewParquetEngine("./test_data/show_tables_test")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()

@@ -7,7 +7,6 @@ import (
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/catalog"
 	"github.com/yyun543/minidb/internal/executor"
 	"github.com/yyun543/minidb/internal/optimizer"
@@ -20,13 +19,13 @@ import (
 // CatalogSQLAdapter 为catalog提供SQL执行能力的适配器
 // 这个适配器直接操作系统表存储，避免循环依赖
 type CatalogSQLAdapter struct {
-	storageEngine storage.Engine
+	storageEngine storage.StorageEngine
 }
 
-// NewCatalogSQLAdapter 创建catalog SQL适配器
+// NewCatalogSQLAdapter 创建catalog SQL适配器 (v2.0)
 func NewCatalogSQLAdapter(cat *catalog.Catalog, exec *executor.BaseExecutor, vectorizedExec *executor.VectorizedExecutor) *CatalogSQLAdapter {
 	return &CatalogSQLAdapter{
-		storageEngine: cat.GetEngine(),
+		storageEngine: cat.GetStorageEngine(),
 	}
 }
 
@@ -83,52 +82,33 @@ func (adapter *CatalogSQLAdapter) handleInsertTableCatalog(sql string) (arrow.Re
 }
 
 // insertDatabaseRecord 向系统表插入数据库记录
+// v2.0: Database creation is handled by StorageEngine.CreateDatabase()
 func (adapter *CatalogSQLAdapter) insertDatabaseRecord(dbName string) (arrow.Record, error) {
-	// 创建arrow记录来表示数据库
-	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "schema_name", Type: arrow.BinaryTypes.String},
-	}, nil)
-
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
-
-	nameBuilder := builder.Field(0).(*array.StringBuilder)
-	nameBuilder.Append(dbName)
-
-	record := builder.NewRecord()
-	defer record.Release()
-
-	// 存储到系统表key
-	key := []byte("sys.schemata." + dbName)
-	err := adapter.storageEngine.Put(key, &record)
-	if err != nil {
-		return nil, fmt.Errorf("failed to store database record: %w", err)
-	}
-
-	return nil, nil // 成功执行
+	// In v2.0, database metadata is managed by Delta Log
+	// This is a stub for compatibility
+	return nil, nil
 }
 
-// QueryHandler 处理SQL查询请求
+// QueryHandler 处理SQL查询请求 (v2.0)
 type QueryHandler struct {
 	catalog                *catalog.Catalog
 	executor               *executor.BaseExecutor
 	vectorizedExecutor     *executor.VectorizedExecutor
 	sessionManager         *session.SessionManager
 	statisticsManager      *statistics.StatisticsManager
-	storageEngine          storage.Engine
+	storageEngine          storage.StorageEngine // v2.0: Using new StorageEngine interface
 	useVectorizedExecution bool
 }
 
-// NewQueryHandler 创建新的查询处理器
+// NewQueryHandler 创建新的查询处理器 (v2.0 with ParquetEngine)
 func NewQueryHandler() (*QueryHandler, error) {
-	// 1. 创建存储引擎
-	storageEngine, err := storage.NewMemTable("minidb.wal")
+	// 1. 创建 v2.0 Parquet 存储引擎
+	storageEngine, err := storage.NewParquetEngine("./minidb_data")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create storage engine: %v", err)
+		return nil, fmt.Errorf("Failed to create Parquet storage engine: %v", err)
 	}
 	if err := storageEngine.Open(); err != nil {
-		return nil, fmt.Errorf("Failed to open storage engine: %v", err)
+		return nil, fmt.Errorf("Failed to open Parquet storage engine: %v", err)
 	}
 
 	// 2. 创建会话管理器
@@ -137,8 +117,9 @@ func NewQueryHandler() (*QueryHandler, error) {
 		return nil, fmt.Errorf("Failure to create session manager: %v", err)
 	}
 
-	// 3. 创建catalog（暂时使用临时初始化）
-	cat := catalog.NewCatalog(storageEngine)
+	// 3. 创建 catalog (v2.0 - no engine parameter)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
 
 	// 4. 创建统计信息管理器
 	statsMgr := statistics.NewStatisticsManager()

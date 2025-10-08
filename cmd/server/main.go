@@ -54,12 +54,12 @@ func main() {
 	defer listener.Close()
 
 	logger.LogServerEvent("server_starting",
-		zap.String("version", "1.0 (MPP Optimized)"),
+		zap.String("version", "2.0 (Lakehouse architecture)"),
 		zap.String("address", address),
 		zap.Strings("features", []string{"Vectorized Execution", "Cost-based Optimization", "Statistics Collection"}))
 
 	fmt.Printf("=== MiniDB Server ===\n")
-	fmt.Printf("Version: 1.0 (MPP Optimized)\n")
+	fmt.Printf("Version: 2.0 (Lakehouse architecture)\n")
 	fmt.Printf("Listening on: %s\n", address)
 	fmt.Printf("Features: Vectorized Execution, Cost-based Optimization, Statistics Collection\n")
 	fmt.Printf("Ready for connections...\n\n")

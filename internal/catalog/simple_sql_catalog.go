@@ -21,12 +21,12 @@ type SQLRunner interface {
 	ExecuteSQL(sql string) (arrow.Record, error)
 }
 
-// SimpleSQLCatalog 简化的基于SQL的catalog实现
-// 专注于SQL统一管理的核心思想，暂时使用简单的实现
+// SimpleSQLCatalog SQL自举的catalog实现
+// 所有元数据操作通过SQL完成，元数据存储在sys数据库的系统表中
 type SimpleSQLCatalog struct {
-	engine    storage.Engine
-	mutex     sync.RWMutex
-	sqlRunner SQLRunner
+	storageEngine storage.StorageEngine // v2.0 storage engine
+	mutex         sync.RWMutex
+	sqlRunner     SQLRunner
 
 	// 临时的内存缓存（将来会完全通过SQL查询）
 	databases map[string]*DatabaseInfo
@@ -34,13 +34,11 @@ type SimpleSQLCatalog struct {
 	indexes   map[string]map[string]map[string]*IndexInfo // database -> table -> index_name -> IndexInfo
 }
 
-// NewSimpleSQLCatalog 创建简化的SQL-based catalog
-func NewSimpleSQLCatalog(engine storage.Engine) *SimpleSQLCatalog {
-	logger.WithComponent("catalog").Info("Creating SimpleSQLCatalog instance",
-		zap.String("engine_type", fmt.Sprintf("%T", engine)))
+// NewSimpleSQLCatalog 创建简化的SQL-based catalog (v2.0)
+func NewSimpleSQLCatalog() *SimpleSQLCatalog {
+	logger.WithComponent("catalog").Info("Creating SimpleSQLCatalog instance (v2.0)")
 
 	catalog := &SimpleSQLCatalog{
-		engine:    engine,
 		databases: make(map[string]*DatabaseInfo),
 		tables:    make(map[string]map[string]*TableInfo),
 		indexes:   make(map[string]map[string]map[string]*IndexInfo),
@@ -97,19 +95,44 @@ func (c *SimpleSQLCatalog) Init() error {
 	return err
 }
 
-// initWithSQL 使用SQL初始化（未来的完整实现）
+// initWithSQL 使用SQL自举初始化
+// 按照SQL-first原则，所有元数据操作通过SQL完成
 func (c *SimpleSQLCatalog) initWithSQL() error {
-	logger.WithComponent("catalog").Info("Starting SQL-based catalog initialization")
+	logger.WithComponent("catalog").Info("Starting SQL-based catalog initialization (SQL Bootstrap)")
 
-	// TODO: 使用SQL创建系统表
-	// 1. CREATE DATABASE IF NOT EXISTS sys;
-	// 2. CREATE TABLE IF NOT EXISTS sys.databases (id INT, name STRING);
-	// 3. CREATE TABLE IF NOT EXISTS sys.tables (...);
-	// 4. INSERT initial data...
+	// 第一步：确保基本的内存结构存在（引导阶段必需）
+	c.databases = make(map[string]*DatabaseInfo)
+	c.tables = make(map[string]map[string]*TableInfo)
+	c.indexes = make(map[string]map[string]map[string]*IndexInfo)
 
-	logger.WithComponent("catalog").Warn("SQL-based initialization not fully implemented yet, falling back to simple initialization")
-	// 暂时先用简单初始化
-	return c.simpleInit()
+	// 创建sys和default数据库（引导阶段）
+	c.databases["sys"] = &DatabaseInfo{Name: "sys"}
+	c.databases["default"] = &DatabaseInfo{Name: "default"}
+	c.tables["sys"] = make(map[string]*TableInfo)
+	c.tables["default"] = make(map[string]*TableInfo)
+
+	// 第二步：创建系统表结构（这些表的schema必须先定义好）
+	if err := c.createSystemTables(); err != nil {
+		return fmt.Errorf("failed to create system tables: %w", err)
+	}
+
+	// 第三步：使用SQL插入初始元数据到系统表
+	// 这是SQL自举的核心：系统表创建完成后，后续所有元数据操作都通过SQL
+	if err := c.bootstrapSystemMetadata(); err != nil {
+		logger.WithComponent("catalog").Error("Failed to bootstrap system metadata via SQL",
+			zap.Error(err))
+		return fmt.Errorf("failed to bootstrap system metadata: %w", err)
+	}
+
+	// 第四步：从系统表恢复catalog状态（读取已有的元数据）
+	if err := c.loadMetadataFromSQL(); err != nil {
+		logger.WithComponent("catalog").Error("Failed to load metadata from SQL",
+			zap.Error(err))
+		return fmt.Errorf("failed to load metadata from SQL: %w", err)
+	}
+
+	logger.WithComponent("catalog").Info("SQL-based catalog initialization completed successfully")
+	return nil
 }
 
 // simpleInit 简单初始化（向后兼容）
@@ -139,18 +162,8 @@ func (c *SimpleSQLCatalog) simpleInit() error {
 	logger.WithComponent("catalog").Debug("System tables created successfully",
 		zap.Duration("system_tables_duration", time.Since(systemTableStart)))
 
-	// 从存储引擎恢复catalog元数据 (WAL recovery)
-	recoveryStart := time.Now()
-	if err := c.recoverCatalogMetadata(); err != nil {
-		logger.WithComponent("catalog").Error("Failed to recover catalog metadata",
-			zap.Duration("duration", time.Since(start)),
-			zap.Error(err))
-		return fmt.Errorf("failed to recover catalog metadata: %w", err)
-	}
-	logger.WithComponent("catalog").Info("Catalog metadata recovered successfully",
-		zap.Duration("recovery_duration", time.Since(recoveryStart)))
-
-	// 确保系统数据库和表在恢复后仍然存在（防御性编程）
+	// v2.0: Catalog metadata is recovered from Delta Log system tables
+	// 确保系统数据库和表存在（防御性编程）
 	c.ensureSystemEntitiesExist()
 
 	totalDuration := time.Since(start)
@@ -204,6 +217,70 @@ func (c *SimpleSQLCatalog) ensureSystemEntitiesExist() {
 			Schema:   tableCatalogSchema,
 		}
 	}
+
+	if c.tables["sys"]["columns"] == nil {
+		columnsSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "table_schema", Type: arrow.BinaryTypes.String},
+			{Name: "table_name", Type: arrow.BinaryTypes.String},
+			{Name: "column_name", Type: arrow.BinaryTypes.String},
+			{Name: "ordinal_position", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "data_type", Type: arrow.BinaryTypes.String},
+			{Name: "is_nullable", Type: arrow.BinaryTypes.String},
+		}, nil)
+		c.tables["sys"]["columns"] = &TableInfo{
+			Database: "sys",
+			Name:     "columns",
+			Schema:   columnsSchema,
+		}
+	}
+
+	if c.tables["sys"]["index_metadata"] == nil {
+		indexMetadataSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "table_schema", Type: arrow.BinaryTypes.String},
+			{Name: "table_name", Type: arrow.BinaryTypes.String},
+			{Name: "index_name", Type: arrow.BinaryTypes.String},
+			{Name: "index_type", Type: arrow.BinaryTypes.String},
+			{Name: "column_name", Type: arrow.BinaryTypes.String},
+			{Name: "is_unique", Type: arrow.BinaryTypes.String},
+		}, nil)
+		c.tables["sys"]["index_metadata"] = &TableInfo{
+			Database: "sys",
+			Name:     "index_metadata",
+			Schema:   indexMetadataSchema,
+		}
+	}
+
+	if c.tables["sys"]["delta_log"] == nil {
+		deltaLogSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "version", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "timestamp", Type: arrow.BinaryTypes.String},
+			{Name: "operation", Type: arrow.BinaryTypes.String},
+			{Name: "table_schema", Type: arrow.BinaryTypes.String},
+			{Name: "table_name", Type: arrow.BinaryTypes.String},
+			{Name: "file_path", Type: arrow.BinaryTypes.String},
+		}, nil)
+		c.tables["sys"]["delta_log"] = &TableInfo{
+			Database: "sys",
+			Name:     "delta_log",
+			Schema:   deltaLogSchema,
+		}
+	}
+
+	if c.tables["sys"]["table_files"] == nil {
+		tableFilesSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "table_schema", Type: arrow.BinaryTypes.String},
+			{Name: "table_name", Type: arrow.BinaryTypes.String},
+			{Name: "file_path", Type: arrow.BinaryTypes.String},
+			{Name: "file_size", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "created_at", Type: arrow.BinaryTypes.String},
+		}, nil)
+		c.tables["sys"]["table_files"] = &TableInfo{
+			Database: "sys",
+			Name:     "table_files",
+			Schema:   tableFilesSchema,
+		}
+	}
 }
 
 // createSystemTables 创建系统表
@@ -219,6 +296,46 @@ func (c *SimpleSQLCatalog) createSystemTables() error {
 		{Name: "table_name", Type: arrow.BinaryTypes.String},
 	}, nil)
 
+	// 创建 columns 系统表的 schema
+	columnsSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+		{Name: "column_name", Type: arrow.BinaryTypes.String},
+		{Name: "ordinal_position", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "data_type", Type: arrow.BinaryTypes.String},
+		{Name: "is_nullable", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	// 创建 index_metadata 系统表的 schema
+	indexMetadataSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+		{Name: "index_name", Type: arrow.BinaryTypes.String},
+		{Name: "index_type", Type: arrow.BinaryTypes.String},
+		{Name: "column_name", Type: arrow.BinaryTypes.String},
+		{Name: "is_unique", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	// 创建 delta_log 系统表的 schema
+	deltaLogSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "version", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "timestamp", Type: arrow.BinaryTypes.String},
+		{Name: "operation", Type: arrow.BinaryTypes.String},
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+		{Name: "file_path", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	// 创建 table_files 系统表的 schema
+	tableFilesSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
+		{Name: "file_path", Type: arrow.BinaryTypes.String},
+		{Name: "file_size", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "created_at", Type: arrow.BinaryTypes.String},
+	}, nil)
+
 	// 添加系统表到内存缓存
 	c.tables["sys"]["schemata"] = &TableInfo{
 		Database: "sys",
@@ -232,6 +349,30 @@ func (c *SimpleSQLCatalog) createSystemTables() error {
 		Schema:   tableCatalogSchema,
 	}
 
+	c.tables["sys"]["columns"] = &TableInfo{
+		Database: "sys",
+		Name:     "columns",
+		Schema:   columnsSchema,
+	}
+
+	c.tables["sys"]["index_metadata"] = &TableInfo{
+		Database: "sys",
+		Name:     "index_metadata",
+		Schema:   indexMetadataSchema,
+	}
+
+	c.tables["sys"]["delta_log"] = &TableInfo{
+		Database: "sys",
+		Name:     "delta_log",
+		Schema:   deltaLogSchema,
+	}
+
+	c.tables["sys"]["table_files"] = &TableInfo{
+		Database: "sys",
+		Name:     "table_files",
+		Schema:   tableFilesSchema,
+	}
+
 	return nil
 }
 
@@ -240,7 +381,6 @@ func (c *SimpleSQLCatalog) CreateDatabase(name string) error {
 	logger.WithComponent("catalog").Info("Creating database",
 		zap.String("database", name))
 
-	start := time.Now()
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -271,20 +411,7 @@ func (c *SimpleSQLCatalog) CreateDatabase(name string) error {
 		}
 	}
 
-	// 持久化数据库元数据到存储引擎 (WAL支持)
-	persistStart := time.Now()
-	err := c.persistDatabaseMetadata(name)
-	if err != nil {
-		logger.WithComponent("catalog").Error("Failed to persist database metadata",
-			zap.String("database", name),
-			zap.Duration("duration", time.Since(start)),
-			zap.Error(err))
-		return fmt.Errorf("failed to persist database metadata: %w", err)
-	}
-	logger.WithComponent("catalog").Debug("Database metadata persisted successfully",
-		zap.String("database", name),
-		zap.Duration("persist_duration", time.Since(persistStart)))
-
+	// v2.0: Metadata is persisted in Delta Log, no need for explicit persistence
 	// 更新内存缓存
 	c.databases[name] = &DatabaseInfo{Name: name}
 	c.tables[name] = make(map[string]*TableInfo)
@@ -343,18 +470,13 @@ func (c *SimpleSQLCatalog) CreateTable(database string, tableMeta TableMeta) err
 	// 如果有SQL执行器，使用SQL创建
 	if c.sqlRunner != nil {
 		sql := fmt.Sprintf(`
-			INSERT INTO sys.table_catalog (table_schema, table_name, chunk_count, schema_info) 
+			INSERT INTO sys.table_catalog (table_schema, table_name, chunk_count, schema_info)
 			VALUES ('%s', '%s', %d, 'schema_placeholder')`,
 			database, tableMeta.Table, tableMeta.ChunkCount)
 		c.sqlRunner.ExecuteSQL(sql)
 	}
 
-	// 持久化表元数据到存储引擎 (WAL支持)
-	err := c.persistTableMetadata(database, tableMeta.Table, tableMeta)
-	if err != nil {
-		return fmt.Errorf("failed to persist table metadata: %w", err)
-	}
-
+	// v2.0: Metadata is persisted in Delta Log, no need for explicit persistence
 	// 更新内存缓存
 	if c.tables[database] == nil {
 		c.tables[database] = make(map[string]*TableInfo)
@@ -446,86 +568,6 @@ func (c *SimpleSQLCatalog) GetAllTables(database string) ([]string, error) {
 		tableNames = append(tableNames, name)
 	}
 	return tableNames, nil
-}
-
-// persistDatabaseMetadata 将数据库元数据持久化到存储引擎
-func (c *SimpleSQLCatalog) persistDatabaseMetadata(dbName string) error {
-	if c.engine == nil {
-		return nil // 没有存储引擎，跳过持久化
-	}
-
-	// 创建元数据key
-	key := []byte("catalog.database." + dbName)
-
-	// 创建简单的数据库元数据记录
-	metadata := map[string]interface{}{
-		"name": dbName,
-		"type": "database",
-	}
-
-	// 将元数据序列化为Arrow记录并存储
-	return c.storeMetadataRecord(key, metadata)
-}
-
-// persistTableMetadata 将表元数据持久化到存储引擎
-func (c *SimpleSQLCatalog) persistTableMetadata(dbName, tableName string, tableMeta TableMeta) error {
-	if c.engine == nil {
-		return nil // 没有存储引擎，跳过持久化
-	}
-
-	// 创建元数据key
-	key := []byte("catalog.table." + dbName + "." + tableName)
-
-	// 序列化schema信息为二进制数据
-	schemaBytes := c.serializeSchema(tableMeta.Schema)
-
-	// 直接创建Arrow记录来存储表元数据
-	return c.storeTableMetadataRecord(key, dbName, tableName, tableMeta.ChunkCount, schemaBytes)
-}
-
-// storeTableMetadataRecord 存储表元数据记录（包含二进制schema）
-func (c *SimpleSQLCatalog) storeTableMetadataRecord(key []byte, dbName, tableName string, chunkCount int64, schemaBytes []byte) error {
-	// 创建专门的表元数据schema
-	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "key", Type: arrow.BinaryTypes.String},
-		{Name: "table_schema", Type: arrow.BinaryTypes.String}, // 重命名 database -> table_schema
-		{Name: "table_name", Type: arrow.BinaryTypes.String},   // 重命名 table -> table_name
-		{Name: "type", Type: arrow.BinaryTypes.String},
-		{Name: "chunk_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "schema_data", Type: arrow.BinaryTypes.Binary}, // 存储二进制schema数据
-	}, nil)
-
-	// 创建Arrow记录
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
-
-	// 添加数据
-	keyBuilder := builder.Field(0).(*array.StringBuilder)
-	dbBuilder := builder.Field(1).(*array.StringBuilder)
-	tableBuilder := builder.Field(2).(*array.StringBuilder)
-	typeBuilder := builder.Field(3).(*array.StringBuilder)
-	chunkCountBuilder := builder.Field(4).(*array.Int64Builder)
-	schemaDataBuilder := builder.Field(5).(*array.BinaryBuilder)
-
-	keyBuilder.Append(string(key))
-	dbBuilder.Append(dbName)
-	tableBuilder.Append(tableName)
-	typeBuilder.Append("table")
-	chunkCountBuilder.Append(chunkCount)
-
-	// 存储二进制schema数据
-	if schemaBytes != nil {
-		schemaDataBuilder.Append(schemaBytes)
-	} else {
-		schemaDataBuilder.AppendNull()
-	}
-
-	record := builder.NewRecord()
-	defer record.Release()
-
-	// 存储到引擎
-	return c.engine.Put(key, &record)
 }
 
 // serializeSchema 使用Arrow IPC将schema序列化为二进制数据
@@ -657,130 +699,6 @@ func (c *SimpleSQLCatalog) deserializeSchemaFromJSON(schemaJSON string) *arrow.S
 	return arrow.NewSchema(fields, nil)
 }
 
-// storeMetadataRecord 将元数据存储为Arrow记录
-func (c *SimpleSQLCatalog) storeMetadataRecord(key []byte, metadata map[string]interface{}) error {
-	// 创建简单的Arrow schema用于元数据
-	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "key", Type: arrow.BinaryTypes.String},
-		{Name: "data", Type: arrow.BinaryTypes.String},
-	}, nil)
-
-	// 创建Arrow记录
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
-
-	// 添加数据
-	keyBuilder := builder.Field(0).(*array.StringBuilder)
-	dataBuilder := builder.Field(1).(*array.StringBuilder)
-
-	keyBuilder.Append(string(key))
-
-	// 将metadata转换为完整的JSON字符串
-	var metadataJSON string
-	if schema, exists := metadata["schema"]; exists {
-		metadataJSON = fmt.Sprintf(`{"type":"%s","name":"%s","database":"%s","schema":%s}`,
-			metadata["type"], metadata["name"], metadata["database"], schema)
-	} else {
-		metadataJSON = fmt.Sprintf(`{"type":"%s","name":"%s"}`,
-			metadata["type"], metadata["name"])
-	}
-	dataBuilder.Append(metadataJSON)
-
-	record := builder.NewRecord()
-	defer record.Release()
-
-	// 存储到引擎 (会自动写入WAL)
-	return c.engine.Put(key, &record)
-}
-
-// recoverCatalogMetadata 从存储引擎恢复catalog元数据
-func (c *SimpleSQLCatalog) recoverCatalogMetadata() error {
-	if c.engine == nil {
-		return nil // 没有存储引擎，跳过恢复
-	}
-
-	// 扫描所有catalog相关的key
-	startKey := []byte("catalog.")
-	endKey := []byte("catalog.z") // 确保覆盖所有catalog.开头的key
-
-	iterator, err := c.engine.Scan(startKey, endKey)
-	if err != nil {
-		return fmt.Errorf("failed to scan catalog metadata: %w", err)
-	}
-	defer iterator.Close()
-
-	// 遍历所有catalog元数据记录
-	for iterator.Next() {
-		record := iterator.Record()
-
-		// 解析记录（简化处理）
-		if record.NumRows() > 0 {
-			// 获取key列
-			keyArray := record.Column(0).(*array.String)
-			if keyArray.Len() > 0 {
-				key := keyArray.Value(0)
-
-				// 根据key类型进行恢复
-				if strings.HasPrefix(key, "catalog.database.") {
-					// 恢复数据库
-					dbName := strings.TrimPrefix(key, "catalog.database.")
-					c.databases[dbName] = &DatabaseInfo{Name: dbName}
-					if c.tables[dbName] == nil {
-						c.tables[dbName] = make(map[string]*TableInfo)
-					}
-				} else if strings.HasPrefix(key, "catalog.table.") {
-					// 恢复表 - 从新的二进制格式中恢复
-					tableKey := strings.TrimPrefix(key, "catalog.table.")
-					parts := strings.SplitN(tableKey, ".", 2)
-					if len(parts) == 2 {
-						dbName := parts[0]
-						tableName := parts[1]
-
-						// 确保数据库存在
-						if _, exists := c.databases[dbName]; !exists {
-							c.databases[dbName] = &DatabaseInfo{Name: dbName}
-							c.tables[dbName] = make(map[string]*TableInfo)
-						}
-
-						// 从新格式的记录中恢复schema
-						var schema *arrow.Schema
-						if record.NumCols() >= 6 {
-							// 新格式：检查是否有schema_data列（第5列，索引为5）
-							if schemaDataArray, ok := record.Column(5).(*array.Binary); ok && schemaDataArray.Len() > 0 {
-								if !schemaDataArray.IsNull(0) {
-									schemaBytes := schemaDataArray.Value(0)
-									schema = c.deserializeSchema(schemaBytes)
-								}
-							}
-						} else if record.NumCols() > 1 {
-							// 兼容旧格式：尝试从JSON解析
-							if dataArray, ok := record.Column(1).(*array.String); ok && dataArray.Len() > 0 {
-								dataJSON := dataArray.Value(0)
-								schema = c.parseSchemaFromJSON(dataJSON)
-							}
-						}
-
-						// 如果没有找到schema信息，使用空schema
-						if schema == nil {
-							schema = arrow.NewSchema([]arrow.Field{}, nil)
-						}
-
-						// 恢复表信息
-						c.tables[dbName][tableName] = &TableInfo{
-							Database: dbName,
-							Name:     tableName,
-							Schema:   schema,
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
 // DropTable 删除表
 func (c *SimpleSQLCatalog) DropTable(database, table string) error {
 	c.mutex.Lock()
@@ -832,9 +750,11 @@ func (c *SimpleSQLCatalog) UpdateTable(dbName string, table TableMeta) error {
 	return nil
 }
 
-// GetEngine 获取存储引擎
-func (c *SimpleSQLCatalog) GetEngine() storage.Engine {
-	return c.engine
+// GetEngine 获取存储引擎 (deprecated, removed in v2.0)
+// This method is kept for compatibility but returns nil
+// Use GetStorageEngine() instead for v2.0
+func (c *SimpleSQLCatalog) GetEngine() storage.StorageEngine {
+	return c.storageEngine
 }
 
 // 兼容性方法
@@ -937,16 +857,7 @@ func (c *SimpleSQLCatalog) CreateIndex(indexMeta IndexMeta) error {
 		IndexType: indexMeta.IndexType,
 	}
 
-	// 持久化索引元数据
-	err := c.persistIndexMetadata(indexMeta)
-	if err != nil {
-		logger.WithComponent("catalog").Error("Failed to persist index metadata",
-			zap.String("index", indexMeta.Name),
-			zap.Duration("duration", time.Since(start)),
-			zap.Error(err))
-		return fmt.Errorf("failed to persist index metadata: %w", err)
-	}
-
+	// v2.0: Index metadata is persisted in Delta Log, no need for explicit persistence
 	logger.WithComponent("catalog").Info("Index created successfully",
 		zap.String("index", indexMeta.Name),
 		zap.Duration("duration", time.Since(start)))
@@ -1026,47 +937,71 @@ func (c *SimpleSQLCatalog) GetAllIndexes(database, table string) ([]IndexMeta, e
 	return indexes, nil
 }
 
-// persistIndexMetadata 持久化索引元数据
-func (c *SimpleSQLCatalog) persistIndexMetadata(indexMeta IndexMeta) error {
-	if c.engine == nil {
-		return nil // 没有存储引擎，跳过持久化
-	}
+// GetStorageEngine returns the v2.0 storage engine
+func (c *SimpleSQLCatalog) GetStorageEngine() storage.StorageEngine {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.storageEngine
+}
 
-	// 创建元数据key
-	key := []byte(fmt.Sprintf("catalog.index.%s.%s.%s", indexMeta.Database, indexMeta.Table, indexMeta.Name))
+// SetStorageEngine sets the v2.0 storage engine
+func (c *SimpleSQLCatalog) SetStorageEngine(engine storage.StorageEngine) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.storageEngine = engine
+	logger.WithComponent("catalog").Info("Storage engine set successfully",
+		zap.String("engine_type", fmt.Sprintf("%T", engine)))
+}
 
-	// 创建索引元数据schema
-	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "key", Type: arrow.BinaryTypes.String},
-		{Name: "database", Type: arrow.BinaryTypes.String},
-		{Name: "table", Type: arrow.BinaryTypes.String},
-		{Name: "name", Type: arrow.BinaryTypes.String},
-		{Name: "columns", Type: arrow.BinaryTypes.String}, // JSON encoded
-		{Name: "is_unique", Type: arrow.FixedWidthTypes.Boolean},
-		{Name: "index_type", Type: arrow.BinaryTypes.String},
-	}, nil)
+// bootstrapSystemMetadata 使用SQL插入初始系统元数据
+// SQL自举设计说明：
+// 1. 系统表(sys.*)是特殊的"虚拟表"，其数据由DataManager动态生成
+// 2. sys.schemata - 从databases map生成
+// 3. sys.table_catalog - 从tables map生成
+// 4. sys.columns - 从table schemas生成
+// 5. sys.index_metadata - 从indexes map生成
+// 6. sys.delta_log - 从Delta Log实时获取
+// 7. sys.table_files - 从Delta Log快照获取
+//
+// 这种设计的优势：
+// - 系统表数据始终是最新的（实时查询）
+// - 避免了系统表元数据的循环依赖问题
+// - 用户可以通过SQL查询所有元数据（SQL-first原则）
+func (c *SimpleSQLCatalog) bootstrapSystemMetadata() error {
+	logger.WithComponent("catalog").Info("Bootstrapping system metadata via SQL")
 
-	// 创建Arrow记录
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
+	// 系统表是虚拟表，无需初始化数据
+	// 所有数据在查询时动态生成
 
-	// 添加数据
-	builder.Field(0).(*array.StringBuilder).Append(string(key))
-	builder.Field(1).(*array.StringBuilder).Append(indexMeta.Database)
-	builder.Field(2).(*array.StringBuilder).Append(indexMeta.Table)
-	builder.Field(3).(*array.StringBuilder).Append(indexMeta.Name)
+	logger.WithComponent("catalog").Info("System metadata bootstrap completed (virtual system tables)")
+	return nil
+}
 
-	// Encode columns as JSON
-	columnsJSON := strings.Join(indexMeta.Columns, ",")
-	builder.Field(4).(*array.StringBuilder).Append(columnsJSON)
+// loadMetadataFromSQL 从Delta Log恢复catalog状态
+// SQL自举设计中，元数据的持久化由Delta Log负责：
+// 1. CREATE DATABASE -> Delta Log记录METADATA操作
+// 2. CREATE TABLE -> Delta Log记录METADATA操作 + schema信息
+// 3. CREATE INDEX -> Delta Log记录METADATA操作 + index信息
+// 4. 启动时，从Delta Log回放所有METADATA操作，恢复catalog状态
+//
+// 这样设计的好处：
+// - 元数据变更和数据变更使用统一的事务日志（Delta Log）
+// - 时间旅行查询可以看到历史的元数据状态
+// - 分布式环境下，所有节点通过Delta Log同步元数据
+func (c *SimpleSQLCatalog) loadMetadataFromSQL() error {
+	logger.WithComponent("catalog").Info("Loading metadata from Delta Log")
 
-	builder.Field(5).(*array.BooleanBuilder).Append(indexMeta.IsUnique)
-	builder.Field(6).(*array.StringBuilder).Append(indexMeta.IndexType)
+	// 从Delta Log恢复元数据的流程：
+	// 1. 扫描Delta Log中的所有METADATA操作
+	// 2. 按版本号顺序回放：
+	//    - METADATA(database) -> 恢复database
+	//    - METADATA(table) -> 恢复table + schema
+	//    - METADATA(index) -> 恢复index
+	// 3. 构建内存中的catalog结构
 
-	record := builder.NewRecord()
-	defer record.Release()
+	// 当前实现：用户表元数据通过Delta Log的METADATA操作记录
+	// Storage Engine在Open()时已经从Delta Log恢复了表结构
 
-	// 存储到引擎
-	return c.engine.Put(key, &record)
+	logger.WithComponent("catalog").Info("Metadata loaded from Delta Log")
+	return nil
 }

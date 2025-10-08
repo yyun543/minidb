@@ -15,13 +15,18 @@ import (
 
 // TestShowTablesIntegration 测试SHOW TABLES在实际使用场景中的功能
 func TestShowTablesIntegration(t *testing.T) {
-	engine, err := storage.NewMemTable("show_tables_integration.wal")
+	storageEngine, err := storage.NewParquetEngine("./test_data/show_tables_integration.wal")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()

@@ -1,24 +1,33 @@
 
 # MiniDB
 
-MiniDB is a distributed MPP (Massively Parallel Processing) database system built in Go, designed for analytical workloads. Currently implemented as a single-node prototype with vectorized execution and cost-based optimization, it provides the foundation for future distributed parallel processing capabilities.
+MiniDB is a modern analytical database built in Go with Lakehouse architecture (v2.0). It combines Parquet-based columnar storage with Delta Lake transaction management, powered by Apache Arrow for vectorized query execution. The system uses cost-based optimization for intelligent query planning across dual execution engines.
 
-## Current Implementation
+## Current Implementation (v2.0 Lakehouse)
+
+### Lakehouse Storage Layer ✅
+
+- **Parquet Storage Engine**: Apache Arrow-based Parquet file format for columnar data storage
+- **Delta Lake Integration**: Transaction log with ACID properties, time-travel queries, and snapshot isolation
+- **Arrow IPC Serialization**: Efficient schema serialization using Arrow Inter-Process Communication format
+- **Multi-Record Merging**: Automatic concatenation of multiple Parquet record batches for efficient scanning
+- **Predicate Pushdown**: Filter pushdown to Parquet files for optimized data skipping
+- **Comprehensive Statistics**: Min/max values and null counts for all Arrow data types (INT8/16/32/64, FLOAT32/64, STRING, BOOLEAN, DATE, TIMESTAMP)
 
 ### Core Database Engine ✅
 
-- **In-Memory Storage**: MemTable-based storage with WAL persistence
-- **Multi-Client Support**: TCP server with session management  
-- **SQL Parser**: ANTLR4-based parser supporting DDL, DML, and query operations
-- **Type System**: Basic data types (INT, VARCHAR) with schema validation
+- **Multi-Client Support**: TCP server with session management and concurrent connection handling
+- **SQL Parser**: ANTLR4-based parser supporting DDL, DML, qualified table names (database.table), and analytical query operations
+- **SQL Self-Bootstrapping**: Virtual system tables in `sys` database for metadata queries (schemata, table_catalog, columns, index_metadata, delta_log, table_files)
+- **Type System**: Complete Arrow type system with automatic type conversions
 - **Enterprise Logging**: Structured logging with zap library, daily log rotation, and environment-aware configuration
 
 ### Query Processing ✅
 
-- **Dual Execution Engines**: Vectorized (Apache Arrow) and regular execution engines
-- **Cost-Based Optimization**: Statistics-driven query plan selection
-- **Basic Operations**: SELECT, INSERT, UPDATE, DELETE with WHERE clauses
-- **Aggregations**: GROUP BY with COUNT, SUM, AVG, MIN, MAX and HAVING clauses
+- **Dual Execution Engines**: Vectorized (Apache Arrow) and regular execution engines with automatic selection
+- **Cost-Based Optimization**: Statistics-driven query plan selection using table row counts and cardinalities
+- **Vectorized Operations**: Batch processing with Arrow for SELECT, GROUP BY, aggregations
+- **Aggregation Functions**: COUNT, SUM, AVG, MIN, MAX with GROUP BY and HAVING support
 
 ## MPP Architecture Goals 🚧
 
@@ -29,12 +38,13 @@ MiniDB is a distributed MPP (Massively Parallel Processing) database system buil
 - **Data Distribution**: Automatic data partitioning and distribution strategies
 - **Inter-Node Communication**: Efficient data transfer protocols between nodes
 
-### Lakehouse Integration (Planned)
+### Lakehouse Enhancements (Planned)
 
-- **Object Storage**: S3, GCS, Azure Blob storage connectors
-- **Multi-Format Support**: Parquet, ORC, Delta Lake, Iceberg readers
-- **Schema Evolution**: Dynamic schema changes without data migration
-- **Metadata Service**: Distributed catalog for transaction coordination
+- **Object Storage**: S3, GCS, Azure Blob storage connectors for cloud-native deployments
+- **Multi-Format Support**: ORC and Iceberg table format readers (Parquet and Delta Lake ✅)
+- **Schema Evolution**: ALTER TABLE support for column additions and type changes
+- **Z-Ordering**: Advanced data clustering for improved query performance
+- **Compaction**: Automatic file compaction and optimization for Delta tables
 
 ## Supported SQL Features ✅
 
@@ -44,6 +54,13 @@ MiniDB is a distributed MPP (Massively Parallel Processing) database system buil
 - **Queries**: `WHERE` clauses (=, >, <, >=, <=, AND, OR)
 - **Aggregation**: `GROUP BY`, `HAVING` with COUNT, SUM, AVG, MIN, MAX
 - **Indexes**: `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `SHOW INDEXES`
+- **System Tables**: SQL self-bootstrapping with virtual system tables in `sys` database
+  - `sys.schemata` - Database catalog
+  - `sys.table_catalog` - Table catalog
+  - `sys.columns` - Column metadata
+  - `sys.index_metadata` - Index information
+  - `sys.delta_log` - Delta Log transaction history
+  - `sys.table_files` - Active Parquet file list
 - **Utilities**: `USE database`, `SHOW TABLES/DATABASES/INDEXES`, `EXPLAIN`
 
 ### Limited Support ⚠️
@@ -58,13 +75,15 @@ MiniDB is a distributed MPP (Massively Parallel Processing) database system buil
 
 ## Architecture & Performance
 
-### Current Architecture ✅
+### Current Architecture (v2.0 Lakehouse) ✅
 
-1. **Single-Node Design**: TCP server with multi-client session support
-2. **Dual Execution Engines**: Vectorized (Arrow) and regular execution engines
-3. **Statistics Collection**: Background statistics for cost-based optimization  
-4. **Modular Design**: Clean separation of parser, optimizer, executor, storage layers
-5. **Enterprise Logging**: Comprehensive structured logging across all modules with performance monitoring
+1. **Lakehouse Storage**: Parquet + Delta Lake for ACID transactions and time-travel
+2. **Arrow-Native Processing**: Vectorized execution using Apache Arrow columnar format
+3. **Dual Execution Engines**: Cost-optimizer selects between vectorized and regular engines
+4. **Delta Transaction Log**: Version control with snapshot isolation and checkpoint management
+5. **Predicate Pushdown**: Filter evaluation at storage layer for data skipping
+6. **Statistics-Driven Optimization**: Min/max/null statistics for intelligent query planning
+7. **Enterprise Logging**: Comprehensive structured logging across all modules with performance monitoring
 
 ### MPP Design Principles 🎯
 
@@ -89,14 +108,17 @@ minidb/
 │       ├── main.go                # Server startup with CLI flags and signal handling
 │       └── handler.go             # Enhanced query handling with dual execution engines
 ├── internal/
-│   ├── catalog/                   # Metadata management
+│   ├── catalog/                   # Metadata management & SQL self-bootstrapping
 │   │   ├── catalog.go             # Database/table management with type system
-│   │   └── simple_sql_catalog.go  # SQL catalog implementation
+│   │   └── simple_sql_catalog.go  # SQL self-bootstrapping catalog (virtual system tables)
+│   ├── delta/                     # Delta Lake transaction log (v2.0)
+│   │   ├── log.go                 # Delta Log manager with Arrow IPC serialization
+│   │   └── types.go               # Delta Log entry types and operations
 │   ├── executor/                  # Dual execution engines
 │   │   ├── executor.go            # Regular execution engine
 │   │   ├── vectorized_executor.go # Apache Arrow vectorized execution engine
 │   │   ├── cost_optimizer.go      # Cost-based query optimization
-│   │   ├── data_manager.go        # Data access layer
+│   │   ├── data_manager.go        # Data access layer with system table support
 │   │   ├── context.go             # Execution context management
 │   │   ├── interface.go           # Executor interfaces
 │   │   └── operators/             # Execution operators
@@ -112,6 +134,8 @@ minidb/
 │   │   ├── logger.go              # Structured logging with zap
 │   │   ├── config.go              # Environment-aware configuration
 │   │   └── middleware.go          # Request/response logging middleware
+│   ├── objectstore/               # Object storage abstraction layer
+│   │   └── local.go               # Local filesystem storage implementation
 │   ├── optimizer/                 # Advanced query optimizer
 │   │   ├── optimizer.go           # Rule-based and cost-based optimization
 │   │   ├── plan.go                # Enhanced query plan representation
@@ -119,8 +143,11 @@ minidb/
 │   │   ├── predicate_push_down_rule.go   # Predicate pushdown optimization
 │   │   ├── projection_pruning_rule.go    # Projection pruning optimization
 │   │   └── join_reorder_rule.go   # Join reordering optimization
+│   ├── parquet/                   # Parquet storage layer (v2.0)
+│   │   ├── reader.go              # Parquet reader with predicate pushdown
+│   │   └── writer.go              # Parquet writer with comprehensive statistics
 │   ├── parser/                    # SQL parser with ANTLR4
-│   │   ├── MiniQL.g4              # Comprehensive ANTLR4 grammar
+│   │   ├── MiniQL.g4              # Comprehensive ANTLR4 grammar (supports qualified table names)
 │   │   ├── miniql_lexer.go        # ANTLR-generated lexer
 │   │   ├── miniql_parser.go       # ANTLR-generated parser
 │   │   ├── miniql_visitor.go      # ANTLR-generated visitor interface
@@ -131,13 +158,10 @@ minidb/
 │   │   └── session.go             # Session lifecycle and cleanup
 │   ├── statistics/                # Statistics collection system
 │   │   └── statistics.go          # Table and column statistics management
-│   ├── storage/                   # Advanced storage engine
-│   │   ├── memtable.go            # Enhanced in-memory table
-│   │   ├── distributed.go         # Distributed storage foundations
-│   │   ├── wal.go                 # Write-Ahead Logging
-│   │   ├── storage.go             # Storage engine interfaces
-│   │   ├── index.go               # Indexing support (BTree)
-│   │   └── key_manager.go         # Key management utilities
+│   ├── storage/                   # Lakehouse storage engine (v2.0)
+│   │   ├── parquet_engine.go      # Parquet-based storage engine with Delta Log
+│   │   ├── parquet_iterator.go    # Parquet record iterator implementation
+│   │   └── interface.go           # Storage engine interfaces
 │   ├── types/                     # Enhanced type system
 │   │   ├── schema.go              # Strong type system with Arrow integration
 │   │   ├── partition.go           # Partitioning strategies for distribution
@@ -145,21 +169,37 @@ minidb/
 │   │   └── types.go               # Data type definitions and conversions
 │   └── utils/                     # Utility functions
 │       └── utils.go               # Common utilities
+├── docs/                          # Project documentation
+│   └── architecture/              # Architecture documentation
+│       ├── README.md              # Architecture overview
+│       ├── QUICKSTART.md          # Quick start guide
+│       ├── minidb-v2-architecture.md        # V2.0 Lakehouse architecture
+│       ├── delta-log-sql-bootstrap.md       # Delta Log and SQL bootstrapping
+│       ├── sql-bootstrap-implementation.md  # SQL self-bootstrapping details
+│       ├── implementation-roadmap.md        # Implementation roadmap
+│       └── comparison-summary.md            # Architecture comparison
 ├── logs/                          # Log files directory
 │   └── minidb.log                 # Application logs with rotation
-├── proto/                         # Protocol buffer definitions
-│   └── minidb.proto               # gRPC service definitions (planned)
 └── test/                          # Comprehensive test suite
-    ├── framework/                 # Test automation framework
-    │   ├── integration/           # Integration test suites
-    │   ├── regression/            # Regression test suites
-    │   ├── unit/                  # Unit test suites
-    │   └── utils/                 # Test utilities and helpers
-    ├── catalog_test.go            # Catalog functionality tests
+    ├── arrow_ipc_test.go          # Arrow IPC serialization tests
+    ├── comprehensive_plan_test.go # Comprehensive plan execution tests
+    ├── delta_acid_test.go         # Delta Lake ACID transaction tests
     ├── executor_test.go           # Execution engine tests
+    ├── group_by_test.go           # GROUP BY and aggregation tests
+    ├── index_test.go              # Index operations tests
+    ├── insert_fix_test.go         # INSERT operation tests
     ├── optimizer_test.go          # Query optimization tests
+    ├── parquet_statistics_test.go # Parquet statistics tests
     ├── parser_test.go             # SQL parsing tests
-    └── storage_test.go            # Storage engine tests
+    ├── predicate_pushdown_test.go # Predicate pushdown tests
+    ├── readme_sql_comprehensive_test.go  # README SQL examples validation
+    ├── show_tables_test.go        # SHOW TABLES/DATABASES tests
+    ├── show_tables_integration_test.go   # SHOW TABLES integration tests
+    ├── time_travel_test.go        # Time-travel query tests
+    ├── unknown_plan_type_test.go  # Unknown plan type handling tests
+    ├── update_delete_test.go      # UPDATE/DELETE operation tests
+    ├── update_debug_test.go       # UPDATE debugging tests
+    └── update_standalone_test.go  # UPDATE standalone tests
 ```
 
 ## Current Performance Status
@@ -211,7 +251,7 @@ ENVIRONMENT=test ./minidb
 
 ```
 # Server startup
-2024-08-31T10:15:30.123Z INFO server/main.go:45 Starting MiniDB server {"version": "1.0", "port": 7205, "environment": "development"}
+2024-08-31T10:15:30.123Z INFO server/main.go:45 Starting MiniDB server {"version": "2.0", "port": 7205, "environment": "development"}
 
 # Query execution with timing
 2024-08-31T10:15:45.456Z INFO executor/executor.go:89 Query executed successfully {"sql": "SELECT * FROM users", "execution_time": "2.5ms", "rows_returned": 150}
@@ -259,9 +299,10 @@ go test ./test/... -v
 
 ```
 === MiniDB Server ===
-Version: 1.0 (MPP Prototype)
+Version: 2.0 (Lakehouse Architecture)
 Listening on: localhost:7205
-Features: Vectorized Execution, Cost-based Optimization, Statistics Collection, Enterprise Logging
+Storage: Parquet + Delta Lake with Arrow IPC serialization
+Features: Vectorized Execution, Predicate Pushdown, Cost-based Optimization, Enterprise Logging
 Logging: Structured logging enabled with daily rotation (logs/minidb.log)
 Ready for connections...
 ```
@@ -357,6 +398,40 @@ HAVING user_count > 0;
 SELECT * FROM users WHERE age >= 25 AND age <= 35;
 SELECT * FROM users WHERE name LIKE 'J%';
 SELECT * FROM orders WHERE amount IN (100, 250);
+```
+
+### System Tables & Metadata Queries ✅
+
+```sql
+-- Query all databases (SQL self-bootstrapping)
+SELECT * FROM sys.schemata;
+-- Returns: sys, default, ecommerce, ...
+
+-- Query all tables in the system
+SELECT * FROM sys.table_catalog;
+-- Returns: database_name, table_name for all tables
+
+-- View column metadata for specific tables
+SELECT column_name, data_type, is_nullable
+FROM sys.columns
+WHERE table_schema = 'ecommerce' AND table_name = 'users';
+
+-- Check index information
+SELECT index_name, column_name, is_unique, index_type
+FROM sys.index_metadata
+WHERE table_schema = 'ecommerce' AND table_name = 'users';
+
+-- View Delta Log transaction history
+SELECT version, operation, table_name, file_path, row_count
+FROM sys.delta_log
+WHERE table_schema = 'ecommerce'
+ORDER BY version DESC
+LIMIT 10;
+
+-- View active Parquet files for a table
+SELECT file_path, file_size, row_count, status
+FROM sys.table_files
+WHERE table_schema = 'ecommerce' AND table_name = 'orders';
 ```
 
 ### Query Optimization ✅
@@ -497,13 +572,17 @@ Goodbye!
 
 ## Development Status & Advantages
 
-### Current Prototype Benefits ✅
+### Current Lakehouse Benefits ✅
 
-1. **Vectorized Analytics**: Significant performance improvements for GROUP BY and aggregations
-2. **Cost-Based Optimization**: Intelligent query plan selection using table statistics  
-3. **Modular Architecture**: Clean separation enabling easy distributed expansion
-4. **Arrow Integration**: Industry-standard columnar processing for analytical workloads
-5. **Enterprise Logging**: Comprehensive structured logging with performance monitoring and error tracking
+1. **Lakehouse Architecture**: Combines data lake flexibility with data warehouse performance
+2. **ACID Transactions**: Delta Lake ensures consistency with snapshot isolation
+3. **Time Travel**: Query historical data using version numbers or timestamps
+4. **SQL Self-Bootstrapping**: Virtual system tables (`sys.*`) for metadata queries without circular dependencies
+5. **Vectorized Analytics**: 10-100x speedup for GROUP BY, aggregations using Apache Arrow
+6. **Predicate Pushdown**: Filter evaluation at storage layer reduces data read
+7. **Arrow IPC Serialization**: Efficient binary schema serialization with full type fidelity
+8. **Comprehensive Statistics**: Min/max/null tracking for all data types enables data skipping
+9. **Enterprise Logging**: Comprehensive structured logging with performance monitoring and error tracking
 
 ### MPP Architecture Advantages 🎯
 
@@ -572,4 +651,4 @@ This project is licensed under the GPL License - see the LICENSE file for detail
 
 ---
 
-**MiniDB v1.0** - MPP Database Prototype with Vectorized Execution and Distributed Architecture Foundations
+**MiniDB v2.0** - Lakehouse Architecture with Parquet + Delta Lake, Apache Arrow Vectorization, and Predicate Pushdown

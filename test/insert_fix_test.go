@@ -14,13 +14,18 @@ import (
 
 // TestInsertFix 测试INSERT修复是否解决了Arrow记录构建问题
 func TestInsertFix(t *testing.T) {
-	engine, err := storage.NewMemTable("insert_fix.wal")
+	storageEngine, err := storage.NewParquetEngine("./test_data/insert_fix")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	cat := catalog.CreateTemporaryCatalog(engine)
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
+	if err != nil {
+		t.Fatalf("Failed to initialize catalog: %v", err)
+	}
 	sessMgr, err := session.NewSessionManager()
 	assert.NoError(t, err)
 	sess := sessMgr.CreateSession()

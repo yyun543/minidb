@@ -6,7 +6,6 @@ import (
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/yyun543/minidb/internal/logger"
-	"github.com/yyun543/minidb/internal/storage"
 	"go.uber.org/zap"
 )
 
@@ -16,14 +15,15 @@ type Catalog struct {
 	*SimpleSQLCatalog
 }
 
-// NewCatalog 创建新的Catalog实例
+// NewCatalog 创建新的Catalog实例 (v2.0)
 // 注意：这个实例需要在有SQL执行器可用后才能完全初始化
-func NewCatalog(engine storage.Engine) *Catalog {
-	logger.WithComponent("catalog").Info("Creating new Catalog instance")
+// Storage engine should be set via SetStorageEngine() after creation
+func NewCatalog() *Catalog {
+	logger.WithComponent("catalog").Info("Creating new Catalog instance (v2.0)")
 
 	start := time.Now()
 	// 创建一个基础实例，稍后通过SetSQLRunner设置SQL执行器
-	simpleCatalog := NewSimpleSQLCatalog(engine)
+	simpleCatalog := NewSimpleSQLCatalog()
 
 	catalog := &Catalog{
 		SimpleSQLCatalog: simpleCatalog,
@@ -46,13 +46,14 @@ func (c *Catalog) SetSQLRunner(sqlRunner SQLRunner) {
 	logger.WithComponent("catalog").Info("SQL runner set successfully for catalog")
 }
 
-// InitWithSQLRunner 创建带有SQL执行器的catalog并初始化
-func InitWithSQLRunner(engine storage.Engine, sqlRunner SQLRunner) (*Catalog, error) {
-	logger.WithComponent("catalog").Info("Initializing catalog with SQL runner",
+// InitWithSQLRunner 创建带有SQL执行器的catalog并初始化 (v2.0)
+// Storage engine should be set via SetStorageEngine() after creation
+func InitWithSQLRunner(sqlRunner SQLRunner) (*Catalog, error) {
+	logger.WithComponent("catalog").Info("Initializing catalog with SQL runner (v2.0)",
 		zap.String("sql_runner_type", fmt.Sprintf("%T", sqlRunner)))
 
 	start := time.Now()
-	simpleCatalog := NewSimpleSQLCatalog(engine)
+	simpleCatalog := NewSimpleSQLCatalog()
 	simpleCatalog.SetSQLRunner(sqlRunner)
 
 	catalog := &Catalog{
@@ -189,12 +190,13 @@ func (n *NullSQLRunner) ExecuteSQL(sql string) (arrow.Record, error) {
 	return nil, fmt.Errorf("null SQL runner - no actual execution capability")
 }
 
-// CreateTemporaryCatalog 创建临时catalog（用于测试）
-func CreateTemporaryCatalog(engine storage.Engine) *Catalog {
-	logger.WithComponent("catalog").Info("Creating temporary catalog for testing")
+// CreateTemporaryCatalog 创建临时catalog（用于测试, v2.0）
+// Storage engine should be set separately via SetStorageEngine()
+func CreateTemporaryCatalog() *Catalog {
+	logger.WithComponent("catalog").Info("Creating temporary catalog for testing (v2.0)")
 
 	start := time.Now()
-	catalog := NewCatalog(engine)
+	catalog := NewCatalog()
 	catalog.SetSQLRunner(&NullSQLRunner{})
 
 	// 初始化catalog（包含WAL恢复）

@@ -13,19 +13,19 @@ import (
 )
 
 func TestExecutor(t *testing.T) {
-	// 创建存储引擎
-	engine, err := storage.NewMemTable("test_executor.wal")
+	// 创建 v2.0 Parquet 存储引擎
+	storageEngine, err := storage.NewParquetEngine("./test_data/executor_test")
 	assert.NoError(t, err)
-	defer engine.Close()
-	err = engine.Open()
+	defer storageEngine.Close()
+	err = storageEngine.Open()
 	assert.NoError(t, err)
 
 	// 创建目录和会话
-	cat := catalog.NewCatalog(engine)
-	err = cat.LegacyInit()
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+	err = cat.Init()
 	if err != nil {
-		// 如果传统初始化失败，使用临时catalog
-		cat = catalog.CreateTemporaryCatalog(engine)
+		t.Fatalf("Failed to initialize catalog: %v", err)
 	}
 
 	sessMgr, err := session.NewSessionManager()
@@ -144,8 +144,18 @@ func TestExecutor(t *testing.T) {
 
 	// 测试INSERT语句执行
 	t.Run("TestExecuteInsert", func(t *testing.T) {
+		// 确保表存在（如果不存在则创建）
+		createSQL := "CREATE TABLE users (id INTEGER, name VARCHAR(255))"
+		stmt, err := parser.Parse(createSQL)
+		if err == nil {
+			plan, err := opt.Optimize(stmt)
+			if err == nil {
+				exec.Execute(plan, sess) // 忽略错误，因为表可能已存在
+			}
+		}
+
 		sql := "INSERT INTO users (id, name) VALUES (2, 'test2')"
-		stmt, err := parser.Parse(sql)
+		stmt, err = parser.Parse(sql)
 		assert.NoError(t, err)
 		plan, err := opt.Optimize(stmt)
 		assert.NoError(t, err)
