@@ -750,13 +750,6 @@ func (c *SimpleSQLCatalog) UpdateTable(dbName string, table TableMeta) error {
 	return nil
 }
 
-// GetEngine 获取存储引擎 (deprecated, removed in v2.0)
-// This method is kept for compatibility but returns nil
-// Use GetStorageEngine() instead for v2.0
-func (c *SimpleSQLCatalog) GetEngine() storage.StorageEngine {
-	return c.storageEngine
-}
-
 // 兼容性方法
 func (c *SimpleSQLCatalog) GetDatabase(name string) (DatabaseMeta, error) {
 	c.mutex.RLock()

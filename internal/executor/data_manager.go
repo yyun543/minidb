@@ -510,13 +510,6 @@ func (dm *DataManager) getTableFilesData() ([]*types.Batch, error) {
 	return []*types.Batch{batch}, nil
 }
 
-// UpdateData 更新表中的数据 (v2.0) - DEPRECATED
-// Use UpdateDataWithFilters instead
-func (dm *DataManager) UpdateData(dbName, tableName string, assignments map[string]interface{}, whereCondition func(arrow.Record, int) bool) error {
-	// Fallback to UpdateDataWithFilters with empty filters
-	return dm.UpdateDataWithFilters(dbName, tableName, assignments, []storage.Filter{})
-}
-
 // UpdateDataWithFilters 使用storage.Filter更新表中的数据 (v2.0)
 func (dm *DataManager) UpdateDataWithFilters(dbName, tableName string, assignments map[string]interface{}, filters []storage.Filter) error {
 	dm.mu.Lock()
@@ -538,13 +531,6 @@ func (dm *DataManager) UpdateDataWithFilters(dbName, tableName string, assignmen
 	_ = updatedCount // Successfully updated
 
 	return nil
-}
-
-// DeleteData 删除表中的数据 (v2.0) - DEPRECATED
-// Use DeleteDataWithFilters instead
-func (dm *DataManager) DeleteData(dbName, tableName string, whereCondition func(arrow.Record, int) bool) error {
-	// Fallback to DeleteDataWithFilters with empty filters
-	return dm.DeleteDataWithFilters(dbName, tableName, []storage.Filter{})
 }
 
 // DeleteDataWithFilters 使用storage.Filter删除表中的数据 (v2.0)

@@ -310,7 +310,12 @@ func TestDeltaLogSnapshot(t *testing.T) {
 		_, err = exec.Execute(plan, sess)
 		assert.NoError(t, err)
 
-		// New read should show updated snapshot
+		// New read should show updated snapshot - use SELECT query
+		selectSQL = "SELECT * FROM events"
+		stmt, err = parser.Parse(selectSQL)
+		assert.NoError(t, err)
+		plan, err = opt.Optimize(stmt)
+		assert.NoError(t, err)
 		result2, err := exec.Execute(plan, sess)
 		assert.NoError(t, err)
 		assert.Greater(t, len(result2.Batches()), len(result1.Batches()),

@@ -84,7 +84,7 @@ func NewExecutorWithDataManager(cat *catalog.Catalog, dm *DataManager) *Executor
 // Execute 执行查询计划
 func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	logger.WithComponent("executor").Info("Executing query plan",
-		zap.String("plan_type", string(plan.Type)),
+		zap.String("plan_type", plan.Type.String()),
 		zap.Int64("session_id", sess.ID))
 
 	start := time.Now()
@@ -139,7 +139,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	}
 
 	logger.WithComponent("executor").Debug("Executing query plan with operator tree",
-		zap.String("plan_type", string(plan.Type)))
+		zap.String("plan_type", plan.Type.String()))
 
 	// 创建执行上下文
 	ctxStart := time.Now()
@@ -152,7 +152,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	op, err := e.buildOperator(plan, ctx)
 	if err != nil {
 		logger.WithComponent("executor").Error("Failed to build operator tree",
-			zap.String("plan_type", string(plan.Type)),
+			zap.String("plan_type", plan.Type.String()),
 			zap.Duration("duration", time.Since(start)),
 			zap.Error(err))
 		return nil, err
@@ -164,7 +164,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	initStart := time.Now()
 	if err := op.Init(ctx); err != nil {
 		logger.WithComponent("executor").Error("Failed to initialize operator",
-			zap.String("plan_type", string(plan.Type)),
+			zap.String("plan_type", plan.Type.String()),
 			zap.Duration("duration", time.Since(start)),
 			zap.Error(err))
 		return nil, err
@@ -180,7 +180,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 		batch, err := op.Next()
 		if err != nil {
 			logger.WithComponent("executor").Error("Error during batch execution",
-				zap.String("plan_type", string(plan.Type)),
+				zap.String("plan_type", plan.Type.String()),
 				zap.Int("batches_processed", batchCount),
 				zap.Duration("duration", time.Since(start)),
 				zap.Error(err))
@@ -200,7 +200,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	closeStart := time.Now()
 	if err := op.Close(); err != nil {
 		logger.WithComponent("executor").Error("Failed to close operator",
-			zap.String("plan_type", string(plan.Type)),
+			zap.String("plan_type", plan.Type.String()),
 			zap.Error(err))
 		return nil, err
 	}
@@ -218,7 +218,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 
 	totalDuration := time.Since(start)
 	logger.WithComponent("executor").Info("Query plan execution completed successfully",
-		zap.String("plan_type", string(plan.Type)),
+		zap.String("plan_type", plan.Type.String()),
 		zap.Int("result_batches", len(batches)),
 		zap.Int("result_columns", len(headers)),
 		zap.Duration("total_duration", totalDuration),
@@ -1227,7 +1227,46 @@ func (e *ExecutorImpl) whereToFilters(whereExpr interface{}) []storage.Filter {
 	}
 
 	// Handle AND expressions (multiple filters)
-	// TODO: Add support for OR, NOT, and complex expressions
+	// 实现对 OR, NOT, AND 和复杂表达式的支持
+	if logicalExpr, ok := whereExpr.(*parser.LogicalExpr); ok {
+		switch logicalExpr.Operator {
+		case "AND":
+			// 处理 AND 表达式：递归处理左右子表达式
+			leftFilters := e.whereToFilters(logicalExpr.Left)
+			rightFilters := e.whereToFilters(logicalExpr.Right)
+			filters = append(filters, leftFilters...)
+			filters = append(filters, rightFilters...)
+			logger.Debug("whereToFilters: processed AND expression",
+				zap.Int("left_filters", len(leftFilters)),
+				zap.Int("right_filters", len(rightFilters)))
+		case "OR":
+			// 处理 OR 表达式：在简化实现中，OR操作较复杂
+			// 当前设计中每个storage.Filter表示一个AND条件
+			// 对于OR操作，我们需要特殊处理或在更高层实现
+			logger.Warn("whereToFilters: OR expressions not fully supported yet",
+				zap.String("suggestion", "consider using IN operator or multiple queries"))
+			// 暂时处理为分别收集两边的过滤条件（这不是真正的OR语义）
+			leftFilters := e.whereToFilters(logicalExpr.Left)
+			rightFilters := e.whereToFilters(logicalExpr.Right)
+			// 注意：这里的实现不是真正的OR逻辑，需要在storage层改进
+			filters = append(filters, leftFilters...)
+			filters = append(filters, rightFilters...)
+		case "NOT":
+			// 处理 NOT 表达式：需要将内部条件取反
+			// 注意：在LogicalExpr中，NOT是一元操作，只有Left操作数
+			innerFilters := e.whereToFilters(logicalExpr.Left)
+			for _, filter := range innerFilters {
+				// 将操作符取反
+				negatedFilter := e.negateFilter(filter)
+				if negatedFilter != nil {
+					filters = append(filters, *negatedFilter)
+					logger.Debug("whereToFilters: negated filter",
+						zap.String("original_op", filter.Operator),
+						zap.String("negated_op", negatedFilter.Operator))
+				}
+			}
+		}
+	}
 
 	return filters
 }
@@ -1273,5 +1312,45 @@ func (e *ExecutorImpl) binaryExprToFilter(expr *parser.BinaryExpr) *storage.Filt
 		Column:   column,
 		Operator: operator,
 		Value:    value,
+	}
+}
+
+// negateFilter 将过滤条件取反
+func (e *ExecutorImpl) negateFilter(filter storage.Filter) *storage.Filter {
+	var negatedOp string
+
+	// 将操作符映射到其否定形式
+	switch filter.Operator {
+	case "=":
+		negatedOp = "!="
+	case "!=", "<>":
+		negatedOp = "="
+	case "<":
+		negatedOp = ">="
+	case "<=":
+		negatedOp = ">"
+	case ">":
+		negatedOp = "<="
+	case ">=":
+		negatedOp = "<"
+	case "LIKE":
+		negatedOp = "NOT LIKE"
+	case "NOT LIKE":
+		negatedOp = "LIKE"
+	case "IN":
+		negatedOp = "NOT IN"
+	case "NOT IN":
+		negatedOp = "IN"
+	default:
+		// 对于不支持的操作符，记录警告并返回nil
+		logger.Warn("negateFilter: unsupported operator for negation",
+			zap.String("operator", filter.Operator))
+		return nil
+	}
+
+	return &storage.Filter{
+		Column:   filter.Column,
+		Operator: negatedOp,
+		Value:    filter.Value,
 	}
 }

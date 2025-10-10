@@ -119,7 +119,7 @@ func (dl *DeltaLog) AppendMetadata(tableID string, schema *arrow.Schema) error {
 	version := dl.currentVer.Add(1)
 	timestamp := time.Now().UnixMilli()
 
-	schemaJSON, err := schemaToJSON(schema)
+	schemaJSON, err := SchemaToJSON(schema)
 	if err != nil {
 		return fmt.Errorf("failed to serialize schema: %w", err)
 	}
@@ -185,7 +185,7 @@ func (dl *DeltaLog) GetSnapshot(tableID string, version int64) (*Snapshot, error
 
 		case OpMetadata:
 			if entry.SchemaJSON != "" {
-				schema, err := schemaFromJSON(entry.SchemaJSON)
+				schema, err := SchemaFromJSON(entry.SchemaJSON)
 				if err == nil {
 					snapshot.Schema = schema
 				}
@@ -305,9 +305,9 @@ func (dl *DeltaLog) GetEntriesByTable(tableID string) []LogEntry {
 
 // Helper functions
 
-// schemaToJSON 使用 Arrow IPC 序列化 Schema
+// SchemaToJSON 使用 Arrow IPC 序列化 Schema
 // 将 Arrow Schema 序列化为 Base64 编码的 IPC 格式
-func schemaToJSON(schema *arrow.Schema) (string, error) {
+func SchemaToJSON(schema *arrow.Schema) (string, error) {
 	if schema == nil {
 		return "", fmt.Errorf("schema is nil")
 	}
@@ -331,9 +331,9 @@ func schemaToJSON(schema *arrow.Schema) (string, error) {
 	return encoded, nil
 }
 
-// schemaFromJSON 从 Base64 编码的 IPC 格式反序列化 Arrow Schema
+// SchemaFromJSON 从 Base64 编码的 IPC 格式反序列化 Arrow Schema
 // 使用 Arrow IPC Reader 完整还原 Schema
-func schemaFromJSON(encoded string) (*arrow.Schema, error) {
+func SchemaFromJSON(encoded string) (*arrow.Schema, error) {
 	if encoded == "" {
 		return nil, fmt.Errorf("encoded string is empty")
 	}

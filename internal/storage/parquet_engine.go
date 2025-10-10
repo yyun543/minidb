@@ -536,11 +536,11 @@ func (pe *ParquetEngine) Update(ctx context.Context, db, table string, filters [
 		// Add to Delta Log
 		parquetFile := &delta.ParquetFile{
 			Path:     filePath,
-			Size:     0, // TODO: get actual file size
+			Size:     stats.FileSize, // 使用从 parquet writer 返回的实际文件大小
 			RowCount: stats.RowCount,
 			Stats: &delta.FileStats{
 				RowCount:   stats.RowCount,
-				FileSize:   0,
+				FileSize:   stats.FileSize, // 使用实际文件大小
 				MinValues:  stats.MinValues,
 				MaxValues:  stats.MaxValues,
 				NullCounts: stats.NullCounts,
@@ -653,11 +653,11 @@ func (pe *ParquetEngine) Delete(ctx context.Context, db, table string, filters [
 		// Add to Delta Log
 		parquetFile := &delta.ParquetFile{
 			Path:     filePath,
-			Size:     0, // TODO: get actual file size
+			Size:     stats.FileSize, // 使用从 parquet writer 返回的实际文件大小
 			RowCount: stats.RowCount,
 			Stats: &delta.FileStats{
 				RowCount:   stats.RowCount,
-				FileSize:   0,
+				FileSize:   stats.FileSize, // 使用实际文件大小
 				MinValues:  stats.MinValues,
 				MaxValues:  stats.MaxValues,
 				NullCounts: stats.NullCounts,

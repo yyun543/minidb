@@ -412,26 +412,90 @@ func (csc *ColumnStatsCollector) calculateMCV() []MCV {
 		values = append(values, valueCount{value, count})
 	}
 
-	// 简单排序（找前10个最常见值）
-	// TODO: 使用更高效的排序算法
+	// heapifyDown maintains the min-heap property by moving the element at index down to its proper position
+	heapifyDown := func(heap []valueCount, index, size int) {
+		for {
+			smallest := index
+			left := 2*index + 1
+			right := 2*index + 2
+
+			// Find the smallest among current node and its children
+			if left < size && heap[left].count < heap[smallest].count {
+				smallest = left
+			}
+			if right < size && heap[right].count < heap[smallest].count {
+				smallest = right
+			}
+
+			// If current node is already the smallest, heap property is satisfied
+			if smallest == index {
+				break
+			}
+
+			// Swap and continue heapifying
+			heap[index], heap[smallest] = heap[smallest], heap[index]
+			index = smallest
+		}
+	}
+
+	// 使用堆排序算法找到前10个最常见值（更高效）
 	mcvs := make([]MCV, 0, 10)
 	totalCount := float64(csc.totalCount)
 
-	for i := 0; i < len(values) && i < 10; i++ {
-		maxIdx := i
-		for j := i + 1; j < len(values); j++ {
-			if values[j].count > values[maxIdx].count {
-				maxIdx = j
-			}
-		}
-		if maxIdx != i {
-			values[i], values[maxIdx] = values[maxIdx], values[i]
+	// 使用最小堆来维护top 10
+	if len(values) > 10 {
+		// 构建最小堆（堆顶是最小的count）
+		heap := make([]valueCount, 10)
+		copy(heap, values[:10])
+
+		// 建堆
+		for i := 9 / 2; i >= 0; i-- {
+			heapifyDown(heap, i, 10)
 		}
 
-		mcvs = append(mcvs, MCV{
-			Value:     values[i].value,
-			Frequency: float64(values[i].count) / totalCount,
-		})
+		// 处理剩余元素
+		for i := 10; i < len(values); i++ {
+			if values[i].count > heap[0].count {
+				heap[0] = values[i]
+				heapifyDown(heap, 0, 10)
+			}
+		}
+
+		// 提取结果并排序（从大到小）
+		for len(heap) > 0 {
+			// 找到堆中最大元素
+			maxIdx := 0
+			for j := 1; j < len(heap); j++ {
+				if heap[j].count > heap[maxIdx].count {
+					maxIdx = j
+				}
+			}
+
+			mcvs = append(mcvs, MCV{
+				Value:     heap[maxIdx].value,
+				Frequency: float64(heap[maxIdx].count) / totalCount,
+			})
+
+			// 移除最大元素
+			heap[maxIdx] = heap[len(heap)-1]
+			heap = heap[:len(heap)-1]
+		}
+	} else {
+		// 数量较少时直接排序
+		for i := 0; i < len(values); i++ {
+			for j := i + 1; j < len(values); j++ {
+				if values[j].count > values[i].count {
+					values[i], values[j] = values[j], values[i]
+				}
+			}
+		}
+
+		for i := 0; i < len(values) && i < 10; i++ {
+			mcvs = append(mcvs, MCV{
+				Value:     values[i].value,
+				Frequency: float64(values[i].count) / totalCount,
+			})
+		}
 	}
 
 	return mcvs

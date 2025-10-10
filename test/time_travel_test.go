@@ -160,10 +160,8 @@ func TestTimeTravelQueries(t *testing.T) {
 
 	t.Run("DeltaLogVersionTracking", func(t *testing.T) {
 		// Get direct access to Delta Log for version testing
-		parquetEngine := storageEngine.(*storage.ParquetEngine)
-		assert.NotNil(t, parquetEngine, "Should be ParquetEngine")
-
-		deltaLog := parquetEngine.GetDeltaLog()
+		// storageEngine is already *ParquetEngine, no type assertion needed
+		deltaLog := storageEngine.GetDeltaLog()
 		assert.NotNil(t, deltaLog, "Delta Log should be available")
 
 		// Check current version
@@ -202,10 +200,8 @@ func TestDeltaLogSnapshotRetrieval(t *testing.T) {
 	err = storageEngine.Open()
 	assert.NoError(t, err)
 
-	parquetEngine := storageEngine.(*storage.ParquetEngine)
-	assert.NotNil(t, parquetEngine)
-
-	deltaLog := parquetEngine.GetDeltaLog()
+	// storageEngine is already *ParquetEngine, no type assertion needed
+	deltaLog := storageEngine.GetDeltaLog()
 	assert.NotNil(t, deltaLog)
 
 	cat := catalog.NewCatalog()

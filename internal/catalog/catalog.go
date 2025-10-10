@@ -80,49 +80,6 @@ func InitWithSQLRunner(sqlRunner SQLRunner) (*Catalog, error) {
 //     return catalog, catalog.Init()
 // }
 
-// LegacyInit 传统初始化方法（用于向后兼容）
-// 当SQL执行器不可用时的临时初始化
-func (c *Catalog) LegacyInit() error {
-	logger.WithComponent("catalog").Warn("Using legacy initialization for catalog")
-
-	start := time.Now()
-	// 如果没有SQL执行器，使用最简单的系统表初始化
-	if c.sqlRunner == nil {
-		logger.WithComponent("catalog").Info("No SQL runner available, attempting direct system table initialization")
-		err := c.initSystemTablesDirectly()
-		if err != nil {
-			logger.WithComponent("catalog").Error("Legacy initialization failed",
-				zap.Duration("duration", time.Since(start)),
-				zap.Error(err))
-		}
-		return err
-	}
-
-	logger.WithComponent("catalog").Info("SQL runner available, using standard initialization")
-	err := c.Init()
-	if err != nil {
-		logger.WithComponent("catalog").Error("Standard initialization failed during legacy init",
-			zap.Duration("duration", time.Since(start)),
-			zap.Error(err))
-	} else {
-		logger.WithComponent("catalog").Info("Legacy initialization completed successfully",
-			zap.Duration("initialization_time", time.Since(start)))
-	}
-	return err
-}
-
-// initSystemTablesDirectly 直接初始化系统表（无SQL执行器时的备选方案）
-func (c *Catalog) initSystemTablesDirectly() error {
-	logger.WithComponent("catalog").Warn("Attempting direct system table initialization without SQL runner")
-
-	// 这里可以调用原来的系统表初始化代码
-	// 但是按照用户要求，我们应该尽量避免这种代码管理机制
-	err := fmt.Errorf("SQL runner not set - cannot initialize catalog without SQL execution capability")
-	logger.WithComponent("catalog").Error("Direct system table initialization failed",
-		zap.Error(err))
-	return err
-}
-
 // 确保向后兼容的类型定义
 type DatabaseMeta struct {
 	Name string

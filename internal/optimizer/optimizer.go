@@ -53,7 +53,7 @@ func (o *Optimizer) Optimize(stmt parser.Node) (*Plan, error) {
 		return nil, err
 	}
 	logger.WithComponent("optimizer").Debug("Initial plan built successfully",
-		zap.String("plan_type", string(plan.Type)),
+		zap.String("plan_type", plan.Type.String()),
 		zap.Duration("build_duration", time.Since(buildStart)))
 
 	// 2. 应用优化规则
@@ -74,7 +74,7 @@ func (o *Optimizer) Optimize(stmt parser.Node) (*Plan, error) {
 	totalDuration := time.Since(start)
 	logger.WithComponent("optimizer").Info("Query optimization completed",
 		zap.String("statement_type", fmt.Sprintf("%T", stmt)),
-		zap.String("final_plan_type", string(plan.Type)),
+		zap.String("final_plan_type", plan.Type.String()),
 		zap.Int("rules_applied", appliedRules),
 		zap.Int("total_rules", len(o.rules)),
 		zap.Duration("rules_duration", time.Since(rulesStart)),

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,9 +18,31 @@ type ObjectInfo struct {
 	ETag         string
 }
 
+// ConditionalObjectStore 支持条件写入的对象存储接口
+type ConditionalObjectStore interface {
+	// 基础对象存储功能
+	Get(path string) ([]byte, error)
+	Put(path string, data []byte) error
+	Delete(path string) error
+	List(prefix string) ([]string, error)
+	GetReader(path string) (io.ReadCloser, error)
+	GetWriter(path string) (io.WriteCloser, error)
+	Exists(path string) (bool, error)
+	Stat(path string) (*ObjectInfo, error)
+	Close() error
+
+	// 条件写入功能
+	// PutIfNotExists 仅在文件不存在时写入 (模拟 S3 If-None-Match: *)
+	PutIfNotExists(path string, data []byte) error
+
+	// PutIfMatch 仅在 ETag 匹配时写入 (模拟 S3 If-Match: etag)
+	PutIfMatch(path string, data []byte, expectedETag string) error
+}
+
 // LocalStore 本地文件系统对象存储实现
 type LocalStore struct {
 	basePath string
+	mu       sync.RWMutex // 用于条件写入的原子性保证
 }
 
 // NewLocalStore 创建本地对象存储
@@ -201,6 +224,66 @@ func fsyncFile(file *os.File) error {
 		return fmt.Errorf("fsync failed: %w", err)
 	}
 	return nil
+}
+
+// PutIfNotExists 仅在文件不存在时写入 (模拟 S3 If-None-Match: *)
+func (ls *LocalStore) PutIfNotExists(path string, data []byte) error {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+	fullPath := ls.getFullPath(path)
+
+	// 原子性检查文件是否存在
+	if _, err := os.Stat(fullPath); err == nil {
+		return fmt.Errorf("PreconditionFailed: file already exists")
+	}
+
+	// 使用现有原子写入机制
+	return atomicWrite(fullPath, data)
+}
+
+// PutIfMatch 仅在 ETag 匹配时写入 (模拟 S3 If-Match: etag)
+func (ls *LocalStore) PutIfMatch(path string, data []byte, expectedETag string) error {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+	fullPath := ls.getFullPath(path)
+
+	// 检查当前 ETag
+	info, err := ls.statInternal(path)
+	if err != nil {
+		if expectedETag == "" {
+			// 文件不存在且期望不存在，执行写入
+			return atomicWrite(fullPath, data)
+		}
+		return fmt.Errorf("PreconditionFailed: file not found")
+	}
+
+	if info.ETag != expectedETag {
+		return fmt.Errorf("PreconditionFailed: ETag mismatch")
+	}
+
+	// ETag 匹配，执行原子写入
+	return atomicWrite(fullPath, data)
+}
+
+// statInternal 内部 stat 方法，不使用锁（避免死锁）
+func (ls *LocalStore) statInternal(path string) (*ObjectInfo, error) {
+	fullPath := ls.getFullPath(path)
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("object not found: %s", path)
+		}
+		return nil, fmt.Errorf("failed to stat object: %w", err)
+	}
+
+	return &ObjectInfo{
+		Path:         path,
+		Size:         info.Size(),
+		ModifiedTime: info.ModTime().Unix(),
+		ETag:         fmt.Sprintf("%d-%d", info.Size(), info.ModTime().Unix()),
+	}, nil
 }
 
 // atomicWrite 原子写入文件
