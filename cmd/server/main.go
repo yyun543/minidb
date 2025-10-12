@@ -123,7 +123,7 @@ func handleConnection(conn net.Conn, handler *QueryHandler) {
 	}()
 
 	// 发送欢迎消息
-	welcomeMsg := fmt.Sprintf("Welcome to MiniDB v1.0!\n")
+	welcomeMsg := fmt.Sprintf("Welcome to MiniDB v2.0!\n")
 	welcomeMsg += fmt.Sprintf("Session ID: %d\n", sessionID)
 	welcomeMsg += fmt.Sprintf("Type 'exit;' or 'quit;' to disconnect\n")
 	welcomeMsg += fmt.Sprintf("------------------------------------\n")

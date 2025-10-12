@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/yyun543/minidb/internal/catalog"
@@ -208,13 +209,10 @@ func (ve *VectorizedExecutor) buildOperationsFromPlan(ctx context.Context, plan 
 func (ve *VectorizedExecutor) buildTableScanOperation(plan *optimizer.Plan, sess *session.Session) (types.VectorizedOperation, error) {
 	props := plan.Properties.(*optimizer.TableScanProperties)
 
-	// 从会话中获取当前数据库，如果没有设置则使用默认数据库
-	currentDB := sess.CurrentDB
-	if currentDB == "" {
-		currentDB = "default"
-	}
+	// 解析表引用：支持 "database.table" 或 "table" 格式
+	dbName, tableName := ve.parseTableReference(props.Table, sess.CurrentDB)
 
-	batches, err := ve.dataManager.GetTableData(currentDB, props.Table)
+	batches, err := ve.dataManager.GetTableData(dbName, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -494,12 +492,9 @@ func (ve *VectorizedExecutor) InferSchema(plan *optimizer.Plan, sess *session.Se
 	switch plan.Type {
 	case optimizer.TableScanPlan:
 		props := plan.Properties.(*optimizer.TableScanProperties)
-		// 使用会话中的当前数据库
-		currentDB := sess.CurrentDB
-		if currentDB == "" {
-			currentDB = "default"
-		}
-		if tableMeta, err := ve.catalog.GetTable(currentDB, props.Table); err == nil {
+		// 解析表引用：支持 "database.table" 或 "table" 格式
+		dbName, tableName := ve.parseTableReference(props.Table, sess.CurrentDB)
+		if tableMeta, err := ve.catalog.GetTable(dbName, tableName); err == nil {
 			return tableMeta.Schema
 		}
 
@@ -718,4 +713,18 @@ func (ve *VectorizedExecutor) updateStatisticsAfterWrite(plan *optimizer.Plan) {
 			// ve.statsMgr.MarkTableForUpdate(tableName)
 		}
 	}()
+}
+
+// parseTableReference 解析表引用，支持 "database.table" 或 "table" 格式
+func (ve *VectorizedExecutor) parseTableReference(tableRef string, currentDB string) (string, string) {
+	parts := strings.Split(tableRef, ".")
+	if len(parts) == 2 {
+		// "database.table" 格式
+		return parts[0], parts[1]
+	}
+	// "table" 格式，使用当前数据库
+	if currentDB == "" {
+		currentDB = "default"
+	}
+	return currentDB, tableRef
 }

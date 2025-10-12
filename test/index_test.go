@@ -1,8 +1,10 @@
 package test
 
 import (
+	"os"
 	"testing"
 
+	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/yyun543/minidb/internal/catalog"
@@ -361,4 +363,159 @@ func TestIndexCatalogIntegration(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "does not exist")
 	})
+}
+
+// TestIndexPersistenceAndRecovery is a critical regression test for index metadata persistence.
+// This test verifies the complete lifecycle: index creation → persistence to Delta Log →
+// server restart simulation → index recovery from Delta Log.
+//
+// Bug History: Previously, CreateIndex had a misleading comment claiming "Index metadata is
+// persisted in Delta Log" but no actual persistence code existed, causing indexes to disappear
+// after server restart. This test ensures that bug never returns.
+//
+// Note: This test uses the catalog API directly (not SQL execution) to keep it simple and focused.
+func TestIndexPersistenceAndRecovery(t *testing.T) {
+	// This test follows the same pattern as TestIndexMetadataRecoveryAfterRestart in
+	// metadata_recovery_test.go, which proved to work correctly.
+	testDir := "./test_data/index_persistence_test"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+	// ========== Phase 1: Create indexes and verify persistence ==========
+	t.Log("Phase 1: Creating database, table, and indexes")
+	{
+		engine, err := storage.NewParquetEngine(testDir)
+		require.NoError(t, err, "Failed to create storage engine")
+
+		err = engine.Open()
+		require.NoError(t, err, "Failed to open storage engine")
+
+		cat := catalog.NewSimpleSQLCatalog()
+		cat.SetStorageEngine(engine)
+		err = cat.Init()
+		require.NoError(t, err, "Failed to initialize catalog")
+
+		// Create database
+		err = engine.CreateDatabase("testdb")
+		require.NoError(t, err, "Failed to create database in engine")
+		err = cat.CreateDatabase("testdb")
+		require.NoError(t, err, "Failed to register database in catalog")
+
+		// Create table
+		schema := arrow.NewSchema([]arrow.Field{
+			{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "name", Type: arrow.BinaryTypes.String},
+			{Name: "price", Type: arrow.PrimitiveTypes.Int64},
+		}, nil)
+
+		err = engine.CreateTable("testdb", "products", schema)
+		require.NoError(t, err, "Failed to create table in engine")
+		err = cat.CreateTable("testdb", catalog.TableMeta{
+			Database: "testdb",
+			Table:    "products",
+			Schema:   schema,
+		})
+		require.NoError(t, err, "Failed to register table in catalog")
+
+		// Create indexes
+		indexes := []catalog.IndexMeta{
+			{
+				Database:  "testdb",
+				Table:     "products",
+				Name:      "idx_product_id",
+				Columns:   []string{"id"},
+				IsUnique:  false,
+				IndexType: "BTREE",
+			},
+			{
+				Database:  "testdb",
+				Table:     "products",
+				Name:      "idx_product_name_price",
+				Columns:   []string{"name", "price"},
+				IsUnique:  false,
+				IndexType: "BTREE",
+			},
+			{
+				Database:  "testdb",
+				Table:     "products",
+				Name:      "idx_product_unique_id",
+				Columns:   []string{"id"},
+				IsUnique:  true,
+				IndexType: "BTREE",
+			},
+		}
+
+		for _, idx := range indexes {
+			err = cat.CreateIndex(idx)
+			require.NoError(t, err, "Failed to create index %s", idx.Name)
+			t.Logf("✓ Created index: %s (columns: %v, unique: %v)", idx.Name, idx.Columns, idx.IsUnique)
+		}
+
+		// Verify indexes exist before restart
+		allIndexes, err := cat.GetAllIndexes("testdb", "products")
+		require.NoError(t, err, "Failed to get indexes before restart")
+		assert.Equal(t, 3, len(allIndexes), "Should have 3 indexes before restart")
+		t.Log("✓ All 3 indexes exist in catalog before restart")
+
+		// Close engine
+		err = engine.Close()
+		require.NoError(t, err, "Failed to close storage engine")
+		t.Log("Phase 1 completed: Database, table, and 3 indexes created")
+	}
+
+	// ========== Phase 2: Reopen engine and verify recovery ==========
+	t.Log("Phase 2: Reopening storage engine (simulating server restart)")
+	{
+		// Create new engine instance (simulating restart)
+		engine, err := storage.NewParquetEngine(testDir)
+		require.NoError(t, err, "Failed to create storage engine on restart")
+
+		err = engine.Open()
+		require.NoError(t, err, "Failed to open storage engine on restart")
+		defer engine.Close()
+
+		// Create new catalog instance
+		cat := catalog.NewSimpleSQLCatalog()
+		cat.SetStorageEngine(engine)
+		err = cat.Init()
+		require.NoError(t, err, "Failed to initialize catalog on restart")
+
+		t.Log("✓ Storage engine reopened and catalog initialized")
+
+		// Verify indexes were recovered from Delta Log
+		idx1, err := cat.GetIndex("testdb", "products", "idx_product_id")
+		require.NoError(t, err, "Index idx_product_id should be recovered")
+		assert.Equal(t, "idx_product_id", idx1.Name)
+		assert.Equal(t, []string{"id"}, idx1.Columns)
+		assert.False(t, idx1.IsUnique)
+		assert.Equal(t, "BTREE", idx1.IndexType)
+		t.Log("✓ Verified idx_product_id recovered correctly")
+
+		idx2, err := cat.GetIndex("testdb", "products", "idx_product_name_price")
+		require.NoError(t, err, "Index idx_product_name_price should be recovered")
+		assert.Equal(t, "idx_product_name_price", idx2.Name)
+		assert.Equal(t, []string{"name", "price"}, idx2.Columns)
+		assert.False(t, idx2.IsUnique)
+		t.Log("✓ Verified idx_product_name_price recovered correctly")
+
+		idx3, err := cat.GetIndex("testdb", "products", "idx_product_unique_id")
+		require.NoError(t, err, "Index idx_product_unique_id should be recovered")
+		assert.Equal(t, "idx_product_unique_id", idx3.Name)
+		assert.Equal(t, []string{"id"}, idx3.Columns)
+		assert.True(t, idx3.IsUnique)
+		t.Log("✓ Verified idx_product_unique_id recovered correctly")
+
+		// Verify all indexes for the table
+		allIndexes, err := cat.GetAllIndexes("testdb", "products")
+		require.NoError(t, err, "Should be able to get all indexes after restart")
+		assert.Equal(t, 3, len(allIndexes), "Should have exactly 3 indexes after restart")
+		t.Log("✓ Verified GetAllIndexes returns 3 indexes")
+
+		t.Log("Phase 2 completed: All index metadata verified after restart")
+	}
+
+	t.Log("========================================")
+	t.Log("✓ Index Persistence and Recovery Test PASSED")
+	t.Log("All indexes were successfully persisted to Delta Log and recovered after restart")
+	t.Log("========================================")
 }

@@ -22,7 +22,7 @@ import (
 type ParquetEngine struct {
 	basePath    string
 	objectStore ObjectStore
-	deltaLog    *delta.DeltaLog
+	deltaLog    delta.LogInterface
 	schemas     map[string]*arrow.Schema // 表 schema 缓存
 	mu          sync.RWMutex
 }
@@ -38,23 +38,444 @@ func NewParquetEngine(basePath string) (*ParquetEngine, error) {
 	engine := &ParquetEngine{
 		basePath:    basePath,
 		objectStore: objStore,
-		deltaLog:    delta.NewDeltaLog(),
 		schemas:     make(map[string]*arrow.Schema),
 	}
+
+	// 暂时使用内存版本，Open() 中会初始化持久化版本
+	engine.deltaLog = delta.NewDeltaLog()
 
 	return engine, nil
 }
 
-// Open 打开存储引擎
+// Open 打开存储引擎并从磁盘恢复所有库表
 func (pe *ParquetEngine) Open() error {
 	logger.Info("Opening Parquet engine", zap.String("path", pe.basePath))
 
-	// Bootstrap Delta Log
-	if err := pe.deltaLog.Bootstrap(); err != nil {
-		return fmt.Errorf("failed to bootstrap delta log: %w", err)
+	// 1. 创建系统数据库和表
+	if err := pe.createSystemTables(); err != nil {
+		logger.Warn("Failed to create system tables", zap.Error(err))
+	}
+
+	// 2. 从 sys.delta_log 表恢复 Delta Log 状态到内存
+	if err := pe.recoverDeltaLogFromDisk(); err != nil {
+		logger.Warn("Failed to recover Delta Log, starting fresh", zap.Error(err))
+	}
+
+	// 3. 设置持久化回调（将新 entries 写入 sys.delta_log 表）
+	if inMemoryLog, ok := pe.deltaLog.(*delta.DeltaLog); ok {
+		inMemoryLog.SetPersistenceCallback(pe.persistDeltaLogEntry)
+	}
+
+	// 4. 从 Delta Log 恢复表的 schema
+	if err := pe.rebuildSchemasFromDeltaLog(); err != nil {
+		logger.Warn("Failed to rebuild schemas", zap.Error(err))
 	}
 
 	logger.Info("Parquet engine opened successfully")
+	return nil
+}
+
+// createSystemTables 创建系统数据库和表
+func (pe *ParquetEngine) createSystemTables() error {
+	// 创建 sys 数据库
+	sysDBPath := filepath.Join(pe.basePath, "sys", ".db")
+	if exists, _ := pe.objectStore.Exists(sysDBPath); !exists {
+		if err := pe.objectStore.Put(sysDBPath, []byte{}); err != nil {
+			return fmt.Errorf("failed to create sys database: %w", err)
+		}
+		logger.Info("Created sys database")
+	}
+
+	// 创建 sys.delta_log 表的目录标记
+	deltaLogMarker := filepath.Join(pe.basePath, "sys", "delta_log", ".table")
+	if exists, _ := pe.objectStore.Exists(deltaLogMarker); !exists {
+		if err := pe.objectStore.Put(deltaLogMarker, []byte{}); err != nil {
+			return fmt.Errorf("failed to create delta_log table marker: %w", err)
+		}
+		logger.Info("Created sys.delta_log table marker")
+	}
+
+	return nil
+}
+
+// persistDeltaLogEntry 持久化单个 Delta Log entry 到 sys.delta_log 表
+func (pe *ParquetEngine) persistDeltaLogEntry(entry *delta.LogEntry) error {
+	// 将 LogEntry 转换为 Arrow Record
+	schema := createDeltaLogSchema()
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer builder.Release()
+
+	// 填充字段
+	builder.Field(0).(*array.Int64Builder).Append(entry.Version)
+	builder.Field(1).(*array.Int64Builder).Append(entry.Timestamp)
+	builder.Field(2).(*array.StringBuilder).Append(entry.TableID)
+	builder.Field(3).(*array.StringBuilder).Append(string(entry.Operation))
+
+	// 根据操作类型填充不同字段
+	switch entry.Operation {
+	case delta.OpAdd:
+		builder.Field(4).(*array.StringBuilder).Append(entry.FilePath)
+		builder.Field(5).(*array.Int64Builder).Append(entry.FileSize)
+		builder.Field(6).(*array.Int64Builder).Append(entry.RowCount)
+		// TODO: Serialize MinValues, MaxValues, NullCounts as JSON
+		builder.Field(7).(*array.StringBuilder).Append("") // min_values
+		builder.Field(8).(*array.StringBuilder).Append("") // max_values
+		builder.Field(9).(*array.StringBuilder).Append("") // null_counts
+		builder.Field(10).(*array.BooleanBuilder).Append(entry.DataChange)
+		builder.Field(11).AppendNull() // deletion_timestamp
+		builder.Field(12).AppendNull() // schema_json
+		builder.Field(13).AppendNull() // index_json
+		builder.Field(14).AppendNull() // index_operation
+
+	case delta.OpRemove:
+		builder.Field(4).(*array.StringBuilder).Append(entry.FilePath)
+		for i := 5; i < 11; i++ {
+			builder.Field(i).AppendNull()
+		}
+		builder.Field(11).(*array.Int64Builder).Append(entry.DeletionTimestamp)
+		builder.Field(12).AppendNull() // schema_json
+		builder.Field(13).AppendNull() // index_json
+		builder.Field(14).AppendNull() // index_operation
+
+	case delta.OpMetadata:
+		for i := 4; i < 12; i++ {
+			builder.Field(i).AppendNull()
+		}
+		// Log what we're about to persist
+		logger.Info("Persisting METADATA entry to sys.delta_log",
+			zap.String("table", entry.TableID),
+			zap.Int64("version", entry.Version),
+			zap.Int("schema_json_length", len(entry.SchemaJSON)),
+			zap.Bool("has_schema", entry.SchemaJSON != ""),
+			zap.Int("index_json_length", len(entry.IndexJSON)),
+			zap.Bool("has_index", entry.IndexJSON != ""),
+			zap.String("index_operation", entry.IndexOperation))
+		builder.Field(12).(*array.StringBuilder).Append(entry.SchemaJSON)
+		builder.Field(13).(*array.StringBuilder).Append(entry.IndexJSON)
+		builder.Field(14).(*array.StringBuilder).Append(entry.IndexOperation)
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 调用 Write 方法，但注意不要递归
+	// sys.delta_log 表写入时会被 Write() 跳过 Delta Log 跟踪
+	return pe.Write(context.Background(), "sys", "delta_log", record)
+}
+
+// createDeltaLogSchema 创建 Delta Log 表的 Schema
+func createDeltaLogSchema() *arrow.Schema {
+	return arrow.NewSchema([]arrow.Field{
+		{Name: "version", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "timestamp", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "table_id", Type: arrow.BinaryTypes.String},
+		{Name: "operation", Type: arrow.BinaryTypes.String},
+		{Name: "file_path", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "file_size", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "min_values", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "max_values", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "null_counts", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "data_change", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "deletion_timestamp", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "schema_json", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "index_json", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "index_operation", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+}
+
+// recoverDeltaLogFromDisk 从 sys.delta_log 表恢复 Delta Log 状态
+// 直接扫描 Parquet 文件，不使用 Delta Log API (因为 sys.delta_log 不跟踪自己)
+func (pe *ParquetEngine) recoverDeltaLogFromDisk() error {
+	logger.Info("Recovering Delta Log from sys.delta_log Parquet files")
+
+	// 直接扫描 sys/delta_log/data 目录中的 Parquet 文件
+	deltaLogDir := filepath.Join(pe.basePath, "sys", "delta_log", "data")
+
+	// 扫描目录中的所有 Parquet 文件 (filepath.Glob 会自动处理目录不存在的情况)
+	files, err := pe.scanParquetFiles(deltaLogDir)
+	if err != nil {
+		logger.Info("Failed to scan Delta Log directory", zap.Error(err))
+		return nil
+	}
+
+	if len(files) == 0 {
+		logger.Info("No Parquet files found in Delta Log directory, starting fresh")
+		return nil
+	}
+
+	allEntries := make([]delta.LogEntry, 0)
+
+	// 读取所有 Parquet 文件
+	for _, filePath := range files {
+		entries, err := pe.readDeltaLogEntriesFromFile(filePath)
+		if err != nil {
+			logger.Warn("Failed to read Delta Log file",
+				zap.String("file", filePath),
+				zap.Error(err))
+			continue
+		}
+		allEntries = append(allEntries, entries...)
+	}
+
+	// 使用 RestoreFromEntries 恢复状态
+	if inMemoryLog, ok := pe.deltaLog.(*delta.DeltaLog); ok {
+		if err := inMemoryLog.RestoreFromEntries(allEntries); err != nil {
+			return fmt.Errorf("failed to restore entries: %w", err)
+		}
+	}
+
+	logger.Info("Delta Log recovered from Parquet files",
+		zap.Int("file_count", len(files)),
+		zap.Int("entry_count", len(allEntries)))
+
+	return nil
+}
+
+// loadDeltaLogFromDisk 从磁盘加载 Delta Log 表数据
+func (pe *ParquetEngine) loadDeltaLogFromDisk(deltaLogDir string) error {
+	// 检查目录是否存在
+	if exists, err := pe.objectStore.Exists(deltaLogDir); err != nil || !exists {
+		return fmt.Errorf("delta log directory does not exist: %s", deltaLogDir)
+	}
+
+	// 扫描目录中的所有 Parquet 文件
+	files, err := pe.scanParquetFiles(deltaLogDir)
+	if err != nil {
+		return fmt.Errorf("failed to scan delta log files: %w", err)
+	}
+
+	if len(files) == 0 {
+		return fmt.Errorf("no parquet files found in delta log directory")
+	}
+
+	// 读取所有 Parquet 文件并恢复 Delta Log entries
+	allEntries := make([]delta.LogEntry, 0)
+
+	for _, filePath := range files {
+		entries, err := pe.readDeltaLogEntriesFromFile(filePath)
+		if err != nil {
+			logger.Warn("Failed to read delta log file",
+				zap.String("file", filePath),
+				zap.Error(err))
+			continue
+		}
+
+		allEntries = append(allEntries, entries...)
+	}
+
+	// 恢复 Delta Log 状态
+	if err := pe.deltaLog.RestoreFromEntries(allEntries); err != nil {
+		return fmt.Errorf("failed to restore delta log: %w", err)
+	}
+
+	logger.Info("Delta Log restored from disk",
+		zap.Int("file_count", len(files)),
+		zap.Int("entry_count", len(allEntries)))
+
+	return nil
+}
+
+// scanParquetFiles 扫描目录中的所有 Parquet 文件
+func (pe *ParquetEngine) scanParquetFiles(dir string) ([]string, error) {
+	logger.Debug("Scanning directory for Parquet files",
+		zap.String("directory", dir))
+
+	// 使用 map 进行去重
+	fileSet := make(map[string]bool)
+
+	// 尝试常见的文件名模式
+	patterns := []string{
+		filepath.Join(dir, "*.parquet"),
+		filepath.Join(dir, "part-*.parquet"),
+		filepath.Join(dir, "delta_log_*.parquet"),
+	}
+
+	for _, pattern := range patterns {
+		logger.Debug("Trying glob pattern", zap.String("pattern", pattern))
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			logger.Debug("Glob pattern failed", zap.String("pattern", pattern), zap.Error(err))
+			continue
+		}
+		logger.Debug("Glob pattern matched",
+			zap.String("pattern", pattern),
+			zap.Int("match_count", len(matches)),
+			zap.Strings("matches", matches))
+
+		// 去重：只添加不存在的文件
+		for _, match := range matches {
+			fileSet[match] = true
+		}
+	}
+
+	// 转换为切片
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+
+	logger.Debug("Scan completed",
+		zap.String("directory", dir),
+		zap.Int("total_files", len(files)),
+		zap.Strings("files", files))
+
+	return files, nil
+}
+
+// readDeltaLogEntriesFromFile 从 Parquet 文件读取 Delta Log entries
+func (pe *ParquetEngine) readDeltaLogEntriesFromFile(filePath string) ([]delta.LogEntry, error) {
+	// 读取 Parquet 文件
+	record, err := parquet.ReadParquetFile(filePath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read parquet file: %w", err)
+	}
+	defer record.Release()
+
+	entries := make([]delta.LogEntry, 0)
+
+	// 逐行解析 Delta Log entries
+	numRows := int(record.NumRows())
+	for rowIdx := 0; rowIdx < numRows; rowIdx++ {
+		entry := pe.parseDeltaLogEntry(record, rowIdx)
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+// parseDeltaLogEntry 从 Arrow Record 解析单个 Delta Log entry
+func (pe *ParquetEngine) parseDeltaLogEntry(record arrow.Record, rowIdx int) delta.LogEntry {
+	entry := delta.LogEntry{}
+
+	// 根据列名解析字段
+	schema := record.Schema()
+	for colIdx := 0; colIdx < int(record.NumCols()); colIdx++ {
+		field := schema.Field(colIdx)
+		col := record.Column(colIdx)
+
+		if col.IsNull(rowIdx) {
+			continue
+		}
+
+		switch field.Name {
+		case "version":
+			if arr, ok := col.(*array.Int64); ok {
+				entry.Version = arr.Value(rowIdx)
+			}
+		case "timestamp":
+			if arr, ok := col.(*array.Int64); ok {
+				entry.Timestamp = arr.Value(rowIdx)
+			}
+		case "table_id":
+			if arr, ok := col.(*array.String); ok {
+				entry.TableID = arr.Value(rowIdx)
+			}
+		case "operation":
+			if arr, ok := col.(*array.String); ok {
+				entry.Operation = delta.Operation(arr.Value(rowIdx))
+			}
+		case "file_path":
+			if arr, ok := col.(*array.String); ok {
+				entry.FilePath = arr.Value(rowIdx)
+			}
+		case "file_size":
+			if arr, ok := col.(*array.Int64); ok {
+				entry.FileSize = arr.Value(rowIdx)
+			}
+		case "row_count":
+			if arr, ok := col.(*array.Int64); ok {
+				entry.RowCount = arr.Value(rowIdx)
+			}
+		case "data_change":
+			if arr, ok := col.(*array.Boolean); ok {
+				entry.DataChange = arr.Value(rowIdx)
+			}
+		case "deletion_timestamp":
+			if arr, ok := col.(*array.Int64); ok {
+				entry.DeletionTimestamp = arr.Value(rowIdx)
+			}
+		case "schema_json":
+			if arr, ok := col.(*array.String); ok {
+				entry.SchemaJSON = arr.Value(rowIdx)
+				// Log when we find a SchemaJSON value
+				if entry.SchemaJSON != "" {
+					logger.Debug("Parsed SchemaJSON from Delta Log entry",
+						zap.String("table_id", entry.TableID),
+						zap.Int("schema_json_length", len(entry.SchemaJSON)),
+						zap.Int64("version", entry.Version))
+				}
+			}
+		case "index_json":
+			if arr, ok := col.(*array.String); ok {
+				entry.IndexJSON = arr.Value(rowIdx)
+				// Log when we find an IndexJSON value
+				if entry.IndexJSON != "" {
+					logger.Debug("Parsed IndexJSON from Delta Log entry",
+						zap.String("table_id", entry.TableID),
+						zap.Int("index_json_length", len(entry.IndexJSON)),
+						zap.Int64("version", entry.Version))
+				}
+			}
+		case "index_operation":
+			if arr, ok := col.(*array.String); ok {
+				entry.IndexOperation = arr.Value(rowIdx)
+			}
+		}
+	}
+
+	// Log parsed entry for METADATA operations
+	if entry.Operation == delta.OpMetadata {
+		logger.Info("Parsed METADATA entry from Parquet",
+			zap.String("table_id", entry.TableID),
+			zap.Int64("version", entry.Version),
+			zap.Int("schema_json_length", len(entry.SchemaJSON)),
+			zap.Bool("has_schema", entry.SchemaJSON != ""),
+			zap.Int("index_json_length", len(entry.IndexJSON)),
+			zap.Bool("has_index", entry.IndexJSON != ""),
+			zap.String("index_operation", entry.IndexOperation))
+	}
+
+	return entry
+}
+
+// rebuildSchemasFromDeltaLog 从 Delta Log 重建所有表的 schema
+func (pe *ParquetEngine) rebuildSchemasFromDeltaLog() error {
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+
+	// 获取所有表的列表
+	tables := pe.deltaLog.ListTables()
+
+	for _, tableID := range tables {
+		// 跳过系统表
+		if tableID == "sys.delta_log" {
+			continue
+		}
+
+		// 从 Delta Log 获取 METADATA 条目
+		snapshot, err := pe.deltaLog.GetSnapshot(tableID, -1)
+		if err != nil {
+			logger.Warn("Failed to get snapshot for table",
+				zap.String("table", tableID),
+				zap.Error(err))
+			continue
+		}
+
+		// 如果 snapshot 包含 schema，恢复到内存
+		if snapshot.Schema != nil {
+			pe.schemas[tableID] = snapshot.Schema
+			logger.Info("Restored table schema",
+				zap.String("table", tableID),
+				zap.Int("field_count", len(snapshot.Schema.Fields())))
+		} else {
+			// Schema is nil - this is a problem that needs investigation
+			logger.Warn("Snapshot has nil schema - cannot restore table schema",
+				zap.String("table", tableID),
+				zap.Int("file_count", len(snapshot.Files)))
+		}
+	}
+
 	return nil
 }
 
@@ -222,15 +643,18 @@ func (pe *ParquetEngine) Write(ctx context.Context, db, table string, batch arro
 	}
 
 	// 追加到 Delta Log
-	parquetFile := &delta.ParquetFile{
-		Path:     filePath,
-		Size:     stats.FileSize,
-		RowCount: stats.RowCount,
-		Stats:    stats,
-	}
+	// 特殊处理：sys.delta_log 表不跟踪自己，避免无限递归
+	if tableID != "sys.delta_log" {
+		parquetFile := &delta.ParquetFile{
+			Path:     filePath,
+			Size:     stats.FileSize,
+			RowCount: stats.RowCount,
+			Stats:    stats,
+		}
 
-	if err := pe.deltaLog.AppendAdd(tableID, parquetFile); err != nil {
-		return fmt.Errorf("failed to append to delta log: %w", err)
+		if err := pe.deltaLog.AppendAdd(tableID, parquetFile); err != nil {
+			return fmt.Errorf("failed to append to delta log: %w", err)
+		}
 	}
 
 	logger.Info("Write completed",
@@ -744,8 +1168,8 @@ func (pe *ParquetEngine) GetTableStats(db, table string) (*TableStats, error) {
 	return stats, nil
 }
 
-// GetDeltaLog 获取 Delta Log 实例 (用于系统表查询)
-func (pe *ParquetEngine) GetDeltaLog() *delta.DeltaLog {
+// GetDeltaLog 获取 Delta Log 实例 (用于系统表查询和compaction)
+func (pe *ParquetEngine) GetDeltaLog() delta.LogInterface {
 	return pe.deltaLog
 }
 

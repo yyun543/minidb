@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
@@ -104,12 +105,12 @@ func (dm *DataManager) GetTableData(dbName, tableName string) ([]*types.Batch, e
 // getSystemTableData 获取系统表数据
 func (dm *DataManager) getSystemTableData(tableName string) ([]*types.Batch, error) {
 	switch tableName {
-	case "schemata":
-		return dm.getSchemataData()
-	case "table_catalog":
-		return dm.getTableCatalogData()
-	case "columns":
-		return dm.getColumnsData()
+	case "db_metadata":
+		return dm.getDbMetadataData()
+	case "table_metadata":
+		return dm.getTableMetadataData()
+	case "columns_metadata":
+		return dm.getColumnsMetadataData()
 	case "index_metadata":
 		return dm.getIndexMetadataData()
 	case "delta_log":
@@ -121,8 +122,8 @@ func (dm *DataManager) getSystemTableData(tableName string) ([]*types.Batch, err
 	}
 }
 
-// getSchemataData 获取schemata系统表数据（数据库列表）
-func (dm *DataManager) getSchemataData() ([]*types.Batch, error) {
+// getDbMetadataData 获取db_metadata系统表数据（数据库列表）
+func (dm *DataManager) getDbMetadataData() ([]*types.Batch, error) {
 	// 获取所有数据库
 	databases, err := dm.catalog.GetAllDatabases()
 	if err != nil {
@@ -143,9 +144,9 @@ func (dm *DataManager) getSchemataData() ([]*types.Batch, error) {
 		}
 	}
 
-	// 创建schemata表的schema
+	// 创建db_metadata表的schema
 	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "schema_name", Type: arrow.BinaryTypes.String},
+		{Name: "db_name", Type: arrow.BinaryTypes.String},
 	}, nil)
 
 	// 创建Arrow记录
@@ -166,11 +167,11 @@ func (dm *DataManager) getSchemataData() ([]*types.Batch, error) {
 	return []*types.Batch{batch}, nil
 }
 
-// getTableCatalogData 获取table_catalog系统表数据（表列表）
-func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
-	// 创建table_catalog表的schema
+// getTableMetadataData 获取table_metadata系统表数据（表列表）
+func (dm *DataManager) getTableMetadataData() ([]*types.Batch, error) {
+	// 创建table_metadata表的schema
 	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "db_name", Type: arrow.BinaryTypes.String},
 		{Name: "table_name", Type: arrow.BinaryTypes.String},
 	}, nil)
 
@@ -178,25 +179,25 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 	builder := array.NewRecordBuilder(pool, schema)
 	defer builder.Release()
 
-	schemaBuilder := builder.Field(0).(*array.StringBuilder)
-	nameBuilder := builder.Field(1).(*array.StringBuilder)
+	dbNameBuilder := builder.Field(0).(*array.StringBuilder)
+	tableNameBuilder := builder.Field(1).(*array.StringBuilder)
 
 	// 添加系统表
 	systemTables := []struct {
-		schema string
-		table  string
+		dbName    string
+		tableName string
 	}{
-		{"sys", "schemata"},
-		{"sys", "table_catalog"},
-		{"sys", "columns"},
+		{"sys", "db_metadata"},
+		{"sys", "table_metadata"},
+		{"sys", "columns_metadata"},
 		{"sys", "index_metadata"},
 		{"sys", "delta_log"},
 		{"sys", "table_files"},
 	}
 
 	for _, sysTable := range systemTables {
-		schemaBuilder.Append(sysTable.schema)
-		nameBuilder.Append(sysTable.table)
+		dbNameBuilder.Append(sysTable.dbName)
+		tableNameBuilder.Append(sysTable.tableName)
 	}
 
 	// 获取所有数据库
@@ -226,7 +227,7 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 
 		// 系统表已经在上面添加过了，这里跳过
 		systemTableSet := map[string]bool{
-			"schemata": true, "table_catalog": true, "columns": true,
+			"db_metadata": true, "table_metadata": true, "columns_metadata": true,
 			"index_metadata": true, "delta_log": true, "table_files": true,
 		}
 
@@ -234,8 +235,8 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 			if dbName == "sys" && systemTableSet[tableName] {
 				continue
 			}
-			schemaBuilder.Append(dbName)
-			nameBuilder.Append(tableName)
+			dbNameBuilder.Append(dbName)
+			tableNameBuilder.Append(tableName)
 		}
 	}
 
@@ -246,11 +247,11 @@ func (dm *DataManager) getTableCatalogData() ([]*types.Batch, error) {
 	return []*types.Batch{batch}, nil
 }
 
-// getColumnsData 获取columns系统表数据（所有表的列信息）
-func (dm *DataManager) getColumnsData() ([]*types.Batch, error) {
-	// 创建columns表的schema
+// getColumnsMetadataData 获取columns_metadata系统表数据（所有表的列信息）
+func (dm *DataManager) getColumnsMetadataData() ([]*types.Batch, error) {
+	// 创建columns_metadata表的schema
 	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "db_name", Type: arrow.BinaryTypes.String},
 		{Name: "table_name", Type: arrow.BinaryTypes.String},
 		{Name: "column_name", Type: arrow.BinaryTypes.String},
 		{Name: "ordinal_position", Type: arrow.PrimitiveTypes.Int64},
@@ -262,11 +263,11 @@ func (dm *DataManager) getColumnsData() ([]*types.Batch, error) {
 	builder := array.NewRecordBuilder(pool, schema)
 	defer builder.Release()
 
-	schemaBuilder := builder.Field(0).(*array.StringBuilder)
-	tableBuilder := builder.Field(1).(*array.StringBuilder)
-	columnBuilder := builder.Field(2).(*array.StringBuilder)
+	dbNameBuilder := builder.Field(0).(*array.StringBuilder)
+	tableNameBuilder := builder.Field(1).(*array.StringBuilder)
+	columnNameBuilder := builder.Field(2).(*array.StringBuilder)
 	positionBuilder := builder.Field(3).(*array.Int64Builder)
-	typeBuilder := builder.Field(4).(*array.StringBuilder)
+	dataTypeBuilder := builder.Field(4).(*array.StringBuilder)
 	nullableBuilder := builder.Field(5).(*array.StringBuilder)
 
 	// 获取所有数据库
@@ -290,11 +291,11 @@ func (dm *DataManager) getColumnsData() ([]*types.Batch, error) {
 
 			// 遍历表的列
 			for i, field := range tableMeta.Schema.Fields() {
-				schemaBuilder.Append(dbName)
-				tableBuilder.Append(tableName)
-				columnBuilder.Append(field.Name)
+				dbNameBuilder.Append(dbName)
+				tableNameBuilder.Append(tableName)
+				columnNameBuilder.Append(field.Name)
 				positionBuilder.Append(int64(i + 1))
-				typeBuilder.Append(field.Type.String())
+				dataTypeBuilder.Append(field.Type.String())
 				if field.Nullable {
 					nullableBuilder.Append("YES")
 				} else {
@@ -311,11 +312,11 @@ func (dm *DataManager) getColumnsData() ([]*types.Batch, error) {
 	return []*types.Batch{batch}, nil
 }
 
-// getIndexesData 获取indexes系统表数据（所有索引信息）
+// getIndexMetadataData 获取index_metadata系统表数据（所有索引信息）
 func (dm *DataManager) getIndexMetadataData() ([]*types.Batch, error) {
-	// 创建indexes表的schema
+	// 创建index_metadata表的schema
 	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "db_name", Type: arrow.BinaryTypes.String},
 		{Name: "table_name", Type: arrow.BinaryTypes.String},
 		{Name: "index_name", Type: arrow.BinaryTypes.String},
 		{Name: "index_type", Type: arrow.BinaryTypes.String},
@@ -327,12 +328,12 @@ func (dm *DataManager) getIndexMetadataData() ([]*types.Batch, error) {
 	builder := array.NewRecordBuilder(pool, schema)
 	defer builder.Release()
 
-	schemaBuilder := builder.Field(0).(*array.StringBuilder)
-	tableBuilder := builder.Field(1).(*array.StringBuilder)
+	dbNameBuilder := builder.Field(0).(*array.StringBuilder)
+	tableNameBuilder := builder.Field(1).(*array.StringBuilder)
 	indexNameBuilder := builder.Field(2).(*array.StringBuilder)
 	indexTypeBuilder := builder.Field(3).(*array.StringBuilder)
-	columnBuilder := builder.Field(4).(*array.StringBuilder)
-	uniqueBuilder := builder.Field(5).(*array.StringBuilder)
+	columnNameBuilder := builder.Field(4).(*array.StringBuilder)
+	isUniqueBuilder := builder.Field(5).(*array.StringBuilder)
 
 	// 获取所有数据库
 	databases, err := dm.catalog.GetAllDatabases()
@@ -356,15 +357,15 @@ func (dm *DataManager) getIndexMetadataData() ([]*types.Batch, error) {
 			for _, indexInfo := range indexes {
 				// 每个索引可能有多个列
 				for _, columnName := range indexInfo.Columns {
-					schemaBuilder.Append(dbName)
-					tableBuilder.Append(indexInfo.Table)
+					dbNameBuilder.Append(dbName)
+					tableNameBuilder.Append(indexInfo.Table)
 					indexNameBuilder.Append(indexInfo.Name)
 					indexTypeBuilder.Append(indexInfo.IndexType)
-					columnBuilder.Append(columnName)
+					columnNameBuilder.Append(columnName)
 					if indexInfo.IsUnique {
-						uniqueBuilder.Append("YES")
+						isUniqueBuilder.Append("YES")
 					} else {
-						uniqueBuilder.Append("NO")
+						isUniqueBuilder.Append("NO")
 					}
 				}
 			}
@@ -381,27 +382,26 @@ func (dm *DataManager) getIndexMetadataData() ([]*types.Batch, error) {
 // getDeltaLogData 获取delta_log系统表数据（Delta Log版本历史）
 func (dm *DataManager) getDeltaLogData() ([]*types.Batch, error) {
 	// 创建delta_log表的schema
+	// 注意：列顺序必须与README中的示例一致
 	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_schema", Type: arrow.BinaryTypes.String},
-		{Name: "table_name", Type: arrow.BinaryTypes.String},
 		{Name: "version", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "timestamp", Type: arrow.BinaryTypes.String},
 		{Name: "operation", Type: arrow.BinaryTypes.String},
+		{Name: "db_name", Type: arrow.BinaryTypes.String},
+		{Name: "table_name", Type: arrow.BinaryTypes.String},
 		{Name: "file_path", Type: arrow.BinaryTypes.String},
-		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "file_size", Type: arrow.PrimitiveTypes.Int64},
 	}, nil)
 
 	pool := memory.NewGoAllocator()
 	builder := array.NewRecordBuilder(pool, schema)
 	defer builder.Release()
 
-	schemaBuilder := builder.Field(0).(*array.StringBuilder)
-	tableBuilder := builder.Field(1).(*array.StringBuilder)
-	versionBuilder := builder.Field(2).(*array.Int64Builder)
-	operationBuilder := builder.Field(3).(*array.StringBuilder)
-	filePathBuilder := builder.Field(4).(*array.StringBuilder)
-	rowCountBuilder := builder.Field(5).(*array.Int64Builder)
-	fileSizeBuilder := builder.Field(6).(*array.Int64Builder)
+	versionBuilder := builder.Field(0).(*array.Int64Builder)
+	timestampBuilder := builder.Field(1).(*array.StringBuilder)
+	operationBuilder := builder.Field(2).(*array.StringBuilder)
+	dbNameBuilder := builder.Field(3).(*array.StringBuilder)
+	tableNameBuilder := builder.Field(4).(*array.StringBuilder)
+	filePathBuilder := builder.Field(5).(*array.StringBuilder)
 
 	// 从 Storage Engine 获取 Delta Log (使用类型断言访问 ParquetEngine)
 	if pe, ok := dm.storageEngine.(*storage.ParquetEngine); ok {
@@ -423,13 +423,17 @@ func (dm *DataManager) getDeltaLogData() ([]*types.Batch, error) {
 					tableName = entry.TableID
 				}
 
-				schemaBuilder.Append(dbName)
-				tableBuilder.Append(tableName)
+				// 按照新的schema顺序填充: version, timestamp, operation, db_name, table_name, file_path
 				versionBuilder.Append(entry.Version)
+
+				// 格式化 timestamp (从 int64 毫秒转为字符串)
+				timestampStr := time.UnixMilli(entry.Timestamp).Format("2006-01-02 15:04:05")
+				timestampBuilder.Append(timestampStr)
+
 				operationBuilder.Append(string(entry.Operation))
+				dbNameBuilder.Append(dbName)
+				tableNameBuilder.Append(tableName)
 				filePathBuilder.Append(entry.FilePath)
-				rowCountBuilder.Append(entry.RowCount)
-				fileSizeBuilder.Append(entry.FileSize)
 			}
 		}
 	}
@@ -445,7 +449,7 @@ func (dm *DataManager) getDeltaLogData() ([]*types.Batch, error) {
 func (dm *DataManager) getTableFilesData() ([]*types.Batch, error) {
 	// 创建table_files表的schema
 	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_schema", Type: arrow.BinaryTypes.String},
+		{Name: "db_name", Type: arrow.BinaryTypes.String},
 		{Name: "table_name", Type: arrow.BinaryTypes.String},
 		{Name: "file_path", Type: arrow.BinaryTypes.String},
 		{Name: "file_size", Type: arrow.PrimitiveTypes.Int64},
@@ -457,8 +461,8 @@ func (dm *DataManager) getTableFilesData() ([]*types.Batch, error) {
 	builder := array.NewRecordBuilder(pool, schema)
 	defer builder.Release()
 
-	schemaBuilder := builder.Field(0).(*array.StringBuilder)
-	tableBuilder := builder.Field(1).(*array.StringBuilder)
+	dbNameBuilder := builder.Field(0).(*array.StringBuilder)
+	tableNameBuilder := builder.Field(1).(*array.StringBuilder)
 	filePathBuilder := builder.Field(2).(*array.StringBuilder)
 	fileSizeBuilder := builder.Field(3).(*array.Int64Builder)
 	rowCountBuilder := builder.Field(4).(*array.Int64Builder)
@@ -492,8 +496,8 @@ func (dm *DataManager) getTableFilesData() ([]*types.Batch, error) {
 
 				// 填充活跃文件信息
 				for _, file := range snapshot.Files {
-					schemaBuilder.Append(dbName)
-					tableBuilder.Append(tableName)
+					dbNameBuilder.Append(dbName)
+					tableNameBuilder.Append(tableName)
 					filePathBuilder.Append(file.Path)
 					fileSizeBuilder.Append(file.Size)
 					rowCountBuilder.Append(file.RowCount)

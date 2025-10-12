@@ -1,36 +1,41 @@
 package operators
 
 import (
-	"context"
-
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/catalog"
-	"github.com/yyun543/minidb/internal/storage"
 	"github.com/yyun543/minidb/internal/types"
 )
 
+// DataProvider 数据提供者接口
+// 用于提供表数据，支持系统表和普通表的统一访问
+type DataProvider interface {
+	GetTableData(dbName, tableName string) ([]*types.Batch, error)
+}
+
 // TableScan 表扫描算子 (v2.0)
-// 使用 StorageEngine.Scan() 而非 key-based Get()
+// 使用 DataProvider 统一获取系统表和普通表数据
 type TableScan struct {
-	database    string
-	table       string
-	catalog     *catalog.Catalog
-	schema      *arrow.Schema
-	pool        *memory.GoAllocator
-	batchSize   int
-	curBatch    int
-	dataBatches []*types.Batch
+	database     string
+	table        string
+	catalog      *catalog.Catalog
+	dataProvider DataProvider
+	schema       *arrow.Schema
+	pool         *memory.GoAllocator
+	batchSize    int
+	curBatch     int
+	dataBatches  []*types.Batch
 }
 
 // NewTableScan 创建表扫描算子
-func NewTableScan(database, table string, catalog *catalog.Catalog) *TableScan {
+func NewTableScan(database, table string, catalog *catalog.Catalog, dataProvider DataProvider) *TableScan {
 	return &TableScan{
-		database:  database,
-		table:     table,
-		catalog:   catalog,
-		pool:      memory.NewGoAllocator(),
-		batchSize: 1024,
+		database:     database,
+		table:        table,
+		catalog:      catalog,
+		dataProvider: dataProvider,
+		pool:         memory.NewGoAllocator(),
+		batchSize:    1024,
 	}
 }
 
@@ -45,9 +50,9 @@ func (op *TableScan) Init(ctx interface{}) error {
 	// 使用表的 Schema
 	op.schema = table.Schema
 
-	// 从存储引擎读取数据 (v2.0: 使用 Scan)
+	// 从 DataProvider 读取数据 (统一处理系统表和普通表)
 	if ctx != nil {
-		batches, err := op.getTableDataFromStorage()
+		batches, err := op.getTableData()
 		if err != nil {
 			return err
 		}
@@ -76,34 +81,18 @@ func (op *TableScan) Close() error {
 	return nil
 }
 
-// getTableDataFromStorage 从存储引擎获取表数据 (v2.0)
-func (op *TableScan) getTableDataFromStorage() ([]*types.Batch, error) {
-	// 获取存储引擎
-	storageEngine := op.catalog.GetStorageEngine()
-	if storageEngine == nil {
-		// 如果没有存储引擎，返回空结果（用于系统表等特殊情况）
+// getTableData 从 DataProvider 获取表数据 (v2.0)
+// 统一处理系统表和普通表，不再区分
+func (op *TableScan) getTableData() ([]*types.Batch, error) {
+	if op.dataProvider == nil {
+		// 如果没有 DataProvider，返回空结果
 		return []*types.Batch{}, nil
 	}
 
-	// 使用 StorageEngine.Scan() 扫描表数据
-	ctx := context.Background()
-	iter, err := storageEngine.Scan(ctx, op.database, op.table, []storage.Filter{})
+	// 使用 DataProvider.GetTableData() 获取表数据
+	// DataProvider 内部会判断是系统表还是普通表，并采用相应的方式获取数据
+	batches, err := op.dataProvider.GetTableData(op.database, op.table)
 	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	// 收集所有批次
-	var batches []*types.Batch
-	for iter.Next() {
-		record := iter.Record()
-		if record.NumRows() > 0 {
-			batch := types.NewBatch(record)
-			batches = append(batches, batch)
-		}
-	}
-
-	if err := iter.Err(); err != nil {
 		return nil, err
 	}
 

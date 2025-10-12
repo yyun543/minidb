@@ -272,7 +272,7 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 			zap.String("currentDB", ctx.Session.CurrentDB),
 			zap.String("resolved_db", dbName),
 			zap.String("resolved_table", tableName))
-		return operators.NewTableScan(dbName, tableName, e.catalog), nil
+		return operators.NewTableScan(dbName, tableName, e.catalog, e.dataManager), nil
 
 	case optimizer.JoinPlan:
 		props := plan.Properties.(*optimizer.JoinProperties)

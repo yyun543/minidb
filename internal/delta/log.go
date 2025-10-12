@@ -14,30 +14,63 @@ import (
 	"go.uber.org/zap"
 )
 
-// DeltaLog Delta Log 管理器 (SQL 自举版)
+// PersistenceCallback 持久化回调函数类型
+// 当新的 Log Entry 被添加时调用
+type PersistenceCallback func(entry *LogEntry) error
+
+// DeltaLog Delta Log 管理器
 type DeltaLog struct {
-	// 使用内存存储模拟 SQL 表 (实际应该用数据库)
-	entries    []LogEntry
-	mu         sync.RWMutex
-	currentVer atomic.Int64
-	tableName  string
+	// 内存存储用于快速访问
+	entries             []LogEntry
+	mu                  sync.RWMutex
+	currentVer          atomic.Int64
+	tableName           string
+	persistenceCallback PersistenceCallback // 持久化回调
 }
 
 // NewDeltaLog 创建 Delta Log 管理器
 func NewDeltaLog() *DeltaLog {
 	dl := &DeltaLog{
 		entries:   make([]LogEntry, 0),
-		tableName: "_system.delta_log",
+		tableName: "sys.delta_log",
 	}
 	dl.currentVer.Store(0)
 	return dl
 }
 
-// Bootstrap 初始化系统表
+// SetPersistenceCallback 设置持久化回调
+func (dl *DeltaLog) SetPersistenceCallback(callback PersistenceCallback) {
+	dl.persistenceCallback = callback
+}
+
+// Bootstrap 初始化 Delta Log (由 ParquetEngine 负责加载持久化数据)
 func (dl *DeltaLog) Bootstrap() error {
 	logger.Info("Bootstrapping Delta Log")
-	// 在实际实现中，这里会创建 _system.delta_log 等系统表
-	// 现在使用内存存储模拟
+	// ParquetEngine 会负责从 sys.delta_log 表加载数据并调用 RestoreFromEntries
+	return nil
+}
+
+// RestoreFromEntries 从已加载的 entries 恢复 Delta Log 状态
+// 由 ParquetEngine 在启动时调用
+func (dl *DeltaLog) RestoreFromEntries(entries []LogEntry) error {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+
+	dl.entries = entries
+
+	// 恢复最新版本号
+	var maxVersion int64 = 0
+	for _, entry := range entries {
+		if entry.Version > maxVersion {
+			maxVersion = entry.Version
+		}
+	}
+	dl.currentVer.Store(maxVersion)
+
+	logger.Info("Delta Log restored from entries",
+		zap.Int("entry_count", len(entries)),
+		zap.Int64("latest_version", maxVersion))
+
 	return nil
 }
 
@@ -67,6 +100,17 @@ func (dl *DeltaLog) AppendAdd(tableID string, file *ParquetFile) error {
 	}
 
 	dl.entries = append(dl.entries, entry)
+
+	// 调用持久化回调
+	if dl.persistenceCallback != nil {
+		if err := dl.persistenceCallback(&entry); err != nil {
+			logger.Error("Failed to persist Delta Log entry",
+				zap.Error(err),
+				zap.String("table", tableID),
+				zap.String("operation", string(OpAdd)))
+			// 不返回错误，继续操作（内存中已保存）
+		}
+	}
 
 	logger.Info("Delta Log entry appended",
 		zap.Int64("version", version),
@@ -102,6 +146,16 @@ func (dl *DeltaLog) AppendRemove(tableID, filePath string) error {
 
 	dl.entries = append(dl.entries, entry)
 
+	// 调用持久化回调
+	if dl.persistenceCallback != nil {
+		if err := dl.persistenceCallback(&entry); err != nil {
+			logger.Error("Failed to persist Delta Log entry",
+				zap.Error(err),
+				zap.String("table", tableID),
+				zap.String("operation", string(OpRemove)))
+		}
+	}
+
 	logger.Info("Delta Log entry appended",
 		zap.Int64("version", version),
 		zap.String("table", tableID),
@@ -124,6 +178,11 @@ func (dl *DeltaLog) AppendMetadata(tableID string, schema *arrow.Schema) error {
 		return fmt.Errorf("failed to serialize schema: %w", err)
 	}
 
+	logger.Info("Schema serialized for METADATA entry",
+		zap.String("table", tableID),
+		zap.Int("schema_json_length", len(schemaJSON)),
+		zap.Int("field_count", len(schema.Fields())))
+
 	entry := LogEntry{
 		Version:    version,
 		Timestamp:  timestamp,
@@ -134,10 +193,142 @@ func (dl *DeltaLog) AppendMetadata(tableID string, schema *arrow.Schema) error {
 
 	dl.entries = append(dl.entries, entry)
 
+	// 调用持久化回调
+	if dl.persistenceCallback != nil {
+		logger.Debug("Calling persistence callback for METADATA entry",
+			zap.String("table", tableID),
+			zap.Int("schema_json_length", len(entry.SchemaJSON)))
+
+		if err := dl.persistenceCallback(&entry); err != nil {
+			logger.Error("Failed to persist Delta Log entry",
+				zap.Error(err),
+				zap.String("table", tableID),
+				zap.String("operation", string(OpMetadata)))
+		} else {
+			logger.Debug("METADATA entry persisted successfully",
+				zap.String("table", tableID),
+				zap.Int("schema_json_length", len(entry.SchemaJSON)))
+		}
+	}
+
 	logger.Info("Delta Log entry appended",
 		zap.Int64("version", version),
 		zap.String("table", tableID),
 		zap.String("operation", string(OpMetadata)))
+
+	return nil
+}
+
+// AppendIndexMetadata 追加索引元数据操作
+func (dl *DeltaLog) AppendIndexMetadata(tableID, indexName string, indexMeta map[string]interface{}) error {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+
+	version := dl.currentVer.Add(1)
+	timestamp := time.Now().UnixMilli()
+
+	// 序列化索引元数据为JSON
+	indexJSON := fmt.Sprintf("{\"index_name\":\"%s\",\"table_id\":\"%s\"", indexName, tableID)
+	for k, v := range indexMeta {
+		indexJSON += fmt.Sprintf(",\"%s\":\"%v\"", k, v)
+	}
+	indexJSON += "}"
+
+	logger.Info("Index metadata serialized for METADATA entry",
+		zap.String("table", tableID),
+		zap.String("index", indexName),
+		zap.Int("index_json_length", len(indexJSON)))
+
+	entry := LogEntry{
+		Version:   version,
+		Timestamp: timestamp,
+		TableID:   tableID,
+		Operation: OpMetadata,
+		IndexJSON: indexJSON,
+	}
+
+	dl.entries = append(dl.entries, entry)
+
+	// 调用持久化回调
+	if dl.persistenceCallback != nil {
+		logger.Debug("Calling persistence callback for INDEX METADATA entry",
+			zap.String("table", tableID),
+			zap.String("index", indexName),
+			zap.Int("index_json_length", len(entry.IndexJSON)))
+
+		if err := dl.persistenceCallback(&entry); err != nil {
+			logger.Error("Failed to persist INDEX METADATA entry",
+				zap.Error(err),
+				zap.String("table", tableID),
+				zap.String("index", indexName),
+				zap.String("operation", string(OpMetadata)))
+		} else {
+			logger.Debug("INDEX METADATA entry persisted successfully",
+				zap.String("table", tableID),
+				zap.String("index", indexName),
+				zap.Int("index_json_length", len(entry.IndexJSON)))
+		}
+	}
+
+	logger.Info("Delta Log INDEX METADATA entry appended",
+		zap.Int64("version", version),
+		zap.String("table", tableID),
+		zap.String("index", indexName),
+		zap.String("operation", string(OpMetadata)))
+
+	return nil
+}
+
+// RemoveIndexMetadata 删除索引元数据操作
+func (dl *DeltaLog) RemoveIndexMetadata(tableID, indexName string) error {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+
+	version := dl.currentVer.Add(1)
+	timestamp := time.Now().UnixMilli()
+
+	// 创建删除索引的 METADATA 条目
+	// 使用 IndexOperation 字段来标识这是删除操作
+	indexJSON := fmt.Sprintf("{\"index_name\":\"%s\",\"table_id\":\"%s\"}", indexName, tableID)
+
+	logger.Info("Index deletion metadata serialized for METADATA entry",
+		zap.String("table", tableID),
+		zap.String("index", indexName),
+		zap.Int("index_json_length", len(indexJSON)))
+
+	entry := LogEntry{
+		Version:        version,
+		Timestamp:      timestamp,
+		TableID:        tableID,
+		Operation:      OpMetadata,
+		IndexJSON:      indexJSON,
+		IndexOperation: "DROP", // 标记为删除操作
+	}
+
+	dl.entries = append(dl.entries, entry)
+
+	// 调用持久化回调
+	if dl.persistenceCallback != nil {
+		logger.Debug("Calling persistence callback for INDEX DROP entry",
+			zap.String("table", tableID),
+			zap.String("index", indexName))
+
+		if err := dl.persistenceCallback(&entry); err != nil {
+			logger.Error("Failed to persist INDEX DROP entry",
+				zap.Error(err),
+				zap.String("table", tableID),
+				zap.String("index", indexName))
+		} else {
+			logger.Debug("INDEX DROP entry persisted successfully",
+				zap.String("table", tableID),
+				zap.String("index", indexName))
+		}
+	}
+
+	logger.Info("Delta Log INDEX DROP entry appended",
+		zap.Int64("version", version),
+		zap.String("table", tableID),
+		zap.String("index", indexName))
 
 	return nil
 }
@@ -188,7 +379,19 @@ func (dl *DeltaLog) GetSnapshot(tableID string, version int64) (*Snapshot, error
 				schema, err := SchemaFromJSON(entry.SchemaJSON)
 				if err == nil {
 					snapshot.Schema = schema
+					logger.Debug("Schema deserialized successfully for snapshot",
+						zap.String("table", tableID),
+						zap.Int("field_count", len(schema.Fields())))
+				} else {
+					logger.Warn("Failed to deserialize schema from METADATA entry",
+						zap.String("table", tableID),
+						zap.Int64("version", entry.Version),
+						zap.Error(err))
 				}
+			} else {
+				logger.Warn("METADATA entry has empty SchemaJSON",
+					zap.String("table", tableID),
+					zap.Int64("version", entry.Version))
 			}
 		}
 	}
