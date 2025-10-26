@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -135,6 +136,11 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 		logger.WithComponent("executor").Debug("Executing DELETE plan")
 		result, err := e.executeDelete(plan, sess)
 		e.logExecutionResult("DELETE", start, err)
+		return result, err
+	case optimizer.AnalyzePlan:
+		logger.WithComponent("executor").Debug("Executing ANALYZE TABLE plan")
+		result, err := e.executeAnalyze(plan, sess)
+		e.logExecutionResult("ANALYZE", start, err)
 		return result, err
 	}
 
@@ -333,10 +339,8 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 		if err != nil {
 			return nil, err
 		}
-		// For now, create a simple limit operator (can be implemented later)
-		// Return child for basic functionality
-		_ = props // avoid unused variable error
-		return child, nil
+		// Create Limit operator (offset=0 for now, can be extended later)
+		return operators.NewLimit(int64(props.Limit), 0, child, ctx), nil
 
 	case optimizer.DropTablePlan:
 		// For DDL operations, create simple NoOp operator
@@ -1353,4 +1357,377 @@ func (e *ExecutorImpl) negateFilter(filter storage.Filter) *storage.Filter {
 		Operator: negatedOp,
 		Value:    filter.Value,
 	}
+}
+
+// executeAnalyze 执行ANALYZE TABLE语句
+func (e *ExecutorImpl) executeAnalyze(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props, ok := plan.Properties.(*optimizer.AnalyzeProperties)
+	if !ok {
+		return nil, fmt.Errorf("invalid ANALYZE plan properties")
+	}
+
+	logger.WithComponent("executor").Info("Executing ANALYZE TABLE",
+		zap.String("table", props.Table),
+		zap.Strings("columns", props.Columns))
+
+	// 解析表名（可能包含数据库名）
+	tableParts := strings.Split(props.Table, ".")
+	var dbName, tableName string
+	if len(tableParts) == 2 {
+		dbName = tableParts[0]
+		tableName = tableParts[1]
+	} else {
+		dbName = sess.CurrentDB
+		tableName = props.Table
+	}
+
+	if dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+
+	// 检查表是否存在
+	table, err := e.catalog.GetTable(dbName, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("table %s.%s not found: %w", dbName, tableName, err)
+	}
+
+	// 获取ParquetEngine通过类型断言
+	storageEngine := e.catalog.GetStorageEngine()
+	engine, ok := storageEngine.(*storage.ParquetEngine)
+	if !ok {
+		return nil, fmt.Errorf("storage engine is not ParquetEngine")
+	}
+
+	// 确保sys数据库和系统表存在
+	if err := e.ensureSystemTables(engine); err != nil {
+		return nil, fmt.Errorf("failed to ensure system tables: %w", err)
+	}
+
+	// 收集表级统计信息
+	if err := e.collectTableStatistics(engine, dbName, tableName); err != nil {
+		return nil, fmt.Errorf("failed to collect table statistics: %w", err)
+	}
+
+	// 收集列级统计信息
+	columns := props.Columns
+	if len(columns) == 0 {
+		// 如果未指定列，收集所有列的统计信息
+		for _, field := range table.Schema.Fields() {
+			columns = append(columns, field.Name)
+		}
+	}
+
+	if err := e.collectColumnStatistics(engine, dbName, tableName, columns); err != nil {
+		return nil, fmt.Errorf("failed to collect column statistics: %w", err)
+	}
+
+	logger.WithComponent("executor").Info("ANALYZE TABLE completed successfully",
+		zap.String("table", props.Table),
+		zap.Int("columns_analyzed", len(columns)))
+
+	// 返回成功消息
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// ensureSystemTables 确保系统表存在
+func (e *ExecutorImpl) ensureSystemTables(engine *storage.ParquetEngine) error {
+	// 创建sys数据库（如果不存在）
+	if err := engine.CreateDatabase("sys"); err != nil && !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("failed to create sys database: %w", err)
+	}
+
+	// 创建sys.table_statistics表（如果不存在）
+	tableStatsSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_id", Type: arrow.BinaryTypes.String},
+		{Name: "version", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "file_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "total_size_bytes", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "last_updated", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	if err := engine.CreateTable("sys", "table_statistics", tableStatsSchema); err != nil && !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("failed to create sys.table_statistics: %w", err)
+	}
+
+	// 创建sys.column_statistics表（如果不存在）
+	columnStatsSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_id", Type: arrow.BinaryTypes.String},
+		{Name: "column_name", Type: arrow.BinaryTypes.String},
+		{Name: "data_type", Type: arrow.BinaryTypes.String},
+		{Name: "min_value", Type: arrow.BinaryTypes.String},
+		{Name: "max_value", Type: arrow.BinaryTypes.String},
+		{Name: "null_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "distinct_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "last_updated", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	if err := engine.CreateTable("sys", "column_statistics", columnStatsSchema); err != nil && !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("failed to create sys.column_statistics: %w", err)
+	}
+
+	return nil
+}
+
+// collectTableStatistics 收集表级统计信息
+func (e *ExecutorImpl) collectTableStatistics(engine *storage.ParquetEngine, dbName, tableName string) error {
+	tableID := fmt.Sprintf("%s.%s", dbName, tableName)
+
+	// 使用COUNT(*)查询获取行数
+	rowCount, err := e.getRowCount(engine, dbName, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get row count: %w", err)
+	}
+
+	// 构建统计记录
+	pool := memory.NewGoAllocator()
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_id", Type: arrow.BinaryTypes.String},
+		{Name: "version", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "file_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "total_size_bytes", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "last_updated", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	builder.Field(0).(*array.StringBuilder).Append(tableID)
+	builder.Field(1).(*array.Int64Builder).Append(0) // version: 0 for now
+	builder.Field(2).(*array.Int64Builder).Append(rowCount)
+	builder.Field(3).(*array.Int64Builder).Append(0) // file_count: 0 for now
+	builder.Field(4).(*array.Int64Builder).Append(0) // total_size_bytes: 0 for now
+	builder.Field(5).(*array.Int64Builder).Append(time.Now().Unix())
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 写入sys.table_statistics
+	ctx := context.Background()
+	if err := engine.Write(ctx, "sys", "table_statistics", record); err != nil {
+		return fmt.Errorf("failed to write table statistics: %w", err)
+	}
+
+	logger.WithComponent("executor").Info("Table statistics collected",
+		zap.String("table_id", tableID),
+		zap.Int64("row_count", rowCount))
+
+	return nil
+}
+
+// collectColumnStatistics 收集列级统计信息
+func (e *ExecutorImpl) collectColumnStatistics(engine *storage.ParquetEngine, dbName, tableName string, columns []string) error {
+	tableID := fmt.Sprintf("%s.%s", dbName, tableName)
+
+	// 获取表schema
+	table, err := e.catalog.GetTable(dbName, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get table: %w", err)
+	}
+
+	pool := memory.NewGoAllocator()
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_id", Type: arrow.BinaryTypes.String},
+		{Name: "column_name", Type: arrow.BinaryTypes.String},
+		{Name: "data_type", Type: arrow.BinaryTypes.String},
+		{Name: "min_value", Type: arrow.BinaryTypes.String},
+		{Name: "max_value", Type: arrow.BinaryTypes.String},
+		{Name: "null_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "distinct_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "last_updated", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	// 扫描表数据收集统计
+	ctx := context.Background()
+	iterator, err := engine.Scan(ctx, dbName, tableName, nil)
+	if err != nil {
+		return fmt.Errorf("failed to scan table: %w", err)
+	}
+
+	// 为每个列初始化统计收集器
+	columnStats := make(map[string]*ColumnStatsCollector)
+	for _, colName := range columns {
+		// 查找列的数据类型
+		var colType arrow.DataType
+		for _, field := range table.Schema.Fields() {
+			if field.Name == colName {
+				colType = field.Type
+				break
+			}
+		}
+		if colType == nil {
+			logger.WithComponent("executor").Warn("Column not found in schema, skipping",
+				zap.String("column", colName))
+			continue
+		}
+		columnStats[colName] = NewColumnStatsCollector(colType)
+	}
+
+	// 遍历数据收集统计
+	for iterator.Next() {
+		record := iterator.Record()
+		for colName, collector := range columnStats {
+			// 找到列索引
+			colIdx := -1
+			for i, field := range record.Schema().Fields() {
+				if field.Name == colName {
+					colIdx = i
+					break
+				}
+			}
+			if colIdx >= 0 {
+				collector.Collect(record.Column(colIdx))
+			}
+		}
+	}
+
+	if err := iterator.Err(); err != nil {
+		return fmt.Errorf("iterator error: %w", err)
+	}
+
+	// 构建统计记录
+	timestamp := time.Now().Unix()
+	for _, colName := range columns {
+		collector, ok := columnStats[colName]
+		if !ok {
+			continue
+		}
+
+		stats := collector.Finalize()
+		builder.Field(0).(*array.StringBuilder).Append(tableID)
+		builder.Field(1).(*array.StringBuilder).Append(colName)
+		builder.Field(2).(*array.StringBuilder).Append(stats.DataType)
+		builder.Field(3).(*array.StringBuilder).Append(stats.MinValue)
+		builder.Field(4).(*array.StringBuilder).Append(stats.MaxValue)
+		builder.Field(5).(*array.Int64Builder).Append(stats.NullCount)
+		builder.Field(6).(*array.Int64Builder).Append(stats.DistinctCount)
+		builder.Field(7).(*array.Int64Builder).Append(timestamp)
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// 写入sys.column_statistics
+	if err := engine.Write(ctx, "sys", "column_statistics", record); err != nil {
+		return fmt.Errorf("failed to write column statistics: %w", err)
+	}
+
+	logger.WithComponent("executor").Info("Column statistics collected",
+		zap.String("table_id", tableID),
+		zap.Int("column_count", len(columns)))
+
+	return nil
+}
+
+// ColumnStats 列统计信息
+type ColumnStats struct {
+	DataType      string
+	MinValue      string
+	MaxValue      string
+	NullCount     int64
+	DistinctCount int64
+}
+
+// ColumnStatsCollector 列统计收集器
+type ColumnStatsCollector struct {
+	dataType       arrow.DataType
+	minValue       interface{}
+	maxValue       interface{}
+	nullCount      int64
+	distinctValues map[string]bool
+}
+
+// NewColumnStatsCollector 创建列统计收集器
+func NewColumnStatsCollector(dataType arrow.DataType) *ColumnStatsCollector {
+	return &ColumnStatsCollector{
+		dataType:       dataType,
+		distinctValues: make(map[string]bool),
+	}
+}
+
+// Collect 收集列的统计信息
+func (c *ColumnStatsCollector) Collect(column arrow.Array) {
+	switch arr := column.(type) {
+	case *array.Int64:
+		for i := 0; i < arr.Len(); i++ {
+			if arr.IsNull(i) {
+				c.nullCount++
+				continue
+			}
+			val := arr.Value(i)
+			c.distinctValues[fmt.Sprintf("%d", val)] = true
+
+			if c.minValue == nil || val < c.minValue.(int64) {
+				c.minValue = val
+			}
+			if c.maxValue == nil || val > c.maxValue.(int64) {
+				c.maxValue = val
+			}
+		}
+	case *array.String:
+		for i := 0; i < arr.Len(); i++ {
+			if arr.IsNull(i) {
+				c.nullCount++
+				continue
+			}
+			val := arr.Value(i)
+			c.distinctValues[val] = true
+
+			if c.minValue == nil || val < c.minValue.(string) {
+				c.minValue = val
+			}
+			if c.maxValue == nil || val > c.maxValue.(string) {
+				c.maxValue = val
+			}
+		}
+	}
+}
+
+// Finalize 完成统计收集并返回结果
+func (c *ColumnStatsCollector) Finalize() ColumnStats {
+	minStr := ""
+	maxStr := ""
+	if c.minValue != nil {
+		minStr = fmt.Sprintf("%v", c.minValue)
+	}
+	if c.maxValue != nil {
+		maxStr = fmt.Sprintf("%v", c.maxValue)
+	}
+
+	return ColumnStats{
+		DataType:      c.dataType.String(),
+		MinValue:      minStr,
+		MaxValue:      maxStr,
+		NullCount:     c.nullCount,
+		DistinctCount: int64(len(c.distinctValues)),
+	}
+}
+
+// getRowCount 获取表的行数
+func (e *ExecutorImpl) getRowCount(engine *storage.ParquetEngine, dbName, tableName string) (int64, error) {
+	ctx := context.Background()
+	iterator, err := engine.Scan(ctx, dbName, tableName, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to scan table: %w", err)
+	}
+
+	var rowCount int64
+	for iterator.Next() {
+		record := iterator.Record()
+		rowCount += record.NumRows()
+	}
+
+	if err := iterator.Err(); err != nil {
+		return 0, fmt.Errorf("iterator error: %w", err)
+	}
+
+	return rowCount, nil
 }

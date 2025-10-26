@@ -34,6 +34,10 @@ type LogEntry struct {
 	// REMOVE 操作字段
 	DeletionTimestamp int64 `json:"deletion_timestamp,omitempty"`
 
+	// Merge-on-Read 字段
+	IsDelta   bool   `json:"is_delta,omitempty"`   // 是否为 Delta 文件
+	DeltaType string `json:"delta_type,omitempty"` // Delta 文件类型: "update", "delete", "insert"
+
 	// METADATA 操作字段
 	SchemaJSON     string `json:"schema_json,omitempty"`
 	IndexJSON      string `json:"index_json,omitempty"`      // 索引元数据
@@ -69,10 +73,12 @@ type FileInfo struct {
 
 // ParquetFile Parquet 文件描述
 type ParquetFile struct {
-	Path     string
-	Size     int64
-	RowCount int64
-	Stats    *FileStats
+	Path      string
+	Size      int64
+	RowCount  int64
+	Stats     *FileStats
+	IsDelta   bool   // Merge-on-Read: 是否为 Delta 文件
+	DeltaType string // Delta 文件类型: "update", "delete", "insert"
 }
 
 // FileStats 文件统计信息

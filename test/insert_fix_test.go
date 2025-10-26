@@ -1,6 +1,7 @@
 package test
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,7 +15,12 @@ import (
 
 // TestInsertFix 测试INSERT修复是否解决了Arrow记录构建问题
 func TestInsertFix(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/insert_fix")
+	// 清理测试数据
+	testDir := "./test_data/insert_fix"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -78,14 +84,15 @@ func TestInsertFix(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, len(result.Batches()) > 0, "Should have data after inserts")
 
-	if len(result.Batches()) > 0 {
-		batch := result.Batches()[0]
-		rowCount := batch.NumRows()
-		t.Logf("✓ Found %d rows after inserts", rowCount)
-		assert.Equal(t, int64(3), rowCount, "Should have 3 rows")
-
-		// 验证第二行（Bob）的age列为NULL（因为没有提供）
-		// 这验证了我们的NULL处理修复
-		t.Log("✅ INSERT fix test PASSED - no more crashes!")
+	// Count rows across all batches
+	totalRows := int64(0)
+	for _, batch := range result.Batches() {
+		totalRows += batch.NumRows()
 	}
+	t.Logf("✓ Found %d rows after inserts (across %d batches)", totalRows, len(result.Batches()))
+	assert.Equal(t, int64(3), totalRows, "Should have 3 rows")
+
+	// 验证第二行（Bob）的age列为NULL（因为没有提供）
+	// 这验证了我们的NULL处理修复
+	t.Log("✅ INSERT fix test PASSED - no more crashes!")
 }

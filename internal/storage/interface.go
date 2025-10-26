@@ -60,9 +60,10 @@ type Transaction interface {
 
 // Filter 查询过滤条件
 type Filter struct {
-	Column   string
-	Operator string // =, >, <, >=, <=, !=, LIKE, IN
-	Value    interface{}
+	Column   string        // 列名
+	Operator string        // =, >, <, >=, <=, !=, LIKE, IN, BETWEEN
+	Value    interface{}   // 单值操作符使用
+	Values   []interface{} // IN 操作符使用多个值
 }
 
 // TableStats 表统计信息

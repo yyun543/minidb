@@ -33,6 +33,8 @@ func WriteArrowBatch(path string, batch arrow.Record) (*delta.FileStats, error) 
 	}
 
 	// 使用 Arrow 的原生 Parquet writer
+	// Note: pqarrow.NewFileWriter takes ownership of the file handle
+	// and will close it when the writer is closed
 	writer, err := pqarrow.NewFileWriter(
 		batch.Schema(),
 		file,
@@ -46,18 +48,24 @@ func WriteArrowBatch(path string, batch arrow.Record) (*delta.FileStats, error) 
 
 	// 写入 Arrow Record
 	if err := writer.Write(batch); err != nil {
-		writer.Close()
-		file.Close()
+		writer.Close() // Will also close the file
 		return nil, fmt.Errorf("failed to write arrow record to parquet: %w", err)
+	}
+
+	// 根据架构文档: "file.Sync() 确保数据刷盘" (line 559)
+	// P0 优先级改进: 在关闭文件前调用 fsync() 确保数据持久化
+	// 注意：必须在 writer.Close() 之前调用 Sync()，因为 Close() 会关闭文件句柄
+	if err := file.Sync(); err != nil {
+		writer.Close()
+		return nil, fmt.Errorf("failed to sync parquet file: %w", err)
 	}
 
 	// 关闭 writer (会自动写入 footer 并关闭底层文件)
 	if err := writer.Close(); err != nil {
-		// writer.Close() 可能已经关闭了文件，所以不再调用 file.Close()
 		return nil, fmt.Errorf("failed to close parquet writer: %w", err)
 	}
 
-	// 获取文件大小（writer 已经关闭文件，使用 os.Stat）
+	// 获取文件大小
 	fileInfo, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat parquet file: %w", err)

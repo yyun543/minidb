@@ -193,6 +193,9 @@ func (v *MiniQLVisitorImpl) VisitUtilityStatement(ctx *UtilityStatementContext) 
 	if ctx.ExplainStatement() != nil {
 		return v.Visit(ctx.ExplainStatement())
 	}
+	if ctx.AnalyzeStatement() != nil {
+		return v.Visit(ctx.AnalyzeStatement())
+	}
 	return nil
 }
 
@@ -1361,6 +1364,58 @@ func (v *MiniQLVisitorImpl) VisitExplainStatement(ctx *ExplainStatementContext) 
 	}
 
 	return stmt
+}
+
+// VisitAnalyzeStatement 访问 ANALYZE TABLE 语句节点
+func (v *MiniQLVisitorImpl) VisitAnalyzeStatement(ctx *AnalyzeStatementContext) interface{} {
+	logger.WithComponent("parser").Debug("Processing ANALYZE TABLE statement")
+
+	if ctx == nil {
+		return nil
+	}
+
+	// 创建 ANALYZE 语句节点
+	stmt := &AnalyzeStmt{
+		BaseNode: BaseNode{nodeType: AnalyzeNode},
+	}
+
+	// 获取表名
+	if ctx.TableName() != nil {
+		if result := v.Visit(ctx.TableName()); result != nil {
+			if tableName, ok := result.(string); ok {
+				stmt.Table = tableName
+			}
+		}
+	}
+
+	// 获取列列表（如果指定）
+	if ctx.ColumnList() != nil {
+		if result := v.Visit(ctx.ColumnList()); result != nil {
+			if columns, ok := result.([]string); ok {
+				stmt.Columns = columns
+			}
+		}
+	}
+
+	return stmt
+}
+
+// VisitColumnList 访问列列表节点
+func (v *MiniQLVisitorImpl) VisitColumnList(ctx *ColumnListContext) interface{} {
+	if ctx == nil {
+		return nil
+	}
+
+	columns := make([]string, 0)
+	for _, idCtx := range ctx.AllIdentifier() {
+		if result := v.Visit(idCtx); result != nil {
+			if id, ok := result.(string); ok {
+				columns = append(columns, id)
+			}
+		}
+	}
+
+	return columns
 }
 
 // VisitIdentifierList 访问标识符列表

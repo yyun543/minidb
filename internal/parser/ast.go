@@ -31,6 +31,7 @@ const (
 	ShowTablesNode
 	ShowIndexesNode
 	ExplainNode
+	AnalyzeNode
 	ErrorNode
 
 	// 表达式节点类型
@@ -396,4 +397,11 @@ type ErrorStmt struct {
 type HavingClause struct {
 	BaseNode
 	Condition Node // HAVING条件表达式
+}
+
+// AnalyzeStmt ANALYZE TABLE语句节点
+type AnalyzeStmt struct {
+	BaseNode
+	Table   string   // 表名
+	Columns []string // 要分析的列（nil表示所有列）
 }

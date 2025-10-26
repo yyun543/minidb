@@ -15,8 +15,11 @@ import (
 // TestUpdateDataPersistence 专门测试UPDATE操作的数据持久化问题
 // 这是一个failing test，用来重现并修复UPDATE问题
 func TestUpdateDataPersistence(t *testing.T) {
+	// 使用统一的测试数据目录管理
+	testDir := SetupTestDir(t, "test_update_debug")
+
 	// 创建独立的存储引擎，避免干扰其他测试
-	storageEngine, err := storage.NewParquetEngine("./test_data/test_update_debug")
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -116,8 +119,11 @@ func TestUpdateDataPersistence(t *testing.T) {
 
 // TestUpdateDataPersistenceMinimal 最简化的UPDATE测试，仅测试单一字段更新
 func TestUpdateDataPersistenceMinimal(t *testing.T) {
+	// 使用统一的测试数据目录管理
+	testDir := SetupTestDir(t, "test_update_minimal")
+
 	// 使用不同的文件名避免冲突
-	storageEngine, err := storage.NewParquetEngine("./test_data/test_update_minimal.wal")
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

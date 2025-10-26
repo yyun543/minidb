@@ -29,29 +29,20 @@ func TestOptimizer(t *testing.T) {
 			assert.NotNil(t, plan)
 
 			// 验证计划树结构：
-			// Select(id, name)
-			//   └─ Projection(id, name)
-			//        └─ TableScan(users)
+			// Project(id, name)
+			//   └─ TableScan(users)
 			assert.Equal(t, optimizer.SelectPlan, plan.Type)
 			assert.Len(t, plan.Children, 1)
 
-			// 验证顶层SELECT算子
-			selectProps, ok := plan.Properties.(*optimizer.SelectProperties)
-			assert.True(t, ok)
-			assert.Len(t, selectProps.Columns, 2)
-			assert.Equal(t, "id", selectProps.Columns[0].Column)
-			assert.Equal(t, "name", selectProps.Columns[1].Column)
-
 			// 验证投影算子
-			projectionPlan := plan.Children[0]
-			assert.Equal(t, optimizer.ProjectionPlan, projectionPlan.Type)
-			projectionProps, ok := projectionPlan.Properties.(*optimizer.ProjectionProperties)
+			projectProps, ok := plan.Properties.(*optimizer.SelectProperties)
 			assert.True(t, ok)
-			assert.Len(t, projectionProps.Columns, 2)
+			assert.Len(t, projectProps.Columns, 2)
+			assert.Equal(t, "id", projectProps.Columns[0].Column)
+			assert.Equal(t, "name", projectProps.Columns[1].Column)
 
 			// 验证表扫描算子
-			assert.Len(t, projectionPlan.Children, 1)
-			scanPlan := projectionPlan.Children[0]
+			scanPlan := plan.Children[0]
 			assert.Equal(t, optimizer.TableScanPlan, scanPlan.Type)
 			scanProps, ok := scanPlan.Properties.(*optimizer.TableScanProperties)
 			assert.True(t, ok)
@@ -70,25 +61,19 @@ func TestOptimizer(t *testing.T) {
 			assert.NotNil(t, plan)
 
 			// 验证计划树结构：
-			// Select(id, name)
-			//   └─ Projection(id, name)
-			//        └─ Filter(age > 18)
-			//             └─ TableScan(users)
+			// Project(id, name)
+			//   └─ Filter(age > 18)
+			//        └─ TableScan(users)
 			assert.Equal(t, optimizer.SelectPlan, plan.Type)
 			assert.Len(t, plan.Children, 1)
 
-			// 验证顶层SELECT算子
-			selectProps, ok := plan.Properties.(*optimizer.SelectProperties)
-			assert.True(t, ok)
-			assert.Len(t, selectProps.Columns, 2)
-
 			// 验证投影算子
-			projectionPlan := plan.Children[0]
-			assert.Equal(t, optimizer.ProjectionPlan, projectionPlan.Type)
-			assert.Len(t, projectionPlan.Children, 1)
+			projectProps, ok := plan.Properties.(*optimizer.SelectProperties)
+			assert.True(t, ok)
+			assert.Len(t, projectProps.Columns, 2)
 
 			// 验证过滤算子
-			filterPlan := projectionPlan.Children[0]
+			filterPlan := plan.Children[0]
 			assert.Equal(t, optimizer.FilterPlan, filterPlan.Type)
 			filterProps, ok := filterPlan.Properties.(*optimizer.FilterProperties)
 			assert.True(t, ok)
@@ -114,26 +99,20 @@ func TestOptimizer(t *testing.T) {
 			assert.NotNil(t, plan)
 
 			// 验证计划树结构：
-			// Select(u.id, o.order_id)
-			//   └─ Projection(u.id, o.order_id)
-			//        └─ Join(INNER, u.id = o.user_id)
-			//             ├─ TableScan(users AS u)
-			//             └─ TableScan(orders AS o)
+			// Project(u.id, o.order_id)
+			//   └─ Join(INNER, u.id = o.user_id)
+			//        ├─ TableScan(users AS u)
+			//        └─ TableScan(orders AS o)
 			assert.Equal(t, optimizer.SelectPlan, plan.Type)
 			assert.Len(t, plan.Children, 1)
 
-			// 验证顶层SELECT算子
-			selectProps, ok := plan.Properties.(*optimizer.SelectProperties)
-			assert.True(t, ok)
-			assert.Len(t, selectProps.Columns, 2)
-
 			// 验证投影算子
-			projectionPlan := plan.Children[0]
-			assert.Equal(t, optimizer.ProjectionPlan, projectionPlan.Type)
-			assert.Len(t, projectionPlan.Children, 1)
+			projectProps, ok := plan.Properties.(*optimizer.SelectProperties)
+			assert.True(t, ok)
+			assert.Len(t, projectProps.Columns, 2)
 
 			// 验证JOIN算子
-			joinPlan := projectionPlan.Children[0]
+			joinPlan := plan.Children[0]
 			assert.Equal(t, optimizer.JoinPlan, joinPlan.Type)
 			joinProps, ok := joinPlan.Properties.(*optimizer.JoinProperties)
 			assert.True(t, ok)
@@ -173,25 +152,19 @@ func TestOptimizer(t *testing.T) {
 			assert.NotNil(t, plan)
 
 			// 验证计划树结构：
-			// Select(id, name)
-			//   └─ Projection(id, name)
-			//        └─ OrderBy(name DESC)
-			//             └─ TableScan(users)
+			// Project(id, name)
+			//   └─ OrderBy(name DESC)
+			//        └─ TableScan(users)
 			assert.Equal(t, optimizer.SelectPlan, plan.Type)
 			assert.Len(t, plan.Children, 1)
 
-			// 验证顶层SELECT算子
-			selectProps, ok := plan.Properties.(*optimizer.SelectProperties)
-			assert.True(t, ok)
-			assert.Len(t, selectProps.Columns, 2)
-
 			// 验证投影算子
-			projectionPlan := plan.Children[0]
-			assert.Equal(t, optimizer.ProjectionPlan, projectionPlan.Type)
-			assert.Len(t, projectionPlan.Children, 1)
+			projectProps, ok := plan.Properties.(*optimizer.SelectProperties)
+			assert.True(t, ok)
+			assert.Len(t, projectProps.Columns, 2)
 
 			// 验证ORDER BY算子
-			orderByPlan := projectionPlan.Children[0]
+			orderByPlan := plan.Children[0]
 			assert.Equal(t, optimizer.OrderPlan, orderByPlan.Type)
 			orderByProps, ok := orderByPlan.Properties.(*optimizer.OrderByProperties)
 			assert.True(t, ok)
@@ -374,9 +347,6 @@ func TestOptimizer(t *testing.T) {
 			assert.True(t, ok)
 			assert.Contains(t, groupProps.GroupKeys[0].Column, "department")
 
-			// 验证Projection算子 (因为没有GROUP BY但有聚合函数，所以没有Projection)
-			// 对于有GROUP BY的查询，没有额外的Projection节点
-
 			// 验证Filter算子
 			filterPlan := groupPlan.Children[0]
 			assert.Equal(t, optimizer.FilterPlan, filterPlan.Type)
@@ -410,29 +380,23 @@ func TestOptimizer(t *testing.T) {
 			assert.NotNil(t, plan)
 
 			// 验证计划树结构：
-			// Select(u.name, d.department_name, o.order_id)
-			//   └─ Projection(u.name, d.department_name, o.order_id)
-			//        └─ Filter(u.status = 'active')
-			//             └─ Join(LEFT, u.id = o.user_id)
-			//                  ├─ Join(INNER, u.dept_id = d.id)
-			//                  │    ├─ TableScan(users AS u)
-			//                  │    └─ TableScan(departments AS d)
-			//                  └─ TableScan(orders AS o)
+			// Project(u.name, d.department_name, o.order_id)
+			//   └─ Filter(u.status = 'active')
+			//        └─ Join(LEFT, u.id = o.user_id)
+			//             ├─ Join(INNER, u.dept_id = d.id)
+			//             │    ├─ TableScan(users AS u)
+			//             │    └─ TableScan(departments AS d)
+			//             └─ TableScan(orders AS o)
 			assert.Equal(t, optimizer.SelectPlan, plan.Type)
 			assert.Len(t, plan.Children, 1)
 
-			// 验证顶层SELECT算子
-			selectProps, ok := plan.Properties.(*optimizer.SelectProperties)
-			assert.True(t, ok)
-			assert.Len(t, selectProps.Columns, 3)
-
 			// 验证投影算子
-			projectionPlan := plan.Children[0]
-			assert.Equal(t, optimizer.ProjectionPlan, projectionPlan.Type)
-			assert.Len(t, projectionPlan.Children, 1)
+			projectProps, ok := plan.Properties.(*optimizer.SelectProperties)
+			assert.True(t, ok)
+			assert.Len(t, projectProps.Columns, 3)
 
 			// 验证Filter算子
-			filterPlan := projectionPlan.Children[0]
+			filterPlan := plan.Children[0]
 			assert.Equal(t, optimizer.FilterPlan, filterPlan.Type)
 			filterProps, ok := filterPlan.Properties.(*optimizer.FilterProperties)
 			assert.True(t, ok)

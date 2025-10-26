@@ -163,41 +163,9 @@ func TestMergeOnReadDelete(t *testing.T) {
 	assert.Equal(t, int64(0), deletedRowsFound, "Deleted rows should not be returned")
 }
 
-// TestMergeOnReadWriteAmplification compares write amplification between CoW and MoR
+// TestMergeOnReadWriteAmplification 验证 Merge-on-Read 的写放大特性
 func TestMergeOnReadWriteAmplification(t *testing.T) {
 	ctx := context.Background()
-
-	// Test Copy-on-Write
-	cowDir := setupTempDirMOR(t)
-	defer os.RemoveAll(cowDir)
-
-	cowEngine, err := storage.NewParquetEngine(cowDir)
-	require.NoError(t, err)
-	require.NoError(t, cowEngine.Open())
-	defer cowEngine.Close()
-
-	require.NoError(t, cowEngine.CreateDatabase("testdb"))
-	schema := arrow.NewSchema(
-		[]arrow.Field{
-			{Name: "id", Type: arrow.PrimitiveTypes.Int64},
-			{Name: "data", Type: arrow.BinaryTypes.String},
-		}, nil,
-	)
-	require.NoError(t, cowEngine.CreateTable("testdb", "cow_table", schema))
-	insertTestDataMOR(t, ctx, cowEngine, "testdb", "cow_table", schema, 10000)
-
-	cowInitialSnapshot, _ := cowEngine.GetDeltaLog().GetSnapshot("testdb.cow_table", -1)
-	cowInitialSize := calculateTotalSize(cowInitialSnapshot.Files)
-
-	// Update 1 row with CoW
-	cowStartTime := time.Now()
-	_, err = cowEngine.Update(ctx, "testdb", "cow_table", []storage.Filter{{Column: "id", Operator: "=", Value: int64(1)}}, map[string]interface{}{"data": "updated"})
-	cowDuration := time.Since(cowStartTime)
-	require.NoError(t, err)
-
-	cowFinalSnapshot, _ := cowEngine.GetDeltaLog().GetSnapshot("testdb.cow_table", -1)
-	cowFinalSize := calculateTotalSize(cowFinalSnapshot.Files)
-	cowWriteAmplification := float64(cowFinalSize) / float64(cowInitialSize)
 
 	// Test Merge-on-Read
 	morDir := setupTempDirMOR(t)
@@ -209,15 +177,21 @@ func TestMergeOnReadWriteAmplification(t *testing.T) {
 	defer morEngine.Close()
 
 	require.NoError(t, morEngine.CreateDatabase("testdb"))
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "data", Type: arrow.BinaryTypes.String},
+		}, nil,
+	)
 	require.NoError(t, morEngine.CreateTable("testdb", "mor_table", schema))
 	insertTestDataMOR(t, ctx, morEngine, "testdb", "mor_table", schema, 10000)
 
 	morInitialSnapshot, _ := morEngine.GetDeltaLog().GetSnapshot("testdb.mor_table", -1)
 	morInitialSize := calculateTotalSize(morInitialSnapshot.Files)
 
-	// Update 1 row with MoR
+	// Update 1 row with MoR (现在 Update() 默认使用 MoR)
 	morStartTime := time.Now()
-	_, err = morEngine.UpdateMergeOnRead(ctx, "testdb", "mor_table", []storage.Filter{{Column: "id", Operator: "=", Value: int64(1)}}, map[string]interface{}{"data": "updated"})
+	_, err = morEngine.Update(ctx, "testdb", "mor_table", []storage.Filter{{Column: "id", Operator: "=", Value: int64(1)}}, map[string]interface{}{"data": "updated"})
 	morDuration := time.Since(morStartTime)
 	require.NoError(t, err)
 
@@ -225,13 +199,11 @@ func TestMergeOnReadWriteAmplification(t *testing.T) {
 	morFinalSize := calculateTotalSize(morFinalSnapshot.Files)
 	morWriteAmplification := float64(morFinalSize) / float64(morInitialSize)
 
-	// Compare results
-	t.Logf("Copy-on-Write: duration=%v, write_amplification=%.2fx", cowDuration, cowWriteAmplification)
 	t.Logf("Merge-on-Read: duration=%v, write_amplification=%.2fx", morDuration, morWriteAmplification)
 
-	// MoR should have significantly less write amplification
-	assert.Less(t, morWriteAmplification, cowWriteAmplification, "MoR should have less write amplification than CoW")
-	assert.Less(t, morWriteAmplification, 1.1, "MoR write amplification should be minimal")
+	// MoR 写放大应该很小 (只添加一个小的 delta 文件)
+	assert.Less(t, morWriteAmplification, 1.1, "MoR write amplification should be minimal (< 1.1x)")
+	assert.Less(t, morDuration.Milliseconds(), int64(100), "MoR update should be fast (< 100ms)")
 }
 
 // Helper functions

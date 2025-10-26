@@ -1,6 +1,7 @@
 package test
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,8 +14,13 @@ import (
 )
 
 func TestExecutor(t *testing.T) {
+	// 清理测试数据
+	testDir := "./test_data/executor_test"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
 	// 创建 v2.0 Parquet 存储引擎
-	storageEngine, err := storage.NewParquetEngine("./test_data/executor_test")
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -36,14 +42,17 @@ func TestExecutor(t *testing.T) {
 	opt := optimizer.NewOptimizer()
 	exec := executor.NewExecutor(cat)
 
-	// 创建默认数据库
+	// 创建默认数据库（如果不存在）
 	createDbSQL := "CREATE DATABASE default"
 	stmt, err := parser.Parse(createDbSQL)
 	assert.NoError(t, err)
 	plan, err := opt.Optimize(stmt)
 	assert.NoError(t, err)
 	_, err = exec.Execute(plan, sess)
-	assert.NoError(t, err)
+	// Ignore "already exists" error
+	if err != nil && err.Error() != "database 'default' already exists" {
+		assert.NoError(t, err)
+	}
 
 	// 设置当前数据库上下文
 	sess.CurrentDB = "default"

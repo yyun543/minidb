@@ -31,6 +31,7 @@ const (
 	UsePlan
 	ShowPlan
 	ExplainPlan
+	AnalyzePlan
 )
 
 // String 返回 PlanType 的字符串描述，便于调试和日志记录
@@ -80,6 +81,8 @@ func (pt PlanType) String() string {
 		return "Show"
 	case ExplainPlan:
 		return "Explain"
+	case AnalyzePlan:
+		return "Analyze"
 	default:
 		return "Unknown"
 	}
@@ -461,4 +464,17 @@ type ExplainProperties struct {
 
 func (p *ExplainProperties) Explain() string {
 	return fmt.Sprintf("Query Plan:\n%s", p.Query.Explain("  "))
+}
+
+// AnalyzeProperties ANALYZE语句的属性
+type AnalyzeProperties struct {
+	Table   string   // 要分析的表名
+	Columns []string // 要分析的列（nil表示所有列）
+}
+
+func (p *AnalyzeProperties) Explain() string {
+	if len(p.Columns) == 0 {
+		return fmt.Sprintf("ANALYZE TABLE %s (all columns)", p.Table)
+	}
+	return fmt.Sprintf("ANALYZE TABLE %s (columns: %v)", p.Table, p.Columns)
 }

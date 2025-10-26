@@ -79,6 +79,11 @@ func (op *Filter) applyFilter(record arrow.Record) (arrow.Record, error) {
 
 // applyBinaryFilter 应用二元表达式过滤
 func (op *Filter) applyBinaryFilter(record arrow.Record, binExpr *optimizer.BinaryExpression) (arrow.Record, error) {
+	// Check if this is a logical operator (AND/OR)
+	if binExpr.Operator == "AND" || binExpr.Operator == "OR" {
+		return op.applyLogicalFilter(record, binExpr)
+	}
+
 	// 获取列引用和比较值
 	var colName string
 	var compareValue interface{}
@@ -127,6 +132,123 @@ func (op *Filter) applyBinaryFilter(record arrow.Record, binExpr *optimizer.Bina
 		// 不支持的操作符，返回原记录
 		return record, nil
 	}
+}
+
+// applyLogicalFilter 应用逻辑表达式过滤 (AND/OR)
+func (op *Filter) applyLogicalFilter(record arrow.Record, binExpr *optimizer.BinaryExpression) (arrow.Record, error) {
+	if binExpr.Operator == "AND" {
+		// Apply left filter first
+		leftBinExpr, ok := binExpr.Left.(*optimizer.BinaryExpression)
+		if !ok {
+			return record, nil
+		}
+		tempFilterLeft := &Filter{condition: leftBinExpr, child: nil, ctx: op.ctx}
+		leftResult, err := tempFilterLeft.applyBinaryFilter(record, leftBinExpr)
+		if err != nil {
+			return nil, err
+		}
+		if leftResult == nil || leftResult.NumRows() == 0 {
+			return leftResult, nil
+		}
+
+		// Apply right filter on the result
+		rightBinExpr, ok := binExpr.Right.(*optimizer.BinaryExpression)
+		if !ok {
+			return leftResult, nil
+		}
+		tempFilterRight := &Filter{condition: rightBinExpr, child: nil, ctx: op.ctx}
+		return tempFilterRight.applyBinaryFilter(leftResult, rightBinExpr)
+	} else if binExpr.Operator == "OR" {
+		// Apply left and right filters separately
+		leftBinExpr, ok := binExpr.Left.(*optimizer.BinaryExpression)
+		if !ok {
+			return record, nil
+		}
+		tempFilterLeft := &Filter{condition: leftBinExpr, child: nil, ctx: op.ctx}
+		leftResult, err := tempFilterLeft.applyBinaryFilter(record, leftBinExpr)
+		if err != nil {
+			return nil, err
+		}
+
+		rightBinExpr, ok := binExpr.Right.(*optimizer.BinaryExpression)
+		if !ok {
+			return leftResult, nil
+		}
+		tempFilterRight := &Filter{condition: rightBinExpr, child: nil, ctx: op.ctx}
+		rightResult, err := tempFilterRight.applyBinaryFilter(record, rightBinExpr)
+		if err != nil {
+			return nil, err
+		}
+
+		// Merge results (union without duplicates)
+		return op.mergeRecords(leftResult, rightResult)
+	}
+
+	return record, nil
+}
+
+// mergeRecords 合并两个记录（用于OR操作）
+func (op *Filter) mergeRecords(left, right arrow.Record) (arrow.Record, error) {
+	if left == nil || left.NumRows() == 0 {
+		return right, nil
+	}
+	if right == nil || right.NumRows() == 0 {
+		return left, nil
+	}
+
+	// Simple implementation: just concatenate the records
+	// TODO: Remove duplicates if needed
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, left.Schema())
+	defer builder.Release()
+
+	// Copy rows from left
+	for rowIdx := int64(0); rowIdx < left.NumRows(); rowIdx++ {
+		for colIdx := int64(0); colIdx < left.NumCols(); colIdx++ {
+			field := builder.Field(int(colIdx))
+			srcCol := left.Column(int(colIdx))
+
+			switch srcCol := srcCol.(type) {
+			case *array.Int64:
+				if intBuilder, ok := field.(*array.Int64Builder); ok {
+					intBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.String:
+				if strBuilder, ok := field.(*array.StringBuilder); ok {
+					strBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.Float64:
+				if floatBuilder, ok := field.(*array.Float64Builder); ok {
+					floatBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			}
+		}
+	}
+
+	// Copy rows from right
+	for rowIdx := int64(0); rowIdx < right.NumRows(); rowIdx++ {
+		for colIdx := int64(0); colIdx < right.NumCols(); colIdx++ {
+			field := builder.Field(int(colIdx))
+			srcCol := right.Column(int(colIdx))
+
+			switch srcCol := srcCol.(type) {
+			case *array.Int64:
+				if intBuilder, ok := field.(*array.Int64Builder); ok {
+					intBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.String:
+				if strBuilder, ok := field.(*array.StringBuilder); ok {
+					strBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.Float64:
+				if floatBuilder, ok := field.(*array.Float64Builder); ok {
+					floatBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			}
+		}
+	}
+
+	return builder.NewRecord(), nil
 }
 
 // filterRecordByColumn 按列值过滤记录

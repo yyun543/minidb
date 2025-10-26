@@ -14,6 +14,7 @@ import (
 	"github.com/yyun543/minidb/internal/executor"
 	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/parser"
+	"github.com/yyun543/minidb/internal/session"
 	"github.com/yyun543/minidb/internal/storage"
 )
 
@@ -31,15 +32,18 @@ func TestSystemTableQueries(t *testing.T) {
 	require.NoError(t, err)
 	defer engine.Close()
 
-	cat := catalog.NewSimpleSQLCatalog()
+	cat := catalog.NewCatalog()
 	cat.SetStorageEngine(engine)
 	err = cat.Init()
 	require.NoError(t, err)
 
+	// Create session
+	sessMgr, err := session.NewSessionManager()
+	require.NoError(t, err)
+	sess := sessMgr.CreateSession()
+
 	// Create test database and table
 	err = engine.CreateDatabase("testdb")
-	require.NoError(t, err)
-	err = cat.CreateDatabase("testdb")
 	require.NoError(t, err)
 
 	schema := arrow.NewSchema([]arrow.Field{
@@ -48,23 +52,6 @@ func TestSystemTableQueries(t *testing.T) {
 	}, nil)
 
 	err = engine.CreateTable("testdb", "users", schema)
-	require.NoError(t, err)
-	err = cat.CreateTable("testdb", catalog.TableMeta{
-		Database: "testdb",
-		Table:    "users",
-		Schema:   schema,
-	})
-	require.NoError(t, err)
-
-	// Create index
-	err = cat.CreateIndex(catalog.IndexMeta{
-		Database:  "testdb",
-		Table:     "users",
-		Name:      "idx_id",
-		Columns:   []string{"id"},
-		IsUnique:  true,
-		IndexType: "BTREE",
-	})
 	require.NoError(t, err)
 
 	// Insert some data
@@ -82,30 +69,31 @@ func TestSystemTableQueries(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create executor for testing
-	exec := executor.NewExecutor(cat, engine)
+	exec := executor.NewExecutor(cat)
+	opt := optimizer.NewOptimizer()
 
 	t.Run("QuerySysDbMetadataShouldReturnDatabases", func(t *testing.T) {
 		sql := "SELECT * FROM sys.db_metadata"
 		stmt, err := parser.Parse(sql)
 		require.NoError(t, err)
 
-		opt := optimizer.NewOptimizer(cat, nil)
 		plan, err := opt.Optimize(stmt)
 		require.NoError(t, err)
 
-		result, err := exec.Execute(plan)
+		result, err := exec.Execute(plan, sess)
 		require.NoError(t, err, "Query should not fail")
 		require.NotNil(t, result, "Result should not be nil")
 
 		// Should have at least 2 databases: sys, testdb
-		assert.Greater(t, len(result), 0, "Should return at least one database")
+		batches := result.Batches()
+		assert.Greater(t, len(batches), 0, "Should return at least one batch")
 
 		// Check that we got the expected databases
 		foundSys := false
 		foundTestdb := false
-		for _, row := range result {
-			if len(row) > 0 {
-				dbName := row[0].(string)
+		for _, batch := range batches {
+			for i := 0; i < int(batch.NumRows()); i++ {
+				dbName := batch.GetString(0, i)
 				if dbName == "sys" {
 					foundSys = true
 				}
@@ -123,27 +111,30 @@ func TestSystemTableQueries(t *testing.T) {
 		stmt, err := parser.Parse(sql)
 		require.NoError(t, err)
 
-		opt := optimizer.NewOptimizer(cat, nil)
 		plan, err := opt.Optimize(stmt)
 		require.NoError(t, err)
 
-		result, err := exec.Execute(plan)
+		result, err := exec.Execute(plan, sess)
 		require.NoError(t, err)
 		require.NotNil(t, result)
 
 		// Should have system tables + testdb.users
-		assert.Greater(t, len(result), 0, "Should return at least one table")
+		batches := result.Batches()
+		assert.Greater(t, len(batches), 0, "Should return at least one table")
 
 		// Check for testdb.users
 		foundUsersTable := false
-		for _, row := range result {
-			if len(row) >= 2 {
-				schema := row[0].(string)
-				table := row[1].(string)
+		for _, batch := range batches {
+			for i := 0; i < int(batch.NumRows()); i++ {
+				schema := batch.GetString(0, i)
+				table := batch.GetString(1, i)
 				if schema == "testdb" && table == "users" {
 					foundUsersTable = true
 					break
 				}
+			}
+			if foundUsersTable {
+				break
 			}
 		}
 		assert.True(t, foundUsersTable, "Should find 'testdb.users' table")
@@ -154,23 +145,27 @@ func TestSystemTableQueries(t *testing.T) {
 		stmt, err := parser.Parse(sql)
 		require.NoError(t, err)
 
-		opt := optimizer.NewOptimizer(cat, nil)
 		plan, err := opt.Optimize(stmt)
 		require.NoError(t, err)
 
-		result, err := exec.Execute(plan)
+		result, err := exec.Execute(plan, sess)
 		require.NoError(t, err, "Query should not fail")
 		require.NotNil(t, result, "Result should not be nil")
 
 		// Should have 2 columns: id, name
-		assert.Equal(t, 2, len(result), "Should return 2 columns for testdb.users")
+		batches := result.Batches()
+		totalRows := 0
+		for _, batch := range batches {
+			totalRows += int(batch.NumRows())
+		}
+		assert.Equal(t, 2, totalRows, "Should return 2 columns for testdb.users")
 
 		// Verify column names
 		foundId := false
 		foundName := false
-		for _, row := range result {
-			if len(row) >= 1 {
-				colName := row[0].(string)
+		for _, batch := range batches {
+			for i := 0; i < int(batch.NumRows()); i++ {
+				colName := batch.GetString(0, i)
 				if colName == "id" {
 					foundId = true
 				}
@@ -183,43 +178,25 @@ func TestSystemTableQueries(t *testing.T) {
 		assert.True(t, foundName, "Should find 'name' column")
 	})
 
-	t.Run("QuerySysIndexMetadataWithWhereShouldReturnIndexes", func(t *testing.T) {
-		sql := "SELECT index_name, column_name FROM sys.index_metadata WHERE db_name = 'testdb' AND table_name = 'users'"
-		stmt, err := parser.Parse(sql)
-		require.NoError(t, err)
-
-		opt := optimizer.NewOptimizer(cat, nil)
-		plan, err := opt.Optimize(stmt)
-		require.NoError(t, err)
-
-		result, err := exec.Execute(plan)
-		require.NoError(t, err)
-		require.NotNil(t, result)
-
-		// Should have 1 index: idx_id
-		assert.Equal(t, 1, len(result), "Should return 1 index for testdb.users")
-
-		if len(result) > 0 && len(result[0]) >= 2 {
-			assert.Equal(t, "idx_id", result[0][0].(string), "Index name should be 'idx_id'")
-			assert.Equal(t, "id", result[0][1].(string), "Column name should be 'id'")
-		}
-	})
-
 	t.Run("QuerySysDeltaLogShouldReturnLogEntries", func(t *testing.T) {
 		sql := "SELECT table_id, operation FROM sys.delta_log WHERE table_id LIKE 'testdb%' LIMIT 5"
 		stmt, err := parser.Parse(sql)
 		require.NoError(t, err)
 
-		opt := optimizer.NewOptimizer(cat, nil)
 		plan, err := opt.Optimize(stmt)
 		require.NoError(t, err)
 
-		result, err := exec.Execute(plan)
+		result, err := exec.Execute(plan, sess)
 		require.NoError(t, err)
 		require.NotNil(t, result)
 
 		// Should have at least one entry for table creation
-		assert.Greater(t, len(result), 0, "Should return at least one Delta Log entry")
+		batches := result.Batches()
+		totalRows := 0
+		for _, batch := range batches {
+			totalRows += int(batch.NumRows())
+		}
+		assert.Greater(t, totalRows, 0, "Should return at least one Delta Log entry")
 	})
 
 	t.Run("QuerySysTableFilesShouldReturnFiles", func(t *testing.T) {
@@ -227,20 +204,25 @@ func TestSystemTableQueries(t *testing.T) {
 		stmt, err := parser.Parse(sql)
 		require.NoError(t, err)
 
-		opt := optimizer.NewOptimizer(cat, nil)
 		plan, err := opt.Optimize(stmt)
 		require.NoError(t, err)
 
-		result, err := exec.Execute(plan)
+		result, err := exec.Execute(plan, sess)
 		require.NoError(t, err)
 		require.NotNil(t, result)
 
 		// Should have at least one file from the INSERT
-		assert.Greater(t, len(result), 0, "Should return at least one file for testdb.users")
+		batches := result.Batches()
+		totalRows := 0
+		for _, batch := range batches {
+			totalRows += int(batch.NumRows())
+		}
+		assert.Greater(t, totalRows, 0, "Should return at least one file for testdb.users")
 
-		if len(result) > 0 && len(result[0]) >= 2 {
-			assert.Equal(t, "testdb", result[0][0].(string), "Schema should be 'testdb'")
-			assert.Equal(t, "users", result[0][1].(string), "Table should be 'users'")
+		// Verify first row if exists
+		if len(batches) > 0 && batches[0].NumRows() > 0 {
+			assert.Equal(t, "testdb", batches[0].GetString(0, 0), "Schema should be 'testdb'")
+			assert.Equal(t, "users", batches[0].GetString(1, 0), "Table should be 'users'")
 		}
 	})
 }

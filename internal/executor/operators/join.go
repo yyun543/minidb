@@ -97,20 +97,22 @@ func (op *Join) cacheAllData() error {
 // buildJoinResult 构建JOIN结果
 func (op *Join) buildJoinResult(leftBatches, rightBatches []*types.Batch) (*types.Batch, error) {
 	// 构建结果schema（左表字段 + 右表字段）
-	var leftRecord, rightRecord arrow.Record
+	var leftSchema, rightSchema *arrow.Schema
 	if len(leftBatches) > 0 {
-		leftRecord = leftBatches[0].Record()
+		leftSchema = leftBatches[0].Record().Schema()
 	}
 	if len(rightBatches) > 0 {
-		rightRecord = rightBatches[0].Record()
+		rightSchema = rightBatches[0].Record().Schema()
 	}
 
-	if leftRecord == nil || rightRecord == nil {
+	if leftSchema == nil || rightSchema == nil {
 		return nil, nil
 	}
 
 	// 合并schema
-	joinSchema := op.mergeSchemas(leftRecord.Schema(), rightRecord.Schema())
+	joinSchema := op.mergeSchemas(leftSchema, rightSchema)
+	leftNumCols := len(leftSchema.Fields())
+	rightNumCols := len(rightSchema.Fields())
 
 	pool := memory.NewGoAllocator()
 	builder := array.NewRecordBuilder(pool, joinSchema)
@@ -120,15 +122,22 @@ func (op *Join) buildJoinResult(leftBatches, rightBatches []*types.Batch) (*type
 	for _, leftBatch := range leftBatches {
 		leftRec := leftBatch.Record()
 		for leftRowIdx := int64(0); leftRowIdx < leftRec.NumRows(); leftRowIdx++ {
+			hasMatch := false
 			for _, rightBatch := range rightBatches {
 				rightRec := rightBatch.Record()
 				for rightRowIdx := int64(0); rightRowIdx < rightRec.NumRows(); rightRowIdx++ {
 					// 检查JOIN条件
 					if op.evaluateJoinCondition(leftRec, leftRowIdx, rightRec, rightRowIdx) {
 						// 合并行数据
-						op.appendJoinedRow(builder, leftRec, leftRowIdx, rightRec, rightRowIdx)
+						op.appendJoinedRow(builder, leftRec, leftRowIdx, rightRec, rightRowIdx, leftSchema, rightSchema)
+						hasMatch = true
 					}
 				}
+			}
+
+			// For LEFT JOIN, if no match found, append left row with NULL for right columns
+			if !hasMatch && op.joinType == "LEFT" {
+				op.appendLeftJoinRow(builder, leftRec, leftRowIdx, leftNumCols, rightNumCols, leftSchema, rightSchema)
 			}
 		}
 	}
@@ -201,50 +210,131 @@ func (op *Join) compareValues(left, right interface{}) bool {
 }
 
 // appendJoinedRow 添加连接后的行到builder
-func (op *Join) appendJoinedRow(builder *array.RecordBuilder, leftRec arrow.Record, leftRowIdx int64, rightRec arrow.Record, rightRowIdx int64) {
+func (op *Join) appendJoinedRow(builder *array.RecordBuilder, leftRec arrow.Record, leftRowIdx int64, rightRec arrow.Record, rightRowIdx int64, leftSchema, rightSchema *arrow.Schema) {
 	fieldIdx := 0
 
-	// 添加左表字段值
-	for colIdx := 0; colIdx < int(leftRec.NumCols()); colIdx++ {
+	// 添加左表字段值 - use schema to determine field count
+	for colIdx := 0; colIdx < len(leftSchema.Fields()); colIdx++ {
 		field := builder.Field(fieldIdx)
-		column := leftRec.Column(colIdx)
 
-		switch col := column.(type) {
-		case *array.Int64:
-			if intBuilder, ok := field.(*array.Int64Builder); ok {
-				intBuilder.Append(col.Value(int(leftRowIdx)))
+		// Check if column exists in current record
+		if colIdx < int(leftRec.NumCols()) {
+			column := leftRec.Column(colIdx)
+
+			appended := false
+			switch col := column.(type) {
+			case *array.Int64:
+				if intBuilder, ok := field.(*array.Int64Builder); ok {
+					intBuilder.Append(col.Value(int(leftRowIdx)))
+					appended = true
+				}
+			case *array.String:
+				if strBuilder, ok := field.(*array.StringBuilder); ok {
+					strBuilder.Append(col.Value(int(leftRowIdx)))
+					appended = true
+				}
+			case *array.Float64:
+				if floatBuilder, ok := field.(*array.Float64Builder); ok {
+					floatBuilder.Append(col.Value(int(leftRowIdx)))
+					appended = true
+				}
 			}
-		case *array.String:
-			if strBuilder, ok := field.(*array.StringBuilder); ok {
-				strBuilder.Append(col.Value(int(leftRowIdx)))
+			if !appended {
+				// Type not handled, append NULL as fallback
+				field.AppendNull()
 			}
-		case *array.Float64:
-			if floatBuilder, ok := field.(*array.Float64Builder); ok {
-				floatBuilder.Append(col.Value(int(leftRowIdx)))
-			}
+		} else {
+			// Column doesn't exist in this batch, append NULL
+			field.AppendNull()
 		}
 		fieldIdx++
 	}
 
-	// 添加右表字段值
-	for colIdx := 0; colIdx < int(rightRec.NumCols()); colIdx++ {
+	// 添加右表字段值 - use schema to determine field count
+	for colIdx := 0; colIdx < len(rightSchema.Fields()); colIdx++ {
 		field := builder.Field(fieldIdx)
-		column := rightRec.Column(colIdx)
 
-		switch col := column.(type) {
-		case *array.Int64:
-			if intBuilder, ok := field.(*array.Int64Builder); ok {
-				intBuilder.Append(col.Value(int(rightRowIdx)))
+		// Check if column exists in current record
+		if colIdx < int(rightRec.NumCols()) {
+			column := rightRec.Column(colIdx)
+
+			appended := false
+			switch col := column.(type) {
+			case *array.Int64:
+				if intBuilder, ok := field.(*array.Int64Builder); ok {
+					intBuilder.Append(col.Value(int(rightRowIdx)))
+					appended = true
+				}
+			case *array.String:
+				if strBuilder, ok := field.(*array.StringBuilder); ok {
+					strBuilder.Append(col.Value(int(rightRowIdx)))
+					appended = true
+				}
+			case *array.Float64:
+				if floatBuilder, ok := field.(*array.Float64Builder); ok {
+					floatBuilder.Append(col.Value(int(rightRowIdx)))
+					appended = true
+				}
 			}
-		case *array.String:
-			if strBuilder, ok := field.(*array.StringBuilder); ok {
-				strBuilder.Append(col.Value(int(rightRowIdx)))
+			if !appended {
+				// Type not handled, append NULL as fallback
+				field.AppendNull()
 			}
-		case *array.Float64:
-			if floatBuilder, ok := field.(*array.Float64Builder); ok {
-				floatBuilder.Append(col.Value(int(rightRowIdx)))
-			}
+		} else {
+			// Column doesn't exist in this batch, append NULL
+			field.AppendNull()
 		}
+		fieldIdx++
+	}
+}
+
+// appendLeftJoinRow appends left row with NULL values for right columns (for LEFT JOIN with no match)
+func (op *Join) appendLeftJoinRow(builder *array.RecordBuilder, leftRec arrow.Record, leftRowIdx int64, leftNumCols, rightNumCols int, leftSchema, rightSchema *arrow.Schema) {
+	fieldIdx := 0
+
+	// 添加左表字段值 - use schema to determine field count
+	for colIdx := 0; colIdx < leftNumCols; colIdx++ {
+		field := builder.Field(fieldIdx)
+
+		// Check if column exists in current record
+		if colIdx < int(leftRec.NumCols()) {
+			column := leftRec.Column(colIdx)
+
+			appended := false
+			switch col := column.(type) {
+			case *array.Int64:
+				if intBuilder, ok := field.(*array.Int64Builder); ok {
+					intBuilder.Append(col.Value(int(leftRowIdx)))
+					appended = true
+				}
+			case *array.String:
+				if strBuilder, ok := field.(*array.StringBuilder); ok {
+					strBuilder.Append(col.Value(int(leftRowIdx)))
+					appended = true
+				}
+			case *array.Float64:
+				if floatBuilder, ok := field.(*array.Float64Builder); ok {
+					floatBuilder.Append(col.Value(int(leftRowIdx)))
+					appended = true
+				}
+			}
+			if !appended {
+				// Type not handled, append NULL as fallback
+				field.AppendNull()
+			}
+		} else {
+			// Column doesn't exist in this batch, append NULL
+			field.AppendNull()
+		}
+		fieldIdx++
+	}
+
+	// 添加右表字段为NULL - use schema to determine field count and types
+	for colIdx := 0; colIdx < rightNumCols; colIdx++ {
+		field := builder.Field(fieldIdx)
+
+		// Append NULL - must always succeed
+		field.AppendNull()
 		fieldIdx++
 	}
 }

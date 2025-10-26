@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -20,15 +21,34 @@ import (
 
 // ParquetEngine Parquet 存储引擎实现
 type ParquetEngine struct {
-	basePath    string
-	objectStore ObjectStore
-	deltaLog    delta.LogInterface
-	schemas     map[string]*arrow.Schema // 表 schema 缓存
-	mu          sync.RWMutex
+	basePath          string
+	objectStore       ObjectStore
+	deltaLog          delta.LogInterface
+	schemas           map[string]*arrow.Schema // 表 schema 缓存
+	mu                sync.RWMutex
+	useOptimisticLock bool // 是否使用乐观并发控制
+	maxRetries        int  // 冲突重试次数
+}
+
+// EngineOption 引擎配置选项
+type EngineOption func(*ParquetEngine)
+
+// WithOptimisticLock 启用乐观并发控制
+func WithOptimisticLock(enabled bool) EngineOption {
+	return func(pe *ParquetEngine) {
+		pe.useOptimisticLock = enabled
+	}
+}
+
+// WithMaxRetries 设置最大重试次数
+func WithMaxRetries(maxRetries int) EngineOption {
+	return func(pe *ParquetEngine) {
+		pe.maxRetries = maxRetries
+	}
 }
 
 // NewParquetEngine 创建 Parquet 存储引擎
-func NewParquetEngine(basePath string) (*ParquetEngine, error) {
+func NewParquetEngine(basePath string, opts ...EngineOption) (*ParquetEngine, error) {
 	// 创建本地对象存储
 	objStore, err := objectstore.NewLocalStore(basePath)
 	if err != nil {
@@ -36,13 +56,27 @@ func NewParquetEngine(basePath string) (*ParquetEngine, error) {
 	}
 
 	engine := &ParquetEngine{
-		basePath:    basePath,
-		objectStore: objStore,
-		schemas:     make(map[string]*arrow.Schema),
+		basePath:          basePath,
+		objectStore:       objStore,
+		schemas:           make(map[string]*arrow.Schema),
+		useOptimisticLock: false, // 默认使用悲观锁（向后兼容）
+		maxRetries:        5,     // 默认重试5次
 	}
 
-	// 暂时使用内存版本，Open() 中会初始化持久化版本
-	engine.deltaLog = delta.NewDeltaLog()
+	// 应用配置选项
+	for _, opt := range opts {
+		opt(engine)
+	}
+
+	// 根据配置选择Delta Log实现
+	if engine.useOptimisticLock {
+		// 使用乐观并发控制的Delta Log
+		// objStore实际是*objectstore.LocalStore，它实现了ConditionalObjectStore接口
+		engine.deltaLog = delta.NewOptimisticDeltaLog(objStore, basePath)
+	} else {
+		// 使用传统的悲观锁Delta Log
+		engine.deltaLog = delta.NewDeltaLog()
+	}
 
 	return engine, nil
 }
@@ -64,6 +98,10 @@ func (pe *ParquetEngine) Open() error {
 	// 3. 设置持久化回调（将新 entries 写入 sys.delta_log 表）
 	if inMemoryLog, ok := pe.deltaLog.(*delta.DeltaLog); ok {
 		inMemoryLog.SetPersistenceCallback(pe.persistDeltaLogEntry)
+		// 设置checkpoint回调（将snapshot序列化到Parquet文件）
+		inMemoryLog.SetCheckpointCallback(func(tableID string, version int64) error {
+			return pe.CreateCheckpoint(tableID, version)
+		})
 	}
 
 	// 4. 从 Delta Log 恢复表的 schema
@@ -122,10 +160,12 @@ func (pe *ParquetEngine) persistDeltaLogEntry(entry *delta.LogEntry) error {
 		builder.Field(8).(*array.StringBuilder).Append("") // max_values
 		builder.Field(9).(*array.StringBuilder).Append("") // null_counts
 		builder.Field(10).(*array.BooleanBuilder).Append(entry.DataChange)
-		builder.Field(11).AppendNull() // deletion_timestamp
-		builder.Field(12).AppendNull() // schema_json
-		builder.Field(13).AppendNull() // index_json
-		builder.Field(14).AppendNull() // index_operation
+		builder.Field(11).AppendNull()                                   // deletion_timestamp
+		builder.Field(12).AppendNull()                                   // schema_json
+		builder.Field(13).AppendNull()                                   // index_json
+		builder.Field(14).AppendNull()                                   // index_operation
+		builder.Field(15).(*array.BooleanBuilder).Append(entry.IsDelta)  // is_delta
+		builder.Field(16).(*array.StringBuilder).Append(entry.DeltaType) // delta_type
 
 	case delta.OpRemove:
 		builder.Field(4).(*array.StringBuilder).Append(entry.FilePath)
@@ -136,6 +176,8 @@ func (pe *ParquetEngine) persistDeltaLogEntry(entry *delta.LogEntry) error {
 		builder.Field(12).AppendNull() // schema_json
 		builder.Field(13).AppendNull() // index_json
 		builder.Field(14).AppendNull() // index_operation
+		builder.Field(15).AppendNull() // is_delta
+		builder.Field(16).AppendNull() // delta_type
 
 	case delta.OpMetadata:
 		for i := 4; i < 12; i++ {
@@ -153,6 +195,8 @@ func (pe *ParquetEngine) persistDeltaLogEntry(entry *delta.LogEntry) error {
 		builder.Field(12).(*array.StringBuilder).Append(entry.SchemaJSON)
 		builder.Field(13).(*array.StringBuilder).Append(entry.IndexJSON)
 		builder.Field(14).(*array.StringBuilder).Append(entry.IndexOperation)
+		builder.Field(15).AppendNull() // is_delta
+		builder.Field(16).AppendNull() // delta_type
 	}
 
 	record := builder.NewRecord()
@@ -181,6 +225,8 @@ func createDeltaLogSchema() *arrow.Schema {
 		{Name: "schema_json", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "index_json", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "index_operation", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "is_delta", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "delta_type", Type: arrow.BinaryTypes.String, Nullable: true},
 	}, nil)
 }
 
@@ -421,6 +467,14 @@ func (pe *ParquetEngine) parseDeltaLogEntry(record arrow.Record, rowIdx int) del
 			if arr, ok := col.(*array.String); ok {
 				entry.IndexOperation = arr.Value(rowIdx)
 			}
+		case "is_delta":
+			if arr, ok := col.(*array.Boolean); ok {
+				entry.IsDelta = arr.Value(rowIdx)
+			}
+		case "delta_type":
+			if arr, ok := col.(*array.String); ok {
+				entry.DeltaType = arr.Value(rowIdx)
+			}
 		}
 	}
 
@@ -491,8 +545,21 @@ func (pe *ParquetEngine) CreateDatabase(name string) error {
 
 	// 创建数据库目录
 	dbPath := filepath.Join(pe.basePath, name)
+
+	// 先创建目录
+	if err := os.MkdirAll(dbPath, 0755); err != nil {
+		return fmt.Errorf("failed to create database directory: %w", err)
+	}
+
+	// Sync目录确保元数据持久化（P0改进：目录fsync）
+	if dir, err := os.Open(dbPath); err == nil {
+		dir.Sync()
+		dir.Close()
+	}
+
+	// 创建.db标记文件
 	if err := pe.objectStore.Put(filepath.Join(dbPath, ".db"), []byte{}); err != nil {
-		return fmt.Errorf("failed to create database: %w", err)
+		return fmt.Errorf("failed to create database marker: %w", err)
 	}
 
 	return nil
@@ -554,10 +621,21 @@ func (pe *ParquetEngine) DropTable(db, table string) error {
 		return fmt.Errorf("failed to get snapshot: %w", err)
 	}
 
+	// Mark all files as REMOVE
 	for _, file := range snapshot.Files {
 		if err := pe.deltaLog.AppendRemove(tableID, file.Path); err != nil {
 			logger.Warn("Failed to remove file", zap.String("file", file.Path), zap.Error(err))
 		}
+	}
+
+	// IMPORTANT: If table has no files (empty table), we still need to mark it as deleted
+	// Write a special REMOVE entry to mark the table as dropped
+	if len(snapshot.Files) == 0 {
+		// Use a special marker path to indicate table deletion
+		if err := pe.deltaLog.AppendRemove(tableID, fmt.Sprintf("_table_dropped_marker_%s", tableID)); err != nil {
+			logger.Warn("Failed to write table deletion marker", zap.String("table", tableID), zap.Error(err))
+		}
+		logger.Info("Empty table deletion marker written", zap.String("table", tableID))
 	}
 
 	logger.Info("Table dropped", zap.String("table", tableID))
@@ -618,12 +696,36 @@ func (pe *ParquetEngine) Scan(ctx context.Context, db, table string, filters []F
 	// 文件级过滤 (Zone Maps)
 	selectedFiles := pe.filterFilesByStats(snapshot.Files, filters)
 
+	// Separate base files and delta files
+	baseFiles := make([]delta.FileInfo, 0)
+	deltaFiles := make([]delta.FileInfo, 0)
+	for _, file := range selectedFiles {
+		// Debug: log each file's IsDelta status
+		logger.Debug("File classification",
+			zap.String("path", file.Path),
+			zap.Bool("is_delta", file.IsDelta),
+			zap.String("delta_type", file.DeltaType))
+
+		if file.IsDelta {
+			deltaFiles = append(deltaFiles, file)
+		} else {
+			baseFiles = append(baseFiles, file)
+		}
+	}
+
 	logger.Info("Files selected for scan",
 		zap.Int("total", len(snapshot.Files)),
-		zap.Int("selected", len(selectedFiles)))
+		zap.Int("selected", len(selectedFiles)),
+		zap.Int("base_files", len(baseFiles)),
+		zap.Int("delta_files", len(deltaFiles)))
 
-	// 创建迭代器
-	return NewParquetIterator(selectedFiles, filters)
+	// Use Merge-on-Read iterator if there are delta files
+	if len(deltaFiles) > 0 {
+		return NewMergeOnReadIterator(baseFiles, deltaFiles, filters)
+	}
+
+	// Standard iterator for base files only
+	return NewParquetIterator(baseFiles, filters)
 }
 
 // Write 写入数据
@@ -663,56 +765,6 @@ func (pe *ParquetEngine) Write(ctx context.Context, db, table string, batch arro
 		zap.Int64("rows", stats.RowCount))
 
 	return nil
-}
-
-// updateRecord applies updates to a record based on filters
-func (pe *ParquetEngine) updateRecord(record arrow.Record, filters []Filter, updates map[string]interface{}, schema *arrow.Schema) (arrow.Record, int64) {
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
-
-	updatedCount := int64(0)
-	numRows := int(record.NumRows())
-
-	// Process each row
-	for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-		// Check if row matches filters
-		matches := pe.matchesFilters(record, rowIdx, filters)
-
-		// Track if this row was updated
-		rowUpdated := false
-
-		// Copy/update row
-		for colIdx := 0; colIdx < int(record.NumCols()); colIdx++ {
-			field := schema.Field(colIdx)
-			col := record.Column(colIdx)
-
-			var value interface{}
-
-			// If row matches filters and column has update, use updated value
-			if matches {
-				if updatedVal, hasUpdate := updates[field.Name]; hasUpdate {
-					value = updatedVal
-					rowUpdated = true
-				} else {
-					value = pe.getValueFromColumn(col, rowIdx)
-				}
-			} else {
-				value = pe.getValueFromColumn(col, rowIdx)
-			}
-
-			// Append value to builder
-			pe.appendValueToBuilder(builder.Field(colIdx), value, field.Type)
-		}
-
-		// Count this row if it was updated
-		if rowUpdated {
-			updatedCount++
-		}
-	}
-
-	// Always return the record (with or without updates)
-	return builder.NewRecord(), updatedCount
 }
 
 // matchesFilters checks if a row matches all filters
@@ -881,259 +933,16 @@ func (pe *ParquetEngine) toFloat64(v interface{}) float64 {
 }
 
 // Update 更新数据 (Copy-on-Write)
+// Update 更新数据 (使用 Merge-on-Read)
 func (pe *ParquetEngine) Update(ctx context.Context, db, table string, filters []Filter, updates map[string]interface{}) (int64, error) {
-	tableID := fmt.Sprintf("%s.%s", db, table)
-	logger.Info("Updating table with Copy-on-Write", zap.String("table", tableID))
-
-	// 1. Read all current data
-	iterator, err := pe.Scan(ctx, db, table, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to scan table: %w", err)
-	}
-	defer iterator.Close()
-
-	// 2. Get table schema from first record or from schemas map
-	var schema *arrow.Schema
-	if s, err := pe.GetTableSchema(db, table); err == nil {
-		schema = s
-	}
-
-	// 3. Collect all records and apply updates (Copy-on-Write)
-	updatedRecords := make([]arrow.Record, 0)
-	updatedCount := int64(0)
-
-	for iterator.Next() {
-		record := iterator.Record()
-
-		// Infer schema from first record if not already set
-		if schema == nil {
-			schema = record.Schema()
-		}
-
-		// Apply updates to matching rows
-		updatedRecord, count := pe.updateRecord(record, filters, updates, schema)
-		if updatedRecord != nil {
-			updatedRecords = append(updatedRecords, updatedRecord)
-			updatedCount += count
-		}
-	}
-
-	if err := iterator.Err(); err != nil {
-		// Clean up
-		for _, rec := range updatedRecords {
-			rec.Release()
-		}
-		return 0, fmt.Errorf("iteration error: %w", err)
-	}
-
-	// 4. Mark old files as REMOVE in Delta Log
-	snapshot, err := pe.deltaLog.GetSnapshot(tableID, -1)
-	if err != nil {
-		for _, rec := range updatedRecords {
-			rec.Release()
-		}
-		return 0, fmt.Errorf("failed to get snapshot: %w", err)
-	}
-
-	for _, file := range snapshot.Files {
-		if err := pe.deltaLog.AppendRemove(tableID, file.Path); err != nil {
-			for _, rec := range updatedRecords {
-				rec.Release()
-			}
-			return 0, fmt.Errorf("failed to mark file for removal: %w", err)
-		}
-	}
-
-	// 5. Write updated records as new Parquet files
-	for i, record := range updatedRecords {
-		// Generate new file name
-		fileName := fmt.Sprintf("part-%d-%d.parquet", time.Now().UnixNano(), i)
-		filePath := filepath.Join(pe.basePath, db, table, fileName)
-
-		// Write to Parquet
-		stats, err := parquet.WriteArrowBatch(filePath, record)
-		if err != nil {
-			record.Release()
-			return 0, fmt.Errorf("failed to write updated parquet file: %w", err)
-		}
-
-		// Add to Delta Log
-		parquetFile := &delta.ParquetFile{
-			Path:     filePath,
-			Size:     stats.FileSize, // 使用从 parquet writer 返回的实际文件大小
-			RowCount: stats.RowCount,
-			Stats: &delta.FileStats{
-				RowCount:   stats.RowCount,
-				FileSize:   stats.FileSize, // 使用实际文件大小
-				MinValues:  stats.MinValues,
-				MaxValues:  stats.MaxValues,
-				NullCounts: stats.NullCounts,
-			},
-		}
-
-		if err := pe.deltaLog.AppendAdd(tableID, parquetFile); err != nil {
-			record.Release()
-			return 0, fmt.Errorf("failed to append to delta log: %w", err)
-		}
-
-		record.Release()
-	}
-
-	logger.Info("Update completed with Copy-on-Write",
-		zap.String("table", tableID),
-		zap.Int64("updated_rows", updatedCount))
-
-	return updatedCount, nil
+	// 直接使用 Merge-on-Read 实现
+	return pe.UpdateMergeOnRead(ctx, db, table, filters, updates)
 }
 
-// Delete 删除数据 (Delta Log integration)
+// Delete 删除数据 (使用 Merge-on-Read)
 func (pe *ParquetEngine) Delete(ctx context.Context, db, table string, filters []Filter) (int64, error) {
-	tableID := fmt.Sprintf("%s.%s", db, table)
-	logger.Info("Deleting from table with Delta Log integration", zap.String("table", tableID))
-
-	// 1. Read all current data
-	iterator, err := pe.Scan(ctx, db, table, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to scan table: %w", err)
-	}
-	defer iterator.Close()
-
-	// 2. Get table schema from first record or from schemas map
-	var schema *arrow.Schema
-	if s, err := pe.GetTableSchema(db, table); err == nil {
-		schema = s
-	}
-
-	// 3. Collect records excluding deleted rows
-	filteredRecords := make([]arrow.Record, 0)
-	deletedCount := int64(0)
-
-	for iterator.Next() {
-		record := iterator.Record()
-
-		// Infer schema from first record if not already set
-		if schema == nil {
-			schema = record.Schema()
-		}
-
-		// Filter out rows that match deletion criteria
-		filteredRecord, count := pe.filterRecord(record, filters, schema)
-		if filteredRecord != nil && filteredRecord.NumRows() > 0 {
-			filteredRecords = append(filteredRecords, filteredRecord)
-		}
-		deletedCount += count
-	}
-
-	if err := iterator.Err(); err != nil {
-		// Clean up
-		for _, rec := range filteredRecords {
-			rec.Release()
-		}
-		return 0, fmt.Errorf("iteration error: %w", err)
-	}
-
-	// If no rows were deleted, return early
-	if deletedCount == 0 {
-		for _, rec := range filteredRecords {
-			rec.Release()
-		}
-		logger.Info("DELETE completed - no matching rows",
-			zap.String("table", tableID),
-			zap.Int64("deleted_rows", 0))
-		return 0, nil
-	}
-
-	// 4. Mark old files as REMOVE in Delta Log
-	snapshot, err := pe.deltaLog.GetSnapshot(tableID, -1)
-	if err != nil {
-		for _, rec := range filteredRecords {
-			rec.Release()
-		}
-		return 0, fmt.Errorf("failed to get snapshot: %w", err)
-	}
-
-	for _, file := range snapshot.Files {
-		if err := pe.deltaLog.AppendRemove(tableID, file.Path); err != nil {
-			for _, rec := range filteredRecords {
-				rec.Release()
-			}
-			return 0, fmt.Errorf("failed to mark file for removal: %w", err)
-		}
-	}
-
-	// 5. Write filtered records as new Parquet files
-	for i, record := range filteredRecords {
-		// Generate new file name
-		fileName := fmt.Sprintf("part-%d-%d.parquet", time.Now().UnixNano(), i)
-		filePath := filepath.Join(pe.basePath, db, table, fileName)
-
-		// Write to Parquet
-		stats, err := parquet.WriteArrowBatch(filePath, record)
-		if err != nil {
-			record.Release()
-			return 0, fmt.Errorf("failed to write filtered parquet file: %w", err)
-		}
-
-		// Add to Delta Log
-		parquetFile := &delta.ParquetFile{
-			Path:     filePath,
-			Size:     stats.FileSize, // 使用从 parquet writer 返回的实际文件大小
-			RowCount: stats.RowCount,
-			Stats: &delta.FileStats{
-				RowCount:   stats.RowCount,
-				FileSize:   stats.FileSize, // 使用实际文件大小
-				MinValues:  stats.MinValues,
-				MaxValues:  stats.MaxValues,
-				NullCounts: stats.NullCounts,
-			},
-		}
-
-		if err := pe.deltaLog.AppendAdd(tableID, parquetFile); err != nil {
-			record.Release()
-			return 0, fmt.Errorf("failed to append to delta log: %w", err)
-		}
-
-		record.Release()
-	}
-
-	logger.Info("DELETE completed with Delta Log integration",
-		zap.String("table", tableID),
-		zap.Int64("deleted_rows", deletedCount))
-
-	return deletedCount, nil
-}
-
-// filterRecord removes rows that match the filters
-func (pe *ParquetEngine) filterRecord(record arrow.Record, filters []Filter, schema *arrow.Schema) (arrow.Record, int64) {
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
-
-	deletedCount := int64(0)
-	numRows := int(record.NumRows())
-
-	// Process each row
-	for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-		// Check if row matches filters (should be deleted)
-		matches := pe.matchesFilters(record, rowIdx, filters)
-
-		if matches {
-			// Skip this row (delete it)
-			deletedCount++
-			continue
-		}
-
-		// Keep this row - copy to builder
-		for colIdx := 0; colIdx < int(record.NumCols()); colIdx++ {
-			col := record.Column(colIdx)
-			field := schema.Field(colIdx)
-			value := pe.getValueFromColumn(col, rowIdx)
-			pe.appendValueToBuilder(builder.Field(colIdx), value, field.Type)
-		}
-	}
-
-	// Return the filtered record
-	return builder.NewRecord(), deletedCount
+	// 直接使用 Merge-on-Read 实现
+	return pe.DeleteMergeOnRead(ctx, db, table, filters)
 }
 
 // BeginTransaction 开始事务
@@ -1198,6 +1007,8 @@ func (pe *ParquetEngine) generateFilePath(db, table string) string {
 	return filepath.Join(pe.basePath, db, table, "data", filename)
 }
 
+// filterFilesByStats 使用文件级统计信息进行数据跳过 (Zone Maps)
+// 支持所有比较操作符: =, >, <, >=, <=, IN
 func (pe *ParquetEngine) filterFilesByStats(files []delta.FileInfo, filters []Filter) []delta.FileInfo {
 	if len(filters) == 0 {
 		return files
@@ -1209,22 +1020,64 @@ func (pe *ParquetEngine) filterFilesByStats(files []delta.FileInfo, filters []Fi
 		skip := false
 
 		for _, filter := range filters {
-			min, ok := file.MinValues[filter.Column]
-			if !ok {
+			min, hasMin := file.MinValues[filter.Column]
+			max, hasMax := file.MaxValues[filter.Column]
+
+			// 如果没有统计信息，不能跳过该文件
+			if !hasMin || !hasMax {
 				continue
 			}
 
-			max, ok := file.MaxValues[filter.Column]
-			if !ok {
-				continue
-			}
-
-			// Zone Map 过滤
-			if filter.Operator == "=" {
+			// 根据操作符类型进行文件级过滤
+			switch filter.Operator {
+			case "=":
+				// 等值过滤: 值必须在 [min, max] 范围内
 				if !valueInRange(filter.Value, min, max) {
 					skip = true
-					break
 				}
+
+			case ">":
+				// 大于过滤: 如果 filterValue >= max, 跳过该文件
+				if compareValues(filter.Value, max) >= 0 {
+					skip = true
+				}
+
+			case "<":
+				// 小于过滤: 如果 filterValue <= min, 跳过该文件
+				if compareValues(filter.Value, min) <= 0 {
+					skip = true
+				}
+
+			case ">=":
+				// 大于等于过滤: 如果 filterValue > max, 跳过该文件
+				if compareValues(filter.Value, max) > 0 {
+					skip = true
+				}
+
+			case "<=":
+				// 小于等于过滤: 如果 filterValue < min, 跳过该文件
+				if compareValues(filter.Value, min) < 0 {
+					skip = true
+				}
+
+			case "IN":
+				// IN 过滤: 如果所有值都不在 [min, max] 范围内, 跳过该文件
+				if len(filter.Values) > 0 {
+					allOutOfRange := true
+					for _, val := range filter.Values {
+						if valueInRange(val, min, max) {
+							allOutOfRange = false
+							break
+						}
+					}
+					if allOutOfRange {
+						skip = true
+					}
+				}
+			}
+
+			if skip {
+				break
 			}
 		}
 
@@ -1236,9 +1089,108 @@ func (pe *ParquetEngine) filterFilesByStats(files []delta.FileInfo, filters []Fi
 	return selected
 }
 
+// valueInRange 检查值是否在范围 [min, max] 内
 func valueInRange(val, min, max interface{}) bool {
-	// 简化实现
-	return true
+	// 值必须 >= min 且 <= max
+	return compareValues(val, min) >= 0 && compareValues(val, max) <= 0
+}
+
+// compareValues 比较两个值
+// 返回: -1 (val < other), 0 (val == other), 1 (val > other)
+func compareValues(val, other interface{}) int {
+	// 处理nil
+	if val == nil && other == nil {
+		return 0
+	}
+	if val == nil {
+		return -1
+	}
+	if other == nil {
+		return 1
+	}
+
+	// Int64 比较
+	if v1, ok1 := toInt64(val); ok1 {
+		if v2, ok2 := toInt64(other); ok2 {
+			if v1 < v2 {
+				return -1
+			} else if v1 > v2 {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Float64 比较
+	if v1, ok1 := toFloat64(val); ok1 {
+		if v2, ok2 := toFloat64(other); ok2 {
+			if v1 < v2 {
+				return -1
+			} else if v1 > v2 {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// String 比较
+	if v1, ok1 := val.(string); ok1 {
+		if v2, ok2 := other.(string); ok2 {
+			if v1 < v2 {
+				return -1
+			} else if v1 > v2 {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// 不支持的类型，默认返回0
+	return 0
+}
+
+// toInt64 尝试转换为int64
+func toInt64(val interface{}) (int64, bool) {
+	switch v := val.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int16:
+		return int64(v), true
+	case int8:
+		return int64(v), true
+	case uint64:
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint16:
+		return int64(v), true
+	case uint8:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+// toFloat64 尝试转换为float64
+func toFloat64(val interface{}) (float64, bool) {
+	switch v := val.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	default:
+		return 0, false
+	}
 }
 
 // ParquetTransaction Parquet 事务实现

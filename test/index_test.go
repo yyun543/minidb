@@ -280,8 +280,13 @@ func TestIndexParser(t *testing.T) {
 
 // TestIndexCatalogIntegration tests index metadata management in catalog
 func TestIndexCatalogIntegration(t *testing.T) {
+	// 清理测试数据
+	testDir := "./test_data/index_catalog_test"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
 	// v2.0 Parquet engine
-	storageEngine, err := storage.NewParquetEngine("./test_data/index_catalog_test")
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	require.NoError(t, err)
 	defer storageEngine.Close()
 
@@ -296,8 +301,24 @@ func TestIndexCatalogIntegration(t *testing.T) {
 	}
 
 	t.Run("CreateAndGetIndex", func(t *testing.T) {
-		// First create a table
+		// First create database and table
 		err := cat.CreateDatabase("testdb")
+		require.NoError(t, err)
+
+		// Create table through catalog
+		schema := arrow.NewSchema([]arrow.Field{
+			{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "email", Type: arrow.BinaryTypes.String},
+		}, nil)
+
+		tableMeta := catalog.TableMeta{
+			Database:   "testdb",
+			Table:      "users",
+			ChunkCount: 0,
+			Schema:     schema,
+		}
+
+		err = cat.CreateTable("testdb", tableMeta)
 		require.NoError(t, err)
 
 		// Create index metadata
@@ -322,11 +343,11 @@ func TestIndexCatalogIntegration(t *testing.T) {
 	})
 
 	t.Run("GetAllIndexesForTable", func(t *testing.T) {
-		// Create multiple indexes
+		// Create multiple indexes (use existing columns from the table)
 		indexes := []catalog.IndexMeta{
-			{Database: "testdb", Table: "users", Name: "idx1", Columns: []string{"col1"}, IsUnique: false, IndexType: "BTREE"},
-			{Database: "testdb", Table: "users", Name: "idx2", Columns: []string{"col2"}, IsUnique: true, IndexType: "BTREE"},
-			{Database: "testdb", Table: "users", Name: "idx3", Columns: []string{"col1", "col2"}, IsUnique: false, IndexType: "BTREE"},
+			{Database: "testdb", Table: "users", Name: "idx1", Columns: []string{"id"}, IsUnique: false, IndexType: "BTREE"},
+			{Database: "testdb", Table: "users", Name: "idx2", Columns: []string{"email"}, IsUnique: true, IndexType: "BTREE"},
+			{Database: "testdb", Table: "users", Name: "idx3", Columns: []string{"id", "email"}, IsUnique: false, IndexType: "BTREE"},
 		}
 
 		for _, idx := range indexes {
@@ -341,12 +362,12 @@ func TestIndexCatalogIntegration(t *testing.T) {
 	})
 
 	t.Run("DropIndex", func(t *testing.T) {
-		// Create index
+		// Create index (use existing column)
 		indexMeta := catalog.IndexMeta{
 			Database:  "testdb",
 			Table:     "users",
 			Name:      "idx_to_drop",
-			Columns:   []string{"name"},
+			Columns:   []string{"id"},
 			IsUnique:  false,
 			IndexType: "BTREE",
 		}

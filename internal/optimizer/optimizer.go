@@ -118,6 +118,8 @@ func (o *Optimizer) buildPlan(node parser.Node) (*Plan, error) {
 		return o.buildShowIndexesPlan(n)
 	case *parser.ExplainStmt:
 		return o.buildExplainPlan(n)
+	case *parser.AnalyzeStmt:
+		return o.buildAnalyzePlan(n)
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", node)
 	}
@@ -430,6 +432,17 @@ func (o *Optimizer) buildExplainPlan(stmt *parser.ExplainStmt) (*Plan, error) {
 		Type: ExplainPlan,
 		Properties: &ExplainProperties{
 			Query: queryPlan,
+		},
+	}, nil
+}
+
+// buildAnalyzePlan 构建ANALYZE TABLE语句的查询计划
+func (o *Optimizer) buildAnalyzePlan(stmt *parser.AnalyzeStmt) (*Plan, error) {
+	return &Plan{
+		Type: AnalyzePlan,
+		Properties: &AnalyzeProperties{
+			Table:   stmt.Table,
+			Columns: stmt.Columns,
 		},
 	}, nil
 }

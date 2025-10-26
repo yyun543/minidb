@@ -180,6 +180,7 @@ utilityStatement
  | showTables
  | showIndexes
  | explainStatement
+ | analyzeStatement
  ;
 
 // DDL规则
@@ -354,6 +355,14 @@ showIndexes
 
 explainStatement
  : EXPLAIN selectStatement
+ ;
+
+analyzeStatement
+ : ANALYZE TABLE tableName (LEFT_PAREN columnList RIGHT_PAREN)?
+ ;
+
+columnList
+ : identifier (COMMA identifier)*
  ;
 
 // 辅助规则
