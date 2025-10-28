@@ -883,6 +883,12 @@ func (pe *ParquetEngine) compareValue(colValue interface{}, operator string, fil
 		return false
 	}
 
+	// Special handling for boolean comparisons
+	if boolVal, ok := colValue.(bool); ok {
+		logger.Debug("Detected boolean column value, calling compareBooleans", zap.Bool("colValue", boolVal))
+		return pe.compareBooleans(boolVal, filterValue, operator)
+	}
+
 	switch operator {
 	case "=", "==":
 		return fmt.Sprintf("%v", colValue) == fmt.Sprintf("%v", filterValue)
@@ -899,6 +905,68 @@ func (pe *ParquetEngine) compareValue(colValue interface{}, operator string, fil
 	default:
 		return false
 	}
+}
+
+// compareBooleans compares a boolean column value with a filter value
+// Handles: true, false, 1, 0, "true", "false", "1", "0"
+func (pe *ParquetEngine) compareBooleans(colValue bool, filterValue interface{}, operator string) bool {
+	logger.Debug("compareBooleans called",
+		zap.Bool("colValue", colValue),
+		zap.Any("filterValue", filterValue),
+		zap.String("filterValueType", fmt.Sprintf("%T", filterValue)),
+		zap.String("operator", operator))
+
+	// Convert filter value to boolean
+	var filterBool bool
+	switch v := filterValue.(type) {
+	case bool:
+		filterBool = v
+		logger.Debug("Filter value is bool", zap.Bool("value", v))
+	case int64:
+		filterBool = v != 0
+		logger.Debug("Filter value is int64", zap.Int64("value", v), zap.Bool("convertedToBool", filterBool))
+	case int:
+		filterBool = v != 0
+		logger.Debug("Filter value is int", zap.Int("value", v), zap.Bool("convertedToBool", filterBool))
+	case int32:
+		filterBool = v != 0
+		logger.Debug("Filter value is int32", zap.Int32("value", v), zap.Bool("convertedToBool", filterBool))
+	case string:
+		// Handle string representations: "true", "1", "t", "T" -> true
+		switch v {
+		case "true", "1", "t", "T", "TRUE":
+			filterBool = true
+		case "false", "0", "f", "F", "FALSE":
+			filterBool = false
+		default:
+			logger.Debug("Unknown string boolean value", zap.String("value", v))
+			return false
+		}
+		logger.Debug("Filter value is string", zap.String("value", v), zap.Bool("convertedToBool", filterBool))
+	default:
+		logger.Debug("Unknown filter value type", zap.String("type", fmt.Sprintf("%T", filterValue)))
+		return false
+	}
+
+	// Compare booleans
+	result := false
+	switch operator {
+	case "=", "==":
+		result = colValue == filterBool
+	case "!=", "<>":
+		result = colValue != filterBool
+	default:
+		logger.Debug("Unknown operator", zap.String("operator", operator))
+		return false
+	}
+
+	logger.Debug("Boolean comparison result",
+		zap.Bool("colValue", colValue),
+		zap.Bool("filterBool", filterBool),
+		zap.String("operator", operator),
+		zap.Bool("result", result))
+
+	return result
 }
 
 // compareNumeric compares two numeric values

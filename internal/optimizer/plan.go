@@ -191,9 +191,10 @@ func (fp *FilterProperties) Explain() string {
 
 // OrderKey 定义排序键
 type OrderKey struct {
-	Column    string // 排序列
-	Table     string // 排序表
-	Direction string // 排序方向 (ASC/DESC)
+	Column     string     // 排序列 (如果是简单列引用)
+	Table      string     // 排序表
+	Direction  string     // 排序方向 (ASC/DESC)
+	Expression Expression // 排序表达式 (如果是表达式如 price * quantity)
 }
 
 // OrderByProperties 用于 ORDER BY 排序计划
@@ -216,12 +217,16 @@ func (lp *LimitProperties) Explain() string {
 
 // InsertProperties 用于 INSERT 计划
 type InsertProperties struct {
-	Table   string       // 表名
-	Columns []string     // 列名列表
-	Values  []Expression // 插入数据
+	Table   string         // 表名
+	Columns []string       // 列名列表
+	Values  []Expression   // 插入数据 (单行，向后兼容)
+	Rows    [][]Expression // 多行插入数据 (新增，如果非空则使用此字段)
 }
 
 func (ip *InsertProperties) Explain() string {
+	if len(ip.Rows) > 0 {
+		return fmt.Sprintf("Table: %s, Columns: %v, Rows: %d", ip.Table, ip.Columns, len(ip.Rows))
+	}
 	return fmt.Sprintf("Table: %s, Columns: %v, Values: %v", ip.Table, ip.Columns, ip.Values)
 }
 
@@ -365,7 +370,7 @@ func (p *CreateDatabaseProperties) Explain() string {
 // CreateTableProperties 用于 CREATE TABLE 计划
 type CreateTableProperties struct {
 	Table   string
-	Columns []ColumnRef
+	Columns []ColumnDef // 改用 ColumnDef 保存完整的列定义
 }
 
 // ColumnDef 定义列属性

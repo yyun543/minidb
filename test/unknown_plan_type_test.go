@@ -15,7 +15,7 @@ import (
 
 // TestUnknownPlanTypeIssue 测试导致"不支持的计划节点类型: Unknown"错误的查询
 func TestUnknownPlanTypeIssue(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/unknown_plan_test.wal")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "unknown_plan_test.wal"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

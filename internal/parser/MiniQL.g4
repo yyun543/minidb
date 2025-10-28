@@ -37,6 +37,8 @@ PRIMARY: P R I M A R Y;
 KEY: K E Y;
 NOT: N O T;
 NULL: N U L L;
+TRUE: T R U E;
+FALSE: F A L S E;
 AS: A S;
 LIKE: L I K E;
 IN: I N;
@@ -65,6 +67,7 @@ INDEX: I N D E X;
 INDEXES: I N D E X E S;
 
 // 数据类型关键字（必须放在IDENTIFIER前）
+INT_TYPE: I N T;
 INTEGER_TYPE: I N T E G E R;
 VARCHAR_TYPE: V A R C H A R;
 BOOLEAN_TYPE: B O O L E A N;
@@ -227,8 +230,8 @@ dropDatabase
 
 // DML规则
 insertStatement
- : INSERT INTO tableName (LEFT_PAREN identifierList RIGHT_PAREN)? 
-   VALUES LEFT_PAREN valueList (COMMA valueList)* RIGHT_PAREN
+ : INSERT INTO tableName (LEFT_PAREN identifierList RIGHT_PAREN)?
+   VALUES LEFT_PAREN valueList RIGHT_PAREN (COMMA LEFT_PAREN valueList RIGHT_PAREN)*
  ;
 
 updateStatement
@@ -279,6 +282,8 @@ joinType
 // 表达式规则
 expression
  : primaryExpr                                                      #primaryExpression
+ | expression (ASTERISK | DIVIDE) expression                       #multiplicativeExpression
+ | expression (PLUS | MINUS) expression                            #additiveExpression
  | expression comparisonOperator expression                         #comparisonExpression
  | expression AND expression                                        #andExpression
  | expression OR expression                                         #orExpression
@@ -383,7 +388,8 @@ identifier
  ;
 
 dataType
- : INTEGER_TYPE
+ : INT_TYPE
+ | INTEGER_TYPE
  | VARCHAR_TYPE (LEFT_PAREN INTEGER_LITERAL RIGHT_PAREN)?
  | BOOLEAN_TYPE
  | DOUBLE_TYPE
@@ -394,4 +400,7 @@ literal
  : INTEGER_LITERAL
  | FLOAT_LITERAL
  | STRING_LITERAL
+ | TRUE
+ | FALSE
+ | NULL
  ;

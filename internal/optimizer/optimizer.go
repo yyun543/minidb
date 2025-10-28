@@ -141,7 +141,15 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 
 	// 2. 构建表扫描和JOIN
 	var currentPlan *Plan
-	if stmt.From != "" {
+	if stmt.FromSubquery != nil {
+		// FROM 子查询：递归优化子查询
+		subqueryPlan, err := o.Optimize(stmt.FromSubquery)
+		if err != nil {
+			return nil, fmt.Errorf("failed to optimize FROM subquery: %w", err)
+		}
+		// 子查询作为数据源直接使用
+		currentPlan = subqueryPlan
+	} else if stmt.From != "" {
 		if len(stmt.Joins) > 0 {
 			currentPlan = o.buildJoinPlan(stmt.From, stmt.FromAlias, stmt.Joins)
 		} else {
@@ -163,9 +171,13 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 		currentPlan = filterPlan
 	}
 
-	// 4. 构建GROUP BY
-	if len(stmt.GroupBy) > 0 {
+	// 4. 构建GROUP BY (包括隐式聚合 - 当有聚合函数但没有GROUP BY时)
+	hasAggregates := o.hasAggregateFunction(stmt.Columns)
+
+	if len(stmt.GroupBy) > 0 || hasAggregates {
 		groupPlan := NewPlan(GroupPlan)
+
+		// 构建GROUP BY键 (如果没有显式GROUP BY，则为空，表示全表聚合)
 		groupKeys := make([]ColumnRef, len(stmt.GroupBy))
 		for i, expr := range stmt.GroupBy {
 			if colRef, ok := expr.(*parser.ColumnRef); ok {
@@ -248,10 +260,20 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 		orderKeys := make([]OrderKey, len(stmt.OrderBy))
 		for i, item := range stmt.OrderBy {
 			if colRef, ok := item.Expr.(*parser.ColumnRef); ok {
+				// 简单列引用
 				orderKeys[i] = OrderKey{
-					Column:    colRef.Column,
-					Table:     colRef.Table,
-					Direction: item.Direction,
+					Column:     colRef.Column,
+					Table:      colRef.Table,
+					Direction:  item.Direction,
+					Expression: nil,
+				}
+			} else {
+				// 表达式 (如 price * quantity)
+				orderKeys[i] = OrderKey{
+					Column:     "",
+					Table:      "",
+					Direction:  item.Direction,
+					Expression: convertExpression(item.Expr),
 				}
 			}
 		}
@@ -274,8 +296,7 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 
 	// 8. 如果不是SELECT *且没有GROUP BY且没有聚合函数，添加投影算子
 	// GROUP BY查询或包含聚合函数的查询会自己处理列投影，不需要额外的投影操作符
-	hasAggregateFunction := o.hasAggregateFunction(stmt.Columns)
-	if !isSelectAll && len(stmt.GroupBy) == 0 && !hasAggregateFunction {
+	if !isSelectAll && len(stmt.GroupBy) == 0 && !hasAggregates {
 		projectionPlan := NewPlan(ProjectionPlan)
 		projectionPlan.Properties = &ProjectionProperties{
 			Columns: convertSelectItems(stmt.Columns),
@@ -305,11 +326,34 @@ func (o *Optimizer) buildJoinPlan(leftTable string, leftAlias string, joins []*p
 	for _, join := range joins {
 		joinPlan := NewPlan(JoinPlan)
 
-		// 创建右表扫描
-		rightScan := NewPlan(TableScanPlan)
-		rightScan.Properties = &TableScanProperties{
-			Table:      join.Right.Table,
-			TableAlias: join.Right.Alias,
+		var rightPlan *Plan
+		var rightTable, rightAlias string
+
+		// 检查右侧是子查询还是表引用
+		if join.Right.Subquery != nil {
+			// 右侧是子查询，递归优化子查询
+			var err error
+			rightPlan, err = o.Optimize(join.Right.Subquery)
+			if err != nil {
+				// 如果子查询优化失败，返回原计划（或处理错误）
+				// 这里简化处理，使用一个简单的占位符
+				rightPlan = NewPlan(TableScanPlan)
+				rightPlan.Properties = &TableScanProperties{
+					Table:      "",
+					TableAlias: join.Right.Alias,
+				}
+			}
+			rightTable = ""               // 子查询没有表名
+			rightAlias = join.Right.Alias // 使用子查询的别名
+		} else {
+			// 右侧是普通表引用
+			rightPlan = NewPlan(TableScanPlan)
+			rightPlan.Properties = &TableScanProperties{
+				Table:      join.Right.Table,
+				TableAlias: join.Right.Alias,
+			}
+			rightTable = join.Right.Table
+			rightAlias = join.Right.Alias
 		}
 
 		// 设置JOIN属性
@@ -317,15 +361,18 @@ func (o *Optimizer) buildJoinPlan(leftTable string, leftAlias string, joins []*p
 			JoinType:   join.JoinType,
 			Left:       leftTable,
 			LeftAlias:  leftAlias,
-			Right:      join.Right.Table,
-			RightAlias: join.Right.Alias,
+			Right:      rightTable,
+			RightAlias: rightAlias,
 			Condition:  convertExpression(join.Condition),
 		}
 
 		// 添加左右子节点
 		joinPlan.AddChild(currentPlan)
-		joinPlan.AddChild(rightScan)
+		joinPlan.AddChild(rightPlan)
 
+		// 更新左侧信息用于下一个JOIN
+		leftTable = rightTable
+		leftAlias = rightAlias
 		currentPlan = joinPlan
 	}
 
@@ -344,11 +391,11 @@ func (o *Optimizer) buildCreateDatabasePlan(stmt *parser.CreateDatabaseStmt) (*P
 
 // buildCreateTablePlan 构建CREATE TABLE语句的查询计划
 func (o *Optimizer) buildCreateTablePlan(stmt *parser.CreateTableStmt) (*Plan, error) {
-	columns := make([]ColumnRef, len(stmt.Columns))
+	columns := make([]ColumnDef, len(stmt.Columns))
 	for i, col := range stmt.Columns {
-		columns[i] = ColumnRef{
-			Column: col.Name,
-			Type:   ColumnRefTypeColumn,
+		columns[i] = ColumnDef{
+			Name: col.Name,
+			Type: col.DataType, // 保存完整的数据类型
 		}
 	}
 	return &Plan{
@@ -583,11 +630,25 @@ func convertFunctionArgs(args []parser.Node) []Expression {
 // buildInsertPlan 构建INSERT查询计划
 func (o *Optimizer) buildInsertPlan(stmt *parser.InsertStmt) (*Plan, error) {
 	plan := NewPlan(InsertPlan)
-	plan.Properties = &InsertProperties{
+
+	props := &InsertProperties{
 		Table:   stmt.Table,
 		Columns: stmt.Columns,
-		Values:  convertInsertValues(stmt.Values),
 	}
+
+	// 处理多行INSERT
+	if len(stmt.Rows) > 0 {
+		// 多行INSERT - 转换所有行
+		props.Rows = make([][]Expression, 0, len(stmt.Rows))
+		for _, row := range stmt.Rows {
+			props.Rows = append(props.Rows, convertInsertValues(row))
+		}
+	} else {
+		// 单行INSERT - 向后兼容
+		props.Values = convertInsertValues(stmt.Values)
+	}
+
+	plan.Properties = props
 	return plan, nil
 }
 
@@ -626,9 +687,13 @@ func (o *Optimizer) buildUpdatePlan(stmt *parser.UpdateStmt) (*Plan, error) {
 // buildDeletePlan 构建DELETE查询计划
 func (o *Optimizer) buildDeletePlan(stmt *parser.DeleteStmt) (*Plan, error) {
 	plan := NewPlan(DeletePlan)
+	var whereCondition parser.Node
+	if stmt.Where != nil {
+		whereCondition = stmt.Where.Condition
+	}
 	plan.Properties = &DeleteProperties{
 		Table: stmt.Table,
-		Where: stmt.Where.Condition,
+		Where: whereCondition,
 	}
 	return plan, nil
 }

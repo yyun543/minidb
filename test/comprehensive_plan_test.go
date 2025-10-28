@@ -16,7 +16,8 @@ import (
 // TestComprehensivePlanTypes 测试各种可能导致"Unknown plan type"的SQL语句
 func TestComprehensivePlanTypes(t *testing.T) {
 	// 创建 v2.0 Parquet 存储引擎
-	storageEngine, err := storage.NewParquetEngine("./test_data/comprehensive_plan_test")
+	testDir := SetupTestDir(t, "comprehensive_plan_test")
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

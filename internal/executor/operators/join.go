@@ -185,14 +185,51 @@ func (op *Join) getColumnValue(record arrow.Record, rowIdx int64, expr optimizer
 		// 查找列索引
 		schema := record.Schema()
 		for i, field := range schema.Fields() {
+			// 匹配列名：支持多种格式
+			matches := false
+
+			// 情况1: 字段名直接匹配列名 (如 "id" == "id")
 			if field.Name == colRef.Column {
+				matches = true
+			}
+
+			// 情况2: 字段名匹配"表.列"格式 (如 "users.id" == "users" + "id")
+			if colRef.Table != "" {
+				expectedName := colRef.Table + "." + colRef.Column
+				if field.Name == expectedName {
+					matches = true
+				}
+			}
+
+			// 情况3: 字段名包含表前缀，但colRef只有列名 (如 "users.id" contains "id")
+			// 这种情况不应该匹配，因为可能有歧义
+
+			// 情况4: 字段名是"列"，colRef是"表.列" - 也应该匹配（用于子查询）
+			// 例如：subquery输出"user_id"，JOIN条件引用"sub.user_id"
+			// 这种情况已经被情况1覆盖了
+
+			if matches {
 				column := record.Column(i)
 				switch col := column.(type) {
 				case *array.Int64:
+					if col.IsNull(int(rowIdx)) {
+						return nil
+					}
 					return col.Value(int(rowIdx))
 				case *array.String:
+					if col.IsNull(int(rowIdx)) {
+						return nil
+					}
 					return col.Value(int(rowIdx))
 				case *array.Float64:
+					if col.IsNull(int(rowIdx)) {
+						return nil
+					}
+					return col.Value(int(rowIdx))
+				case *array.Boolean:
+					if col.IsNull(int(rowIdx)) {
+						return nil
+					}
 					return col.Value(int(rowIdx))
 				}
 			}
@@ -206,7 +243,56 @@ func (op *Join) compareValues(left, right interface{}) bool {
 	if left == nil || right == nil {
 		return false
 	}
-	return left == right
+
+	// 直接比较
+	if left == right {
+		return true
+	}
+
+	// 处理数值类型转换 (仅支持常见的数值类型互转)
+	switch l := left.(type) {
+	case int64:
+		switch r := right.(type) {
+		case int64:
+			return l == r
+		case int32:
+			return l == int64(r)
+		case int:
+			return l == int64(r)
+		case float64:
+			return float64(l) == r
+		}
+	case int32:
+		switch r := right.(type) {
+		case int64:
+			return int64(l) == r
+		case int32:
+			return l == r
+		case int:
+			return int64(l) == int64(r)
+		case float64:
+			return float64(l) == r
+		}
+	case float64:
+		switch r := right.(type) {
+		case int64:
+			return l == float64(r)
+		case int32:
+			return l == float64(r)
+		case float64:
+			return l == r
+		}
+	case string:
+		if r, ok := right.(string); ok {
+			return l == r
+		}
+	case bool:
+		if r, ok := right.(bool); ok {
+			return l == r
+		}
+	}
+
+	return false
 }
 
 // appendJoinedRow 添加连接后的行到builder

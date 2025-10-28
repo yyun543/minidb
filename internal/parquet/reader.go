@@ -16,9 +16,10 @@ import (
 
 // Filter 查询过滤条件 (避免循环依赖)
 type Filter struct {
-	Column   string
-	Operator string
-	Value    interface{}
+	Column   string        // 列名
+	Operator string        // =, >, <, >=, <=, !=, LIKE, IN, BETWEEN
+	Value    interface{}   // 单值操作符使用
+	Values   []interface{} // IN 操作符使用多个值
 }
 
 // ReadParquetFile 读取 Parquet 文件并返回 Arrow Record (使用 Arrow 原生 reader)
@@ -296,7 +297,7 @@ func applyFilters(record arrow.Record, filters []Filter) (arrow.Record, error) {
 		col := record.Column(colIdx)
 
 		// 根据操作符和列类型应用过滤
-		if err := applyColumnFilter(col, filter.Operator, filter.Value, mask); err != nil {
+		if err := applyColumnFilter(col, filter.Operator, filter.Value, filter.Values, mask); err != nil {
 			return nil, fmt.Errorf("failed to apply filter on column %s: %w", filter.Column, err)
 		}
 	}
@@ -315,10 +316,29 @@ func applyFilters(record arrow.Record, filters []Filter) (arrow.Record, error) {
 }
 
 // applyColumnFilter 对单列应用过滤条件
-func applyColumnFilter(col arrow.Array, operator string, value interface{}, mask []bool) error {
+func applyColumnFilter(col arrow.Array, operator string, value interface{}, values []interface{}, mask []bool) error {
 	switch col.DataType().ID() {
 	case arrow.INT64:
 		arr := col.(*array.Int64)
+
+		// Handle IN operator with multiple values
+		if operator == "IN" {
+			targetVals := make([]int64, 0, len(values))
+			for _, v := range values {
+				if val, ok := v.(int64); ok {
+					targetVals = append(targetVals, val)
+				} else if val, ok := v.(int); ok {
+					targetVals = append(targetVals, int64(val))
+				} else if val, ok := v.(float64); ok {
+					targetVals = append(targetVals, int64(val))
+				} else {
+					return fmt.Errorf("cannot convert IN value %v to int64", v)
+				}
+			}
+			return applyInt64FilterIN(arr, targetVals, mask)
+		}
+
+		// Handle single value operators
 		targetVal, ok := value.(int64)
 		if !ok {
 			// 尝试类型转换
@@ -334,6 +354,21 @@ func applyColumnFilter(col arrow.Array, operator string, value interface{}, mask
 
 	case arrow.STRING:
 		arr := col.(*array.String)
+
+		// Handle IN operator with multiple values
+		if operator == "IN" {
+			targetVals := make([]string, 0, len(values))
+			for _, v := range values {
+				if val, ok := v.(string); ok {
+					targetVals = append(targetVals, val)
+				} else {
+					return fmt.Errorf("cannot convert IN value %v to string", v)
+				}
+			}
+			return applyStringFilterIN(arr, targetVals, mask)
+		}
+
+		// Handle single value operators
 		targetVal, ok := value.(string)
 		if !ok {
 			return fmt.Errorf("cannot convert value %v to string", value)
@@ -342,6 +377,25 @@ func applyColumnFilter(col arrow.Array, operator string, value interface{}, mask
 
 	case arrow.FLOAT64:
 		arr := col.(*array.Float64)
+
+		// Handle IN operator with multiple values
+		if operator == "IN" {
+			targetVals := make([]float64, 0, len(values))
+			for _, v := range values {
+				if val, ok := v.(float64); ok {
+					targetVals = append(targetVals, val)
+				} else if val, ok := v.(int); ok {
+					targetVals = append(targetVals, float64(val))
+				} else if val, ok := v.(int64); ok {
+					targetVals = append(targetVals, float64(val))
+				} else {
+					return fmt.Errorf("cannot convert IN value %v to float64", v)
+				}
+			}
+			return applyFloat64FilterIN(arr, targetVals, mask)
+		}
+
+		// Handle single value operators
 		targetVal, ok := value.(float64)
 		if !ok {
 			if v, ok := value.(int); ok {
@@ -353,6 +407,23 @@ func applyColumnFilter(col arrow.Array, operator string, value interface{}, mask
 			}
 		}
 		return applyFloat64Filter(arr, operator, targetVal, mask)
+
+	case arrow.BOOL:
+		arr := col.(*array.Boolean)
+
+		// Convert value to bool
+		var targetVal bool
+		if v, ok := value.(bool); ok {
+			targetVal = v
+		} else if v, ok := value.(int64); ok {
+			targetVal = (v != 0) // 0 = false, non-zero = true
+		} else if v, ok := value.(int); ok {
+			targetVal = (v != 0)
+		} else {
+			return fmt.Errorf("cannot convert value %v to bool", value)
+		}
+
+		return applyBoolFilter(arr, operator, targetVal, mask)
 
 	default:
 		logger.Warn("Unsupported column type for filtering",
@@ -470,6 +541,111 @@ func applyFloat64Filter(arr *array.Float64, operator string, value float64, mask
 		}
 
 		mask[i] = mask[i] && match
+	}
+
+	return nil
+}
+
+// applyBoolFilter applies filter to BOOLEAN column
+func applyBoolFilter(arr *array.Boolean, operator string, value bool, mask []bool) error {
+	for i := 0; i < arr.Len(); i++ {
+		if !mask[i] {
+			continue
+		}
+
+		if arr.IsNull(i) {
+			mask[i] = false
+			continue
+		}
+
+		val := arr.Value(i)
+		match := false
+
+		switch operator {
+		case "=", "==":
+			match = val == value
+		case "!=", "<>":
+			match = val != value
+		default:
+			return fmt.Errorf("unsupported operator for bool: %s", operator)
+		}
+
+		mask[i] = mask[i] && match
+	}
+
+	return nil
+}
+
+// applyInt64FilterIN applies IN filter to INT64 column with multiple values
+func applyInt64FilterIN(arr *array.Int64, values []int64, mask []bool) error {
+	// Create a map for O(1) lookup
+	valuesSet := make(map[int64]bool)
+	for _, v := range values {
+		valuesSet[v] = true
+	}
+
+	for i := 0; i < arr.Len(); i++ {
+		if !mask[i] {
+			continue
+		}
+
+		if arr.IsNull(i) {
+			mask[i] = false
+			continue
+		}
+
+		val := arr.Value(i)
+		mask[i] = mask[i] && valuesSet[val]
+	}
+
+	return nil
+}
+
+// applyStringFilterIN applies IN filter to STRING column with multiple values
+func applyStringFilterIN(arr *array.String, values []string, mask []bool) error {
+	// Create a map for O(1) lookup
+	valuesSet := make(map[string]bool)
+	for _, v := range values {
+		valuesSet[v] = true
+	}
+
+	for i := 0; i < arr.Len(); i++ {
+		if !mask[i] {
+			continue
+		}
+
+		if arr.IsNull(i) {
+			mask[i] = false
+			continue
+		}
+
+		val := arr.Value(i)
+		mask[i] = mask[i] && valuesSet[val]
+	}
+
+	return nil
+}
+
+// applyFloat64FilterIN applies IN filter to FLOAT64 column with multiple values
+func applyFloat64FilterIN(arr *array.Float64, values []float64, mask []bool) error {
+	// Create a map for O(1) lookup
+	valuesSet := make(map[float64]bool)
+	for _, v := range values {
+		valuesSet[v] = true
+	}
+
+	for i := 0; i < arr.Len(); i++ {
+		if !mask[i] {
+			continue
+		}
+
+		if arr.IsNull(i) {
+			mask[i] = false
+			continue
+		}
+
+		val := arr.Value(i)
+		mask[i] = mask[i] && valuesSet[val]
 	}
 
 	return nil

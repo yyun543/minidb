@@ -15,7 +15,7 @@ import (
 
 // TestPredicatePushdown tests predicate pushdown optimization
 func TestPredicatePushdown(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/predicate_pushdown_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "predicate_pushdown_test"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -246,7 +246,7 @@ func TestPredicatePushdown(t *testing.T) {
 
 // TestDataSkippingWithStatistics tests data skipping using min/max statistics
 func TestDataSkippingWithStatistics(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/data_skipping_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "data_skipping_test"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -368,7 +368,7 @@ func TestPredicatePushdownPerformance(t *testing.T) {
 		t.Skip("Skipping performance test in short mode")
 	}
 
-	storageEngine, err := storage.NewParquetEngine("./test_data/pushdown_performance_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "pushdown_performance_test"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

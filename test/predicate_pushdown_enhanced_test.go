@@ -191,6 +191,7 @@ func TestPredicatePushdownEnhanced(t *testing.T) {
 }
 
 // TestPredicatePushdownIN 测试IN操作符的谓词下推
+// 实现存储层IN操作符的谓词下推优化，提升查询性能
 func TestPredicatePushdownIN(t *testing.T) {
 	basePath := filepath.Join(os.TempDir(), fmt.Sprintf("minidb_predicate_in_test_%d", time.Now().UnixNano()))
 	defer os.RemoveAll(basePath)
@@ -359,7 +360,10 @@ func TestPredicatePushdownEnhancedPerformance(t *testing.T) {
 	duration := time.Since(start)
 
 	// 验证结果
-	expectedRows := int64(totalFiles*rowsPerFile) - targetTimestamp
+	// timestamp > targetTimestamp means (targetTimestamp, maxTimestamp]
+	// maxTimestamp = totalFiles*rowsPerFile - 1 (0-indexed)
+	// expectedRows = maxTimestamp - targetTimestamp
+	expectedRows := int64(totalFiles*rowsPerFile-1) - targetTimestamp
 	assert.Equal(t, expectedRows, totalRows, "应该返回 %d 行，实际 %d 行", expectedRows, totalRows)
 
 	t.Logf("✓ 性能测试: 扫描 %d 行耗时 %v", totalRows, duration)

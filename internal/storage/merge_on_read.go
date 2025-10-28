@@ -252,40 +252,123 @@ func (pe *ParquetEngine) estimateAffectedRows(ctx context.Context, tableID strin
 
 // MergeOnReadIterator implements iterator with delta file merging
 type MergeOnReadIterator struct {
-	baseIterator  RecordIterator
-	deltaFiles    []delta.FileInfo
-	currentRecord arrow.Record
-	err           error
+	baseIterator    RecordIterator   // Iterator for old base files (affected by deltas)
+	newBaseIterator RecordIterator   // Iterator for new base files (immune to deltas)
+	baseFiles       []delta.FileInfo // Track old base files for timestamp filtering
+	deltaFiles      []delta.FileInfo
+	currentRecord   arrow.Record
+	processingOld   bool // true if processing old files, false if processing new files
+	err             error
 }
 
 // NewMergeOnReadIterator creates a new merge-on-read iterator
 func NewMergeOnReadIterator(baseFiles, deltaFiles []delta.FileInfo, filters []Filter) (RecordIterator, error) {
-	// Create base iterator
-	baseIterator, err := NewParquetIterator(baseFiles, filters)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create base iterator: %w", err)
+	// Find the MINIMUM delta timestamp - any file added after ANY delta should be immune
+	// Delta files should ONLY apply to files that existed BEFORE the delta was created
+	// This ensures correct Merge-on-Read semantics
+	var minDeltaTimestamp int64 = int64(^uint64(0) >> 1) // Max int64
+	hasDelta := false
+	for _, deltaFile := range deltaFiles {
+		hasDelta = true
+		if deltaFile.AddedAt < minDeltaTimestamp {
+			minDeltaTimestamp = deltaFile.AddedAt
+		}
 	}
+
+	// If no deltas, all files are "new" (no merging needed)
+	if !hasDelta {
+		minDeltaTimestamp = 0
+	}
+
+	// Separate base files into "old" (affected by deltas) and "new" (immune to all deltas)
+	var oldBaseFiles, newBaseFiles []delta.FileInfo
+	for _, baseFile := range baseFiles {
+		if hasDelta && baseFile.AddedAt >= minDeltaTimestamp {
+			// This file was added AT OR AFTER any delta file was created
+			// No deltas should apply to it - it contains fresh data
+			newBaseFiles = append(newBaseFiles, baseFile)
+		} else {
+			// This file was added BEFORE all deltas
+			// All deltas should be applied to it
+			oldBaseFiles = append(oldBaseFiles, baseFile)
+		}
+	}
+
+	// Create base iterator for old files (will have deltas applied)
+	var oldIterator RecordIterator
+	var err error
+	if len(oldBaseFiles) > 0 {
+		oldIterator, err = NewParquetIterator(oldBaseFiles, filters)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create old base iterator: %w", err)
+		}
+	}
+
+	// Create base iterator for new files (will NOT have deltas applied)
+	var newIterator RecordIterator
+	if len(newBaseFiles) > 0 {
+		newIterator, err = NewParquetIterator(newBaseFiles, filters)
+		if err != nil {
+			if oldIterator != nil {
+				oldIterator.Close()
+			}
+			return nil, fmt.Errorf("failed to create new base iterator: %w", err)
+		}
+	}
+
+	logger.Info("Split base files for merge-on-read",
+		zap.Int("total_base_files", len(baseFiles)),
+		zap.Int("old_base_files", len(oldBaseFiles)),
+		zap.Int("new_base_files", len(newBaseFiles)),
+		zap.Int("delta_files", len(deltaFiles)))
 
 	// Create merge-on-read iterator
 	return &MergeOnReadIterator{
-		baseIterator: baseIterator,
-		deltaFiles:   deltaFiles,
+		baseIterator:    oldIterator,
+		newBaseIterator: newIterator,
+		baseFiles:       oldBaseFiles,
+		deltaFiles:      deltaFiles,
+		processingOld:   oldIterator != nil,
 	}, nil
 }
 
 // Next advances to the next record
 func (m *MergeOnReadIterator) Next() bool {
-	if !m.baseIterator.Next() {
-		return false
+	// First process old files with ALL deltas applied
+	if m.processingOld {
+		if m.baseIterator != nil && m.baseIterator.Next() {
+			baseRecord := m.baseIterator.Record()
+			// Apply ALL delta files to merge changes (both UPDATE and DELETE)
+			mergedRecord := m.applyDeltas(baseRecord, m.deltaFiles)
+			m.currentRecord = mergedRecord
+			return true
+		}
+		// Done with old files, switch to new files
+		m.processingOld = false
 	}
 
-	baseRecord := m.baseIterator.Record()
+	// Then process new files WITHOUT any deltas (fresh data)
+	if m.newBaseIterator != nil && m.newBaseIterator.Next() {
+		newRecord := m.newBaseIterator.Record()
+		// New files are added AFTER deltas, so NO deltas should apply
+		// Return the record as-is without any merging
+		newRecord.Retain()
+		m.currentRecord = newRecord
+		return true
+	}
 
-	// Apply delta files to merge changes
-	mergedRecord := m.applyDeltas(baseRecord, m.deltaFiles)
-	m.currentRecord = mergedRecord
+	return false
+}
 
-	return true
+// filterUpdateDeltas returns only UPDATE deltas from the delta files
+func (m *MergeOnReadIterator) filterUpdateDeltas(deltaFiles []delta.FileInfo) []delta.FileInfo {
+	var updateDeltas []delta.FileInfo
+	for _, delta := range deltaFiles {
+		if delta.DeltaType == "update" {
+			updateDeltas = append(updateDeltas, delta)
+		}
+	}
+	return updateDeltas
 }
 
 // Record returns the current record
@@ -298,7 +381,17 @@ func (m *MergeOnReadIterator) Err() error {
 	if m.err != nil {
 		return m.err
 	}
-	return m.baseIterator.Err()
+	if m.baseIterator != nil {
+		if err := m.baseIterator.Err(); err != nil {
+			return err
+		}
+	}
+	if m.newBaseIterator != nil {
+		if err := m.newBaseIterator.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close closes the iterator
@@ -306,7 +399,17 @@ func (m *MergeOnReadIterator) Close() error {
 	if m.currentRecord != nil {
 		m.currentRecord.Release()
 	}
-	return m.baseIterator.Close()
+	var err1, err2 error
+	if m.baseIterator != nil {
+		err1 = m.baseIterator.Close()
+	}
+	if m.newBaseIterator != nil {
+		err2 = m.newBaseIterator.Close()
+	}
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
 
 // applyDeltas applies delta files to base record
@@ -315,6 +418,10 @@ func (m *MergeOnReadIterator) applyDeltas(baseRecord arrow.Record, deltaFiles []
 		baseRecord.Retain()
 		return baseRecord
 	}
+
+	logger.Info("Applying deltas to base record",
+		zap.Int("base_rows", int(baseRecord.NumRows())),
+		zap.Int("delta_count", len(deltaFiles)))
 
 	// Read all delta files and build update/delete maps
 	updateMap := make(map[int64]map[string]interface{}) // rowID -> column -> value
@@ -337,12 +444,23 @@ func (m *MergeOnReadIterator) applyDeltas(baseRecord arrow.Record, deltaFiles []
 		deltaType := m.getDeltaType(deltaRecord)
 		filterColumn, filterOperator, filterValue := m.getFilterInfo(deltaRecord)
 
+		logger.Info("Processing delta",
+			zap.String("type", deltaType),
+			zap.String("filter_column", filterColumn),
+			zap.String("filter_operator", filterOperator),
+			zap.String("filter_value", filterValue),
+			zap.Int("delta_rows", int(deltaRecord.NumRows())))
+
 		// Apply delta based on type
 		switch deltaType {
 		case "update":
 			// Each row in delta record represents one column update
 			for rowIdx := int64(0); rowIdx < deltaRecord.NumRows(); rowIdx++ {
 				updateColumn, updateValue := m.getUpdateInfoAtRow(deltaRecord, rowIdx)
+				logger.Info("Applying UPDATE delta row",
+					zap.Int64("row_idx", rowIdx),
+					zap.String("update_column", updateColumn),
+					zap.String("update_value", updateValue))
 				m.applyUpdateDelta(baseRecord, filterColumn, filterOperator, filterValue, updateColumn, updateValue, updateMap)
 			}
 
@@ -431,20 +549,27 @@ func (m *MergeOnReadIterator) getUpdateInfoAtRow(record arrow.Record, rowIdx int
 
 // applyUpdateDelta marks rows for update based on filter
 func (m *MergeOnReadIterator) applyUpdateDelta(baseRecord arrow.Record, filterColumn, filterOperator, filterValue, updateColumn, updateValue string, updateMap map[int64]map[string]interface{}) {
-	if filterColumn == "" || updateColumn == "" {
+	// updateColumn must not be empty
+	if updateColumn == "" {
+		logger.Warn("Skipping UPDATE delta: empty update column",
+			zap.String("update_column", updateColumn))
 		return
 	}
 
-	// Find filter column index
+	// Find filter column index (only if filter is specified)
 	filterColIdx := -1
-	for i := 0; i < int(baseRecord.NumCols()); i++ {
-		if baseRecord.Schema().Field(i).Name == filterColumn {
-			filterColIdx = i
-			break
+	if filterColumn != "" {
+		for i := 0; i < int(baseRecord.NumCols()); i++ {
+			if baseRecord.Schema().Field(i).Name == filterColumn {
+				filterColIdx = i
+				break
+			}
 		}
-	}
-	if filterColIdx == -1 {
-		return
+		if filterColIdx == -1 {
+			logger.Warn("Filter column not found in base record",
+				zap.String("filter_column", filterColumn))
+			return
+		}
 	}
 
 	// Find update column index to get correct type
@@ -456,24 +581,65 @@ func (m *MergeOnReadIterator) applyUpdateDelta(baseRecord arrow.Record, filterCo
 		}
 	}
 	if updateColIdx == -1 {
+		logger.Warn("Update column not found in base record",
+			zap.String("update_column", updateColumn))
 		return // Update column not found in schema
 	}
 
+	logger.Info("Evaluating UPDATE delta against base record",
+		zap.Int("filter_col_idx", filterColIdx),
+		zap.Int("update_col_idx", updateColIdx),
+		zap.Int("base_rows", int(baseRecord.NumRows())))
+
+	// If no filter specified, update ALL rows
+	if filterColumn == "" {
+		for rowIdx := 0; rowIdx < int(baseRecord.NumRows()); rowIdx++ {
+			if updateMap[int64(rowIdx)] == nil {
+				updateMap[int64(rowIdx)] = make(map[string]interface{})
+			}
+			parsedValue := m.parseValue(updateValue, baseRecord.Schema().Field(updateColIdx).Type)
+			updateMap[int64(rowIdx)][updateColumn] = parsedValue
+			logger.Info("Row updated (no WHERE clause)",
+				zap.Int("row_idx", rowIdx),
+				zap.String("update_column", updateColumn),
+				zap.Any("update_value", parsedValue))
+		}
+		logger.Info("UPDATE delta evaluation complete (no filter)",
+			zap.Int("updated_rows", int(baseRecord.NumRows())),
+			zap.Int("total_updates_in_map", len(updateMap)))
+		return
+	}
+
 	// Evaluate filter and mark rows for update
+	matchCount := 0
 	for rowIdx := 0; rowIdx < int(baseRecord.NumRows()); rowIdx++ {
 		if m.evaluateFilter(baseRecord, rowIdx, filterColIdx, filterOperator, filterValue) {
+			matchCount++
 			if updateMap[int64(rowIdx)] == nil {
 				updateMap[int64(rowIdx)] = make(map[string]interface{})
 			}
 			// Parse update value based on UPDATE column type (not filter column type!)
-			updateMap[int64(rowIdx)][updateColumn] = m.parseValue(updateValue, baseRecord.Schema().Field(updateColIdx).Type)
+			parsedValue := m.parseValue(updateValue, baseRecord.Schema().Field(updateColIdx).Type)
+			updateMap[int64(rowIdx)][updateColumn] = parsedValue
+			logger.Info("Row matched UPDATE filter",
+				zap.Int("row_idx", rowIdx),
+				zap.String("update_column", updateColumn),
+				zap.Any("update_value", parsedValue))
 		}
 	}
+
+	logger.Info("UPDATE delta evaluation complete",
+		zap.Int("matched_rows", matchCount),
+		zap.Int("total_updates_in_map", len(updateMap)))
 }
 
 // applyDeleteDelta marks rows for deletion based on filter
 func (m *MergeOnReadIterator) applyDeleteDelta(baseRecord arrow.Record, filterColumn, filterOperator, filterValue string, deleteSet map[int64]bool) {
+	// If no filter specified, delete ALL rows
 	if filterColumn == "" {
+		for rowIdx := 0; rowIdx < int(baseRecord.NumRows()); rowIdx++ {
+			deleteSet[int64(rowIdx)] = true
+		}
 		return
 	}
 
@@ -513,6 +679,39 @@ func (m *MergeOnReadIterator) evaluateFilter(record arrow.Record, rowIdx, colIdx
 		rowValue := strCol.Value(rowIdx)
 		return m.compareString(rowValue, value, operator)
 
+	case arrow.BOOL:
+		boolCol := col.(*array.Boolean)
+		rowValue := boolCol.Value(rowIdx)
+		filterValue := m.parseBool(value)
+		return m.compareBool(rowValue, filterValue, operator)
+
+	default:
+		return false
+	}
+}
+
+// parseBool parses a string to boolean
+// Handles: "true", "1", "t", "T", "TRUE" -> true
+//
+//	"false", "0", "f", "F", "FALSE" -> false
+func (m *MergeOnReadIterator) parseBool(s string) bool {
+	switch s {
+	case "true", "1", "t", "T", "TRUE":
+		return true
+	case "false", "0", "f", "F", "FALSE":
+		return false
+	default:
+		return false
+	}
+}
+
+// compareBool compares two boolean values based on operator
+func (m *MergeOnReadIterator) compareBool(a, b bool, operator string) bool {
+	switch operator {
+	case "=":
+		return a == b
+	case "!=":
+		return a != b
 	default:
 		return false
 	}
@@ -564,6 +763,45 @@ func (m *MergeOnReadIterator) parseValue(s string, dataType arrow.DataType) inte
 		var val int64
 		fmt.Sscanf(s, "%d", &val)
 		return val
+	case arrow.INT32:
+		var val int32
+		fmt.Sscanf(s, "%d", &val)
+		return val
+	case arrow.FLOAT64:
+		var val float64
+		// Try parsing as float first
+		if _, err := fmt.Sscanf(s, "%f", &val); err == nil {
+			return val
+		}
+		// Fallback: try parsing as int and convert to float
+		var intVal int64
+		if _, err := fmt.Sscanf(s, "%d", &intVal); err == nil {
+			return float64(intVal)
+		}
+		return 0.0
+	case arrow.FLOAT32:
+		var val float32
+		// Try parsing as float first
+		if _, err := fmt.Sscanf(s, "%f", &val); err == nil {
+			return val
+		}
+		// Fallback: try parsing as int and convert to float
+		var intVal int64
+		if _, err := fmt.Sscanf(s, "%d", &intVal); err == nil {
+			return float32(intVal)
+		}
+		return float32(0.0)
+	case arrow.BOOL:
+		// Parse boolean values: "true", "1", "t", "T", "TRUE" -> true
+		// "false", "0", "f", "F", "FALSE" -> false
+		switch s {
+		case "true", "1", "t", "T", "TRUE":
+			return true
+		case "false", "0", "f", "F", "FALSE":
+			return false
+		default:
+			return false
+		}
 	case arrow.STRING:
 		return s
 	default:
@@ -646,6 +884,13 @@ func (m *MergeOnReadIterator) appendValue(builder array.Builder, value interface
 		case float64:
 			builder.(*array.Float64Builder).Append(v)
 		case float32:
+			builder.(*array.Float64Builder).Append(float64(v))
+		case int64:
+			// Allow int64 to float64 conversion (e.g., UPDATE price = 1099)
+			builder.(*array.Float64Builder).Append(float64(v))
+		case int:
+			builder.(*array.Float64Builder).Append(float64(v))
+		case int32:
 			builder.(*array.Float64Builder).Append(float64(v))
 		default:
 			builder.AppendNull()

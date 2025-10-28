@@ -629,7 +629,11 @@ func (h *QueryHandler) getColumnValue(column arrow.Array, rowIdx int) interface{
 	switch col := column.(type) {
 	case *array.Int64:
 		return col.Value(rowIdx)
+	case *array.Int32:
+		return col.Value(rowIdx)
 	case *array.Float64:
+		return col.Value(rowIdx)
+	case *array.Float32:
 		return col.Value(rowIdx)
 	case *array.String:
 		return col.Value(rowIdx)

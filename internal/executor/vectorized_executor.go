@@ -327,6 +327,30 @@ func (ve *VectorizedExecutor) buildVectorizedPredicate(condition optimizer.Expre
 					default:
 						return nil, fmt.Errorf("cannot convert %T to float64 for column %s", litVal.Value, colRef.Column)
 					}
+				case arrow.FixedWidthTypes.Boolean:
+					// 确保值是bool类型 - 支持 true/false, 1/0, "true"/"false" 等多种形式
+					switch v := litVal.Value.(type) {
+					case bool:
+						value = v
+					case int64:
+						value = (v != 0)
+					case int:
+						value = (v != 0)
+					case int32:
+						value = (v != 0)
+					case string:
+						// 处理字符串形式的布尔值
+						switch v {
+						case "true", "1", "t", "T", "TRUE":
+							value = true
+						case "false", "0", "f", "F", "FALSE":
+							value = false
+						default:
+							return nil, fmt.Errorf("cannot convert string %q to bool for column %s", v, colRef.Column)
+						}
+					default:
+						return nil, fmt.Errorf("cannot convert %T to bool for column %s", litVal.Value, colRef.Column)
+					}
 				default:
 					value = litVal.Value
 				}
@@ -360,12 +384,20 @@ func (ve *VectorizedExecutor) buildProjectionMapping(columns []optimizer.ColumnR
 		}
 
 		if columnIndex != -1 {
+			// 如果有别名，使用别名作为字段名
+			if col.Alias != "" {
+				foundField.Name = col.Alias
+			}
 			fields[i] = foundField
 			columnIndices[i] = columnIndex
 		} else {
 			// 列未找到，创建一个默认字段
+			fieldName := col.Column
+			if col.Alias != "" {
+				fieldName = col.Alias
+			}
 			fields[i] = arrow.Field{
-				Name:     col.Column,
+				Name:     fieldName,
 				Type:     arrow.BinaryTypes.String,
 				Nullable: true,
 			}

@@ -7,6 +7,7 @@ import (
 	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/types"
+	"strings"
 )
 
 // Projection 投影算子 - 用于选择特定的列
@@ -54,28 +55,88 @@ func (op *Projection) Close() error {
 func (op *Projection) applyProjection(batch *types.Batch) (*types.Batch, error) {
 	record := batch.Record()
 
-	// 构建投影后的schema
+	// 构建投影后的schema和数据源信息
 	var projectedFields []arrow.Field
-	var columnIndices []int
+	type columnSource struct {
+		isExpression bool
+		columnIndex  int                  // 用于直接列引用
+		expression   optimizer.Expression // 用于表达式计算
+		columnRef    optimizer.ColumnRef  // 原始列引用信息
+	}
+	var sources []columnSource
 
 	for _, projCol := range op.columns {
-		// 查找列在原始schema中的位置
-		found := false
-		for i, field := range record.Schema().Fields() {
-			// 匹配列名 (支持表别名.列名格式)
-			if op.matchesColumn(field.Name, projCol) {
-				projectedFields = append(projectedFields, field)
-				columnIndices = append(columnIndices, i)
-				found = true
-				break
+		if projCol.Type == optimizer.ColumnRefTypeFunction {
+			// 处理函数调用类型 (如 UPPER(name), LOWER(name), etc.)
+			fieldName := projCol.Column
+			if fieldName == "" && projCol.Alias != "" {
+				fieldName = projCol.Alias
 			}
-		}
-		if !found {
-			return nil, fmt.Errorf("column not found: %s", op.formatColumnName(projCol))
+			if fieldName == "" {
+				fieldName = projCol.FunctionName // 使用函数名作为默认名称
+			}
+
+			// 函数结果类型根据函数类型推断 (字符串函数返回String)
+			var fieldType arrow.DataType = arrow.BinaryTypes.String
+			projectedFields = append(projectedFields, arrow.Field{
+				Name: fieldName,
+				Type: fieldType,
+			})
+			sources = append(sources, columnSource{
+				isExpression: true,
+				expression:   nil, // 函数不使用expression字段
+				columnRef:    projCol,
+			})
+		} else if projCol.Type == optimizer.ColumnRefTypeExpression && projCol.Expression != nil {
+			// 处理表达式类型 - 计算表达式并添加为新列
+			fieldName := projCol.Column
+			if fieldName == "" && projCol.Alias != "" {
+				fieldName = projCol.Alias
+			}
+			if fieldName == "" {
+				fieldName = "expr" // 默认名称
+			}
+
+			// 表达式结果类型推断为 Float64（算术运算结果）
+			projectedFields = append(projectedFields, arrow.Field{
+				Name: fieldName,
+				Type: arrow.PrimitiveTypes.Float64,
+			})
+			sources = append(sources, columnSource{
+				isExpression: true,
+				expression:   projCol.Expression,
+				columnRef:    projCol,
+			})
+		} else {
+			// 处理普通列引用
+			found := false
+			for i, field := range record.Schema().Fields() {
+				if op.matchesColumn(field.Name, projCol) {
+					// 如果有别名，使用别名作为字段名
+					if projCol.Alias != "" {
+						projectedFields = append(projectedFields, arrow.Field{
+							Name: projCol.Alias,
+							Type: field.Type,
+						})
+					} else {
+						projectedFields = append(projectedFields, field)
+					}
+					sources = append(sources, columnSource{
+						isExpression: false,
+						columnIndex:  i,
+						columnRef:    projCol,
+					})
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("column not found: %s", op.formatColumnName(projCol))
+			}
 		}
 	}
 
-	// 如果没有找到任何列，返回空结果
+	// 如果没有任何列，返回空结果
 	if len(projectedFields) == 0 {
 		return nil, nil
 	}
@@ -88,48 +149,83 @@ func (op *Projection) applyProjection(batch *types.Batch) (*types.Batch, error) 
 	builder := array.NewRecordBuilder(pool, projectedSchema)
 	defer builder.Release()
 
-	// 复制选中列的数据
+	// 处理每一行数据
 	for rowIdx := int64(0); rowIdx < record.NumRows(); rowIdx++ {
-		for fieldIdx, colIdx := range columnIndices {
+		for fieldIdx, source := range sources {
 			field := builder.Field(fieldIdx)
-			column := record.Column(colIdx)
 
-			switch col := column.(type) {
-			case *array.Int64:
-				if intBuilder, ok := field.(*array.Int64Builder); ok {
-					if col.IsNull(int(rowIdx)) {
-						intBuilder.AppendNull()
-					} else {
-						intBuilder.Append(col.Value(int(rowIdx)))
+			if source.isExpression {
+				// 检查是否是函数调用
+				if source.columnRef.Type == optimizer.ColumnRefTypeFunction {
+					// 执行函数调用
+					result, err := op.evaluateFunction(source.columnRef, record, int(rowIdx))
+					if err != nil {
+						return nil, fmt.Errorf("failed to evaluate function %s: %w", source.columnRef.FunctionName, err)
+					}
+
+					// 函数结果作为String
+					if strBuilder, ok := field.(*array.StringBuilder); ok {
+						if result == nil {
+							strBuilder.AppendNull()
+						} else if strVal, ok := result.(string); ok {
+							strBuilder.Append(strVal)
+						} else {
+							strBuilder.Append(fmt.Sprintf("%v", result))
+						}
+					}
+				} else {
+					// 计算表达式的值
+					value, err := op.evaluateExpression(source.expression, record, int(rowIdx))
+					if err != nil {
+						return nil, fmt.Errorf("failed to evaluate expression: %w", err)
+					}
+
+					// 表达式结果作为 Float64
+					if floatBuilder, ok := field.(*array.Float64Builder); ok {
+						floatBuilder.Append(value)
 					}
 				}
-			case *array.String:
-				if strBuilder, ok := field.(*array.StringBuilder); ok {
-					if col.IsNull(int(rowIdx)) {
-						strBuilder.AppendNull()
-					} else {
-						strBuilder.Append(col.Value(int(rowIdx)))
+			} else {
+				// 直接复制列数据
+				column := record.Column(source.columnIndex)
+
+				switch col := column.(type) {
+				case *array.Int64:
+					if intBuilder, ok := field.(*array.Int64Builder); ok {
+						if col.IsNull(int(rowIdx)) {
+							intBuilder.AppendNull()
+						} else {
+							intBuilder.Append(col.Value(int(rowIdx)))
+						}
 					}
-				}
-			case *array.Float64:
-				if floatBuilder, ok := field.(*array.Float64Builder); ok {
-					if col.IsNull(int(rowIdx)) {
-						floatBuilder.AppendNull()
-					} else {
-						floatBuilder.Append(col.Value(int(rowIdx)))
+				case *array.String:
+					if strBuilder, ok := field.(*array.StringBuilder); ok {
+						if col.IsNull(int(rowIdx)) {
+							strBuilder.AppendNull()
+						} else {
+							strBuilder.Append(col.Value(int(rowIdx)))
+						}
 					}
-				}
-			case *array.Boolean:
-				if boolBuilder, ok := field.(*array.BooleanBuilder); ok {
-					if col.IsNull(int(rowIdx)) {
-						boolBuilder.AppendNull()
-					} else {
-						boolBuilder.Append(col.Value(int(rowIdx)))
+				case *array.Float64:
+					if floatBuilder, ok := field.(*array.Float64Builder); ok {
+						if col.IsNull(int(rowIdx)) {
+							floatBuilder.AppendNull()
+						} else {
+							floatBuilder.Append(col.Value(int(rowIdx)))
+						}
 					}
+				case *array.Boolean:
+					if boolBuilder, ok := field.(*array.BooleanBuilder); ok {
+						if col.IsNull(int(rowIdx)) {
+							boolBuilder.AppendNull()
+						} else {
+							boolBuilder.Append(col.Value(int(rowIdx)))
+						}
+					}
+				default:
+					// 对于不支持的类型，跳过该行
+					continue
 				}
-			default:
-				// 对于不支持的类型，跳过该行
-				continue
 			}
 		}
 	}
@@ -162,4 +258,161 @@ func (op *Projection) formatColumnName(col optimizer.ColumnRef) string {
 		return fmt.Sprintf("%s.%s", col.Table, col.Column)
 	}
 	return col.Column
+}
+
+// evaluateExpression 计算表达式的值
+func (op *Projection) evaluateExpression(expr optimizer.Expression, record arrow.Record, rowIdx int) (float64, error) {
+	switch e := expr.(type) {
+	case *optimizer.BinaryExpression:
+		// 递归计算左右操作数
+		leftVal, err := op.evaluateExpression(e.Left, record, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		rightVal, err := op.evaluateExpression(e.Right, record, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+
+		// 根据操作符计算结果
+		switch e.Operator {
+		case "+":
+			return leftVal + rightVal, nil
+		case "-":
+			return leftVal - rightVal, nil
+		case "*":
+			return leftVal * rightVal, nil
+		case "/":
+			if rightVal == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			return leftVal / rightVal, nil
+		default:
+			return 0, fmt.Errorf("unsupported operator in expression: %s", e.Operator)
+		}
+
+	case *optimizer.ColumnReference:
+		// 从record中获取列的值
+		colIdx := -1
+		for i, field := range record.Schema().Fields() {
+			if field.Name == e.Column || (e.Table != "" && field.Name == fmt.Sprintf("%s.%s", e.Table, e.Column)) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx == -1 {
+			return 0, fmt.Errorf("column not found in expression: %s", e.Column)
+		}
+
+		column := record.Column(colIdx)
+		switch col := column.(type) {
+		case *array.Int64:
+			if col.IsNull(rowIdx) {
+				return 0, fmt.Errorf("null value in expression")
+			}
+			return float64(col.Value(rowIdx)), nil
+		case *array.Float64:
+			if col.IsNull(rowIdx) {
+				return 0, fmt.Errorf("null value in expression")
+			}
+			return col.Value(rowIdx), nil
+		case *array.Float32:
+			if col.IsNull(rowIdx) {
+				return 0, fmt.Errorf("null value in expression")
+			}
+			return float64(col.Value(rowIdx)), nil
+		default:
+			return 0, fmt.Errorf("unsupported column type in expression: %T", col)
+		}
+
+	case *optimizer.LiteralValue:
+		// 字面量值
+		switch e.Type {
+		case optimizer.LiteralTypeInteger:
+			if intVal, ok := e.Value.(int64); ok {
+				return float64(intVal), nil
+			}
+			if intVal, ok := e.Value.(int); ok {
+				return float64(intVal), nil
+			}
+		case optimizer.LiteralTypeFloat:
+			if floatVal, ok := e.Value.(float64); ok {
+				return floatVal, nil
+			}
+		}
+		return 0, fmt.Errorf("unsupported literal type in expression: %v", e.Type)
+
+	default:
+		return 0, fmt.Errorf("unsupported expression type: %T", expr)
+	}
+}
+
+// evaluateFunction 执行函数调用并返回结果
+func (op *Projection) evaluateFunction(colRef optimizer.ColumnRef, record arrow.Record, rowIdx int) (interface{}, error) {
+	// 解析函数参数（通常是列引用）
+	if len(colRef.FunctionArgs) == 0 {
+		return nil, fmt.Errorf("function %s requires arguments", colRef.FunctionName)
+	}
+
+	// 获取第一个参数的值
+	var argValue interface{}
+	firstArg := colRef.FunctionArgs[0]
+
+	if colRef, ok := firstArg.(*optimizer.ColumnReference); ok {
+		// 从record中获取列的值
+		colIdx := -1
+		for i, field := range record.Schema().Fields() {
+			if field.Name == colRef.Column || (colRef.Table != "" && field.Name == fmt.Sprintf("%s.%s", colRef.Table, colRef.Column)) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx == -1 {
+			return nil, fmt.Errorf("column not found in function argument: %s", colRef.Column)
+		}
+
+		column := record.Column(colIdx)
+		switch col := column.(type) {
+		case *array.String:
+			if col.IsNull(rowIdx) {
+				return nil, nil
+			}
+			argValue = col.Value(rowIdx)
+		case *array.Int64:
+			if col.IsNull(rowIdx) {
+				return nil, nil
+			}
+			argValue = col.Value(rowIdx)
+		case *array.Float64:
+			if col.IsNull(rowIdx) {
+				return nil, nil
+			}
+			argValue = col.Value(rowIdx)
+		default:
+			return nil, fmt.Errorf("unsupported column type for function argument: %T", col)
+		}
+	} else {
+		return nil, fmt.Errorf("unsupported function argument type: %T", firstArg)
+	}
+
+	// 执行函数
+	switch colRef.FunctionName {
+	case "UPPER":
+		if strVal, ok := argValue.(string); ok {
+			return strings.ToUpper(strVal), nil
+		}
+		return nil, fmt.Errorf("UPPER requires string argument")
+	case "LOWER":
+		if strVal, ok := argValue.(string); ok {
+			return strings.ToLower(strVal), nil
+		}
+		return nil, fmt.Errorf("LOWER requires string argument")
+	case "LENGTH", "LEN":
+		if strVal, ok := argValue.(string); ok {
+			return int64(len(strVal)), nil
+		}
+		return nil, fmt.Errorf("LENGTH requires string argument")
+	default:
+		return nil, fmt.Errorf("unsupported function: %s", colRef.FunctionName)
+	}
 }

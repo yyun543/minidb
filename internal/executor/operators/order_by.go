@@ -99,16 +99,22 @@ func (op *OrderBy) processAndSortAllData() error {
 			// 找到排序列的索引
 			orderKeyIndices = make([]int, len(op.orderKeys))
 			for i, key := range op.orderKeys {
-				found := false
-				for j, field := range schema.Fields() {
-					if field.Name == key.Column {
-						orderKeyIndices[i] = j
-						found = true
-						break
+				if key.Expression != nil {
+					// 表达式类型，使用 -1 作为占位符
+					orderKeyIndices[i] = -1
+				} else {
+					// 列引用类型，查找列索引
+					found := false
+					for j, field := range schema.Fields() {
+						if field.Name == key.Column {
+							orderKeyIndices[i] = j
+							found = true
+							break
+						}
 					}
-				}
-				if !found {
-					return fmt.Errorf("order key column %s not found in schema", key.Column)
+					if !found {
+						return fmt.Errorf("order key column %s not found in schema", key.Column)
+					}
 				}
 			}
 		}
@@ -126,6 +132,10 @@ func (op *OrderBy) processAndSortAllData() error {
 					rowData[colIdx] = col.Value(int(rowIdx))
 				case *array.Float64:
 					rowData[colIdx] = col.Value(int(rowIdx))
+				case *array.Boolean:
+					rowData[colIdx] = col.Value(int(rowIdx))
+				case *array.Timestamp:
+					rowData[colIdx] = col.Value(int(rowIdx))
 				default:
 					rowData[colIdx] = nil
 				}
@@ -134,7 +144,17 @@ func (op *OrderBy) processAndSortAllData() error {
 			// 提取排序键值
 			keyValues := make([]interface{}, len(op.orderKeys))
 			for i, colIdx := range orderKeyIndices {
-				keyValues[i] = rowData[colIdx]
+				if colIdx == -1 {
+					// 表达式类型，需要计算表达式值
+					value, err := op.evaluateExpression(op.orderKeys[i].Expression, record, int(rowIdx))
+					if err != nil {
+						return fmt.Errorf("failed to evaluate order by expression: %w", err)
+					}
+					keyValues[i] = value
+				} else {
+					// 列引用类型，直接使用列值
+					keyValues[i] = rowData[colIdx]
+				}
 			}
 
 			allRows = append(allRows, sortableRow{
@@ -196,6 +216,18 @@ func (op *OrderBy) buildSortedResult(rows []sortableRow, schema *arrow.Schema) (
 			case *array.Float64Builder:
 				if floatVal, ok := value.(float64); ok {
 					b.Append(floatVal)
+				} else {
+					b.AppendNull()
+				}
+			case *array.BooleanBuilder:
+				if boolVal, ok := value.(bool); ok {
+					b.Append(boolVal)
+				} else {
+					b.AppendNull()
+				}
+			case *array.TimestampBuilder:
+				if tsVal, ok := value.(arrow.Timestamp); ok {
+					b.Append(tsVal)
 				} else {
 					b.AppendNull()
 				}
@@ -297,6 +329,25 @@ func compareValues(val1, val2 interface{}) int {
 			}
 			return 0
 		}
+	case bool:
+		if v2, ok := val2.(bool); ok {
+			// false < true
+			if !v1 && v2 {
+				return -1
+			} else if v1 && !v2 {
+				return 1
+			}
+			return 0
+		}
+	case arrow.Timestamp:
+		if v2, ok := val2.(arrow.Timestamp); ok {
+			if v1 < v2 {
+				return -1
+			} else if v1 > v2 {
+				return 1
+			}
+			return 0
+		}
 	}
 
 	// 默认字符串比较
@@ -308,4 +359,91 @@ func compareValues(val1, val2 interface{}) int {
 		return 1
 	}
 	return 0
+}
+
+// evaluateExpression 计算表达式的值 (重用Projection算子的逻辑)
+func (op *OrderBy) evaluateExpression(expr optimizer.Expression, record arrow.Record, rowIdx int) (float64, error) {
+	switch e := expr.(type) {
+	case *optimizer.BinaryExpression:
+		// 递归计算左右操作数
+		leftVal, err := op.evaluateExpression(e.Left, record, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		rightVal, err := op.evaluateExpression(e.Right, record, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+
+		// 根据操作符计算结果
+		switch e.Operator {
+		case "+":
+			return leftVal + rightVal, nil
+		case "-":
+			return leftVal - rightVal, nil
+		case "*":
+			return leftVal * rightVal, nil
+		case "/":
+			if rightVal == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			return leftVal / rightVal, nil
+		default:
+			return 0, fmt.Errorf("unsupported operator in expression: %s", e.Operator)
+		}
+
+	case *optimizer.ColumnReference:
+		// 从record中获取列的值
+		colIdx := -1
+		for i, field := range record.Schema().Fields() {
+			if field.Name == e.Column || (e.Table != "" && field.Name == fmt.Sprintf("%s.%s", e.Table, e.Column)) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx == -1 {
+			return 0, fmt.Errorf("column not found in expression: %s", e.Column)
+		}
+
+		column := record.Column(colIdx)
+		switch col := column.(type) {
+		case *array.Int64:
+			if col.IsNull(rowIdx) {
+				return 0, fmt.Errorf("null value in expression")
+			}
+			return float64(col.Value(rowIdx)), nil
+		case *array.Float64:
+			if col.IsNull(rowIdx) {
+				return 0, fmt.Errorf("null value in expression")
+			}
+			return col.Value(rowIdx), nil
+		case *array.Float32:
+			if col.IsNull(rowIdx) {
+				return 0, fmt.Errorf("null value in expression")
+			}
+			return float64(col.Value(rowIdx)), nil
+		default:
+			return 0, fmt.Errorf("unsupported column type in expression: %T", col)
+		}
+
+	case *optimizer.LiteralValue:
+		// 字面量值
+		switch e.Type {
+		case optimizer.LiteralTypeInteger:
+			if intVal, ok := e.Value.(int64); ok {
+				return float64(intVal), nil
+			}
+			if intVal, ok := e.Value.(int); ok {
+				return float64(intVal), nil
+			}
+		case optimizer.LiteralTypeFloat:
+			if floatVal, ok := e.Value.(float64); ok {
+				return floatVal, nil
+			}
+		}
+		return 0, fmt.Errorf("unsupported literal type in expression: %v", e.Type)
+
+	default:
+		return 0, fmt.Errorf("unsupported expression type: %T", expr)
+	}
 }

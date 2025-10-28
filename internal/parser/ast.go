@@ -95,16 +95,17 @@ func (n *BaseNode) Type() NodeType {
 // SelectStmt SELECT语句节点
 type SelectStmt struct {
 	BaseNode
-	All       bool           // 是否选择所有列
-	Columns   []*ColumnItem  // 选择的列
-	From      string         // FROM子句表名
-	FromAlias string         // FROM子句表别名
-	Joins     []*JoinClause  // JOIN子句
-	Where     *WhereClause   // WHERE子句
-	GroupBy   []Node         // GROUP BY子句
-	Having    *HavingClause  // HAVING子句
-	OrderBy   []*OrderByItem // ORDER BY子句
-	Limit     int64          // LIMIT子句
+	All          bool           // 是否选择所有列
+	Columns      []*ColumnItem  // 选择的列
+	From         string         // FROM子句表名
+	FromAlias    string         // FROM子句表别名
+	FromSubquery *SelectStmt    // FROM子句子查询
+	Joins        []*JoinClause  // JOIN子句
+	Where        *WhereClause   // WHERE子句
+	GroupBy      []Node         // GROUP BY子句
+	Having       *HavingClause  // HAVING子句
+	OrderBy      []*OrderByItem // ORDER BY子句
+	Limit        int64          // LIMIT子句
 }
 
 // UseStmt USE语句节点
@@ -175,7 +176,8 @@ type InsertStmt struct {
 	BaseNode
 	Table   string   // 表名
 	Columns []string // 列名列表
-	Values  []Node   // 值列表
+	Values  []Node   // 值列表 (单行，向后兼容)
+	Rows    [][]Node // 多行插入 (新增，如果非空则使用此字段)
 }
 
 // UpdateStmt UPDATE语句节点

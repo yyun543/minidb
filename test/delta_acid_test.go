@@ -15,8 +15,9 @@ import (
 
 // TestDeltaLakeACID tests ACID properties of Delta Lake implementation
 func TestDeltaLakeACID(t *testing.T) {
-	// Setup test environment
-	storageEngine, err := storage.NewParquetEngine("./test_data/delta_acid_test")
+	// Setup test environment with cleanup
+	testDir := SetupTestDir(t, "delta_acid_test")
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -245,7 +246,8 @@ func TestDeltaLakeACID(t *testing.T) {
 
 // TestDeltaLogSnapshot tests snapshot isolation
 func TestDeltaLogSnapshot(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/delta_snapshot_test")
+	testDir := SetupTestDir(t, "delta_snapshot_test")
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

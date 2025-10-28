@@ -65,14 +65,9 @@ func TestReadmeAllSQL(t *testing.T) {
 			return "Empty set"
 		}
 
-		batch := result.Batches()[0]
-		if batch.NumRows() == 0 {
-			return "Empty set"
-		}
-
 		var output strings.Builder
-		record := batch.Record()
 		headers := result.GetHeaders()
+		totalRows := int64(0)
 
 		// 格式化输出
 		output.WriteString("Result: ")
@@ -84,19 +79,33 @@ func TestReadmeAllSQL(t *testing.T) {
 		}
 		output.WriteString(" | ")
 
-		for row := int64(0); row < record.NumRows(); row++ {
-			if row > 0 {
-				output.WriteString("; ")
+		// Iterate through ALL batches, not just the first one
+		for _, batch := range result.Batches() {
+			if batch.NumRows() == 0 {
+				continue
 			}
-			for col := int64(0); col < record.NumCols(); col++ {
-				if col > 0 {
-					output.WriteString(", ")
+
+			record := batch.Record()
+			for row := int64(0); row < record.NumRows(); row++ {
+				if totalRows > 0 {
+					output.WriteString("; ")
 				}
-				array := record.Column(int(col))
-				output.WriteString(getArrayValue(array, int(row)))
+				for col := int64(0); col < record.NumCols(); col++ {
+					if col > 0 {
+						output.WriteString(", ")
+					}
+					array := record.Column(int(col))
+					output.WriteString(getArrayValue(array, int(row)))
+				}
+				totalRows++
 			}
 		}
-		output.WriteString(fmt.Sprintf(" (%d rows)", record.NumRows()))
+
+		if totalRows == 0 {
+			return "Empty set"
+		}
+
+		output.WriteString(fmt.Sprintf(" (%d rows)", totalRows))
 		return output.String()
 	}
 
@@ -307,6 +316,27 @@ func TestReadmeAllSQL(t *testing.T) {
 	assert.Contains(t, result, "150")    // John's second order (150) should remain
 	assert.NotContains(t, result, "100") // John's first order (100) should be deleted
 	t.Log("✅ DELETE verification - Success:", result)
+
+	// Test DELETE without WHERE clause (should delete all rows)
+	// First create a temporary table for this test
+	result, err = execSQL("CREATE TABLE temp_delete_test (id INT, value VARCHAR)")
+	assert.NoError(t, err, "Should create temp table successfully")
+	result, err = execSQL("INSERT INTO temp_delete_test VALUES (1, 'test1')")
+	assert.NoError(t, err, "Should insert test data")
+	result, err = execSQL("INSERT INTO temp_delete_test VALUES (2, 'test2')")
+	assert.NoError(t, err, "Should insert test data")
+
+	// Now test DELETE without WHERE
+	result, err = execSQL("DELETE FROM temp_delete_test")
+	assert.NoError(t, err, "Should execute DELETE without WHERE successfully")
+	t.Log("✅ DELETE without WHERE - Success")
+
+	// Verify all rows are deleted
+	result, err = execSQL("SELECT * FROM temp_delete_test")
+	assert.NoError(t, err, "Should query empty table successfully")
+	assert.NotContains(t, result, "test1", "All rows should be deleted")
+	assert.NotContains(t, result, "test2", "All rows should be deleted")
+	t.Log("✅ DELETE without WHERE verification - Success:", result)
 
 	// ========== Section 6: Result Formatting Tests (README lines 295-308) ==========
 	t.Log("=== Section 6: Result Formatting Tests ===")

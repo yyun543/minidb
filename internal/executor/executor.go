@@ -85,7 +85,7 @@ func NewExecutorWithDataManager(cat *catalog.Catalog, dm *DataManager) *Executor
 // Execute 执行查询计划
 func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	logger.WithComponent("executor").Info("Executing query plan",
-		zap.String("plan_type", plan.Type.String()),
+		zap.String("plan_type", string(plan.Type)),
 		zap.Int64("session_id", sess.ID))
 
 	start := time.Now()
@@ -107,15 +107,10 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 		result, err := e.executeCreateTable(plan, sess)
 		e.logExecutionResult("CREATE TABLE", start, err)
 		return result, err
-	case optimizer.CreateIndexPlan:
-		logger.WithComponent("executor").Debug("Executing CREATE INDEX plan")
-		result, err := e.executeCreateIndex(plan, sess)
-		e.logExecutionResult("CREATE INDEX", start, err)
-		return result, err
-	case optimizer.DropIndexPlan:
-		logger.WithComponent("executor").Debug("Executing DROP INDEX plan")
-		result, err := e.executeDropIndex(plan, sess)
-		e.logExecutionResult("DROP INDEX", start, err)
+	case optimizer.DropTablePlan:
+		logger.WithComponent("executor").Debug("Executing DROP TABLE plan")
+		result, err := e.executeDropTable(plan, sess)
+		e.logExecutionResult("DROP TABLE", start, err)
 		return result, err
 	case optimizer.ShowPlan:
 		logger.WithComponent("executor").Debug("Executing SHOW plan")
@@ -137,15 +132,40 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 		result, err := e.executeDelete(plan, sess)
 		e.logExecutionResult("DELETE", start, err)
 		return result, err
+	case optimizer.CreateIndexPlan:
+		logger.WithComponent("executor").Debug("Executing CREATE INDEX plan")
+		result, err := e.executeCreateIndex(plan, sess)
+		e.logExecutionResult("CREATE INDEX", start, err)
+		return result, err
+	case optimizer.DropIndexPlan:
+		logger.WithComponent("executor").Debug("Executing DROP INDEX plan")
+		result, err := e.executeDropIndex(plan, sess)
+		e.logExecutionResult("DROP INDEX", start, err)
+		return result, err
 	case optimizer.AnalyzePlan:
 		logger.WithComponent("executor").Debug("Executing ANALYZE TABLE plan")
 		result, err := e.executeAnalyze(plan, sess)
 		e.logExecutionResult("ANALYZE", start, err)
 		return result, err
+	case optimizer.TransactionPlan:
+		logger.WithComponent("executor").Debug("Executing TRANSACTION plan")
+		result, err := e.executeTransaction(plan, sess)
+		e.logExecutionResult("TRANSACTION", start, err)
+		return result, err
+	case optimizer.UsePlan:
+		logger.WithComponent("executor").Debug("Executing USE DATABASE plan")
+		result, err := e.executeUseDatabase(plan, sess)
+		e.logExecutionResult("USE", start, err)
+		return result, err
+	case optimizer.ExplainPlan:
+		logger.WithComponent("executor").Debug("Executing EXPLAIN plan")
+		result, err := e.executeExplain(plan, sess)
+		e.logExecutionResult("EXPLAIN", start, err)
+		return result, err
 	}
 
 	logger.WithComponent("executor").Debug("Executing query plan with operator tree",
-		zap.String("plan_type", plan.Type.String()))
+		zap.String("plan_type", string(plan.Type)))
 
 	// 创建执行上下文
 	ctxStart := time.Now()
@@ -158,7 +178,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	op, err := e.buildOperator(plan, ctx)
 	if err != nil {
 		logger.WithComponent("executor").Error("Failed to build operator tree",
-			zap.String("plan_type", plan.Type.String()),
+			zap.String("plan_type", string(plan.Type)),
 			zap.Duration("duration", time.Since(start)),
 			zap.Error(err))
 		return nil, err
@@ -170,7 +190,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	initStart := time.Now()
 	if err := op.Init(ctx); err != nil {
 		logger.WithComponent("executor").Error("Failed to initialize operator",
-			zap.String("plan_type", plan.Type.String()),
+			zap.String("plan_type", string(plan.Type)),
 			zap.Duration("duration", time.Since(start)),
 			zap.Error(err))
 		return nil, err
@@ -186,7 +206,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 		batch, err := op.Next()
 		if err != nil {
 			logger.WithComponent("executor").Error("Error during batch execution",
-				zap.String("plan_type", plan.Type.String()),
+				zap.String("plan_type", string(plan.Type)),
 				zap.Int("batches_processed", batchCount),
 				zap.Duration("duration", time.Since(start)),
 				zap.Error(err))
@@ -206,7 +226,7 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 	closeStart := time.Now()
 	if err := op.Close(); err != nil {
 		logger.WithComponent("executor").Error("Failed to close operator",
-			zap.String("plan_type", plan.Type.String()),
+			zap.String("plan_type", string(plan.Type)),
 			zap.Error(err))
 		return nil, err
 	}
@@ -224,35 +244,13 @@ func (e *ExecutorImpl) Execute(plan *optimizer.Plan, sess *session.Session) (*Re
 
 	totalDuration := time.Since(start)
 	logger.WithComponent("executor").Info("Query plan execution completed successfully",
-		zap.String("plan_type", plan.Type.String()),
+		zap.String("plan_type", string(plan.Type)),
 		zap.Int("result_batches", len(batches)),
 		zap.Int("result_columns", len(headers)),
 		zap.Duration("total_duration", totalDuration),
 		zap.Duration("result_building_duration", time.Since(resultStart)))
 
 	return result, nil
-}
-
-// parseTableReference 解析表引用，支持 "database.table" 或 "table" 格式
-func (e *ExecutorImpl) parseTableReference(tableRef string, currentDB string) (string, string) {
-	parts := strings.Split(tableRef, ".")
-	if len(parts) == 2 {
-		// "database.table" 格式
-		logger.WithComponent("executor").Debug("Parsed qualified table reference",
-			zap.String("input", tableRef),
-			zap.String("database", parts[0]),
-			zap.String("table", parts[1]))
-		return parts[0], parts[1]
-	}
-	// "table" 格式，使用当前数据库
-	if currentDB == "" {
-		currentDB = "default"
-	}
-	logger.WithComponent("executor").Debug("Parsed unqualified table reference",
-		zap.String("input", tableRef),
-		zap.String("database", currentDB),
-		zap.String("table", tableRef))
-	return currentDB, tableRef
 }
 
 // buildOperator 根据计划节点构建算子
@@ -271,13 +269,24 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 
 	case optimizer.TableScanPlan:
 		props := plan.Properties.(*optimizer.TableScanProperties)
-		// 解析表引用：支持 "database.table" 或 "table" 格式
-		dbName, tableName := e.parseTableReference(props.Table, ctx.Session.CurrentDB)
-		logger.WithComponent("executor").Info("Building TableScan operator",
-			zap.String("props.Table", props.Table),
-			zap.String("currentDB", ctx.Session.CurrentDB),
-			zap.String("resolved_db", dbName),
-			zap.String("resolved_table", tableName))
+		// 从上下文中获取当前数据库
+		currentDB := ctx.Session.CurrentDB
+		if currentDB == "" {
+			currentDB = "default"
+		}
+
+		// 检查表名是否已经包含数据库限定符 (如 "sys.table_name")
+		tableName := props.Table
+		dbName := currentDB
+		if strings.Contains(tableName, ".") {
+			// 表名已经限定数据库，分割并使用指定的数据库
+			parts := strings.SplitN(tableName, ".", 2)
+			if len(parts) == 2 {
+				dbName = parts[0]
+				tableName = parts[1]
+			}
+		}
+
 		return operators.NewTableScan(dbName, tableName, e.catalog, e.dataManager), nil
 
 	case optimizer.JoinPlan:
@@ -339,8 +348,10 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 		if err != nil {
 			return nil, err
 		}
-		// Create Limit operator (offset=0 for now, can be extended later)
-		return operators.NewLimit(int64(props.Limit), 0, child, ctx), nil
+		// For now, create a simple limit operator (can be implemented later)
+		// Return child for basic functionality
+		_ = props // avoid unused variable error
+		return child, nil
 
 	case optimizer.DropTablePlan:
 		// For DDL operations, create simple NoOp operator
@@ -415,7 +426,10 @@ func (e *ExecutorImpl) getResultHeaders(plan *optimizer.Plan, sess *session.Sess
 
 		columns := make([]string, len(props.Columns))
 		for i, col := range props.Columns {
-			if col.Table != "" {
+			// 优先使用别名
+			if col.Alias != "" {
+				columns[i] = col.Alias
+			} else if col.Table != "" {
 				columns[i] = fmt.Sprintf("%s.%s", col.Table, col.Column)
 			} else {
 				columns[i] = col.Column
@@ -470,7 +484,20 @@ func (e *ExecutorImpl) getSchemaFromPlan(plan *optimizer.Plan, sess *session.Ses
 		if currentDB == "" {
 			currentDB = "default"
 		}
-		if tableMeta, err := e.catalog.GetTable(currentDB, tableScanProps.Table); err == nil {
+
+		// 检查表名是否已经包含数据库限定符 (如 "sys.table_name")
+		tableName := tableScanProps.Table
+		dbName := currentDB
+		if strings.Contains(tableName, ".") {
+			// 表名已经限定数据库，分割并使用指定的数据库
+			parts := strings.SplitN(tableName, ".", 2)
+			if len(parts) == 2 {
+				dbName = parts[0]
+				tableName = parts[1]
+			}
+		}
+
+		if tableMeta, err := e.catalog.GetTable(dbName, tableName); err == nil {
 			headers := make([]string, len(tableMeta.Schema.Fields()))
 			for i, field := range tableMeta.Schema.Fields() {
 				headers[i] = field.Name
@@ -528,10 +555,10 @@ func (e *ExecutorImpl) executeCreateTable(plan *optimizer.Plan, sess *session.Se
 	// 创建 Arrow Schema
 	fields := make([]arrow.Field, len(props.Columns))
 	for i, col := range props.Columns {
-		// 从列定义中获取类型，默认根据列名推断
-		dataType := e.convertToArrowType(col.Column)
+		// 从列定义中获取类型 - 使用col.Type而不是col.Name
+		dataType := e.convertSQLTypeToArrow(col.Type)
 		fields[i] = arrow.Field{
-			Name: col.Column,
+			Name: col.Name,
 			Type: dataType,
 		}
 	}
@@ -567,14 +594,6 @@ func (e *ExecutorImpl) executeCreateTable(plan *optimizer.Plan, sess *session.Se
 func (e *ExecutorImpl) executeInsert(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.InsertProperties)
 
-	// 提取插入的值
-	values := make([]interface{}, len(props.Values))
-	for i, expr := range props.Values {
-		if lit, ok := expr.(*optimizer.LiteralValue); ok {
-			values[i] = lit.Value
-		}
-	}
-
 	// 使用会话中的当前数据库，默认为"default"
 	currentDB := sess.CurrentDB
 	if currentDB == "" {
@@ -597,10 +616,36 @@ func (e *ExecutorImpl) executeInsert(plan *optimizer.Plan, sess *session.Session
 		}
 	}
 
-	// 使用 DataManager 插入数据
-	err := e.dataManager.InsertData(currentDB, props.Table, columns, values)
-	if err != nil {
-		return nil, err
+	// 处理多行INSERT或单行INSERT
+	if len(props.Rows) > 0 {
+		// 多行INSERT - 逐行插入
+		for _, row := range props.Rows {
+			values := make([]interface{}, len(row))
+			for i, expr := range row {
+				if lit, ok := expr.(*optimizer.LiteralValue); ok {
+					values[i] = lit.Value
+				}
+			}
+
+			// 插入每一行
+			err := e.dataManager.InsertData(currentDB, props.Table, columns, values)
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert row: %w", err)
+			}
+		}
+	} else {
+		// 单行INSERT（向后兼容）
+		values := make([]interface{}, len(props.Values))
+		for i, expr := range props.Values {
+			if lit, ok := expr.(*optimizer.LiteralValue); ok {
+				values[i] = lit.Value
+			}
+		}
+
+		err := e.dataManager.InsertData(currentDB, props.Table, columns, values)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &ResultSet{
@@ -614,7 +659,44 @@ func (e *ExecutorImpl) executeInsert(plan *optimizer.Plan, sess *session.Session
 func (e *ExecutorImpl) executeUpdate(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.UpdateProperties)
 
-	// 解析赋值表达式，将Expression转换为实际值
+	// 使用会话中的当前数据库
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// Convert WHERE condition to storage filters
+	var filters []storage.Filter
+	if props.Where != nil {
+		filters = e.convertWhereToFilters(props.Where)
+	}
+
+	// Check if any assignments contain expressions (not just literals)
+	hasExpressions := false
+	for column, expr := range props.Assignments {
+		// Log the type of each assignment
+		logger.Info("Checking assignment type",
+			zap.String("column", column),
+			zap.String("type", fmt.Sprintf("%T", expr)))
+
+		// Check if it's a literal value
+		isLiteral := false
+		switch expr.(type) {
+		case *optimizer.LiteralValue, *parser.StringLiteral, *parser.IntegerLiteral, *parser.FloatLiteral, *parser.BooleanLiteral:
+			isLiteral = true
+		}
+		if !isLiteral {
+			hasExpressions = true
+			logger.Info("Found expression in UPDATE", zap.String("column", column))
+		}
+	}
+
+	// For expression-based updates, we need to read data, evaluate expressions, and write back
+	if hasExpressions {
+		return e.executeUpdateWithExpressions(currentDB, props.Table, props.Assignments, filters, sess)
+	}
+
+	// For simple literal updates, use the fast path
 	assignments := make(map[string]interface{})
 	for column, expr := range props.Assignments {
 		if litExpr, ok := expr.(*optimizer.LiteralValue); ok {
@@ -623,19 +705,13 @@ func (e *ExecutorImpl) executeUpdate(plan *optimizer.Plan, sess *session.Session
 			assignments[column] = strLit.Value
 		} else if intLit, ok := expr.(*parser.IntegerLiteral); ok {
 			assignments[column] = intLit.Value
+		} else if floatLit, ok := expr.(*parser.FloatLiteral); ok {
+			assignments[column] = floatLit.Value
+		} else if boolLit, ok := expr.(*parser.BooleanLiteral); ok {
+			assignments[column] = boolLit.Value
 		}
 	}
 
-	// 将WHERE表达式转换为storage.Filter
-	filters := e.whereToFilters(props.Where)
-
-	// 使用会话中的当前数据库
-	currentDB := sess.CurrentDB
-	if currentDB == "" {
-		currentDB = "default"
-	}
-
-	// 使用 DataManager 更新数据（传递filters而不是whereCondition）
 	err := e.dataManager.UpdateDataWithFilters(currentDB, props.Table, assignments, filters)
 	if err != nil {
 		return nil, err
@@ -646,6 +722,335 @@ func (e *ExecutorImpl) executeUpdate(plan *optimizer.Plan, sess *session.Session
 		rows:    []*types.Batch{},
 		curRow:  -1,
 	}, nil
+}
+
+// executeUpdateWithExpressions handles UPDATE statements with expressions (e.g., price = price * 1.1)
+func (e *ExecutorImpl) executeUpdateWithExpressions(dbName, tableName string, assignments map[string]interface{}, filters []storage.Filter, sess *session.Session) (*ResultSet, error) {
+	ctx := context.Background()
+	storageEngine := e.catalog.GetStorageEngine()
+
+	logger.Info("Executing UPDATE with expressions",
+		zap.String("table", fmt.Sprintf("%s.%s", dbName, tableName)),
+		zap.Int("assignments", len(assignments)),
+		zap.Int("filters", len(filters)))
+
+	// Read current data WITHOUT filters - we need original values to evaluate expressions
+	// We'll apply filters in-memory after reading
+	iter, err := storageEngine.Scan(ctx, dbName, tableName, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan table for update: %w", err)
+	}
+	defer iter.Close()
+
+	// Get table schema
+	schema, err := storageEngine.GetTableSchema(dbName, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table schema: %w", err)
+	}
+
+	// Create column name to index mapping
+	colNameToIdx := make(map[string]int)
+	for i, field := range schema.Fields() {
+		colNameToIdx[field.Name] = i
+	}
+
+	updatedCount := int64(0)
+
+	// Process each batch
+	for iter.Next() {
+		record := iter.Record()
+		if record == nil {
+			continue
+		}
+
+		logger.Info("Processing batch for expression UPDATE",
+			zap.Int64("rows", record.NumRows()))
+
+		// For each row, evaluate expressions and update
+		for rowIdx := int64(0); rowIdx < record.NumRows(); rowIdx++ {
+			// Check if row matches WHERE clause filters
+			if len(filters) > 0 {
+				matches := e.rowMatchesFilters(record, int(rowIdx), filters, colNameToIdx)
+				if !matches {
+					continue // Skip this row
+				}
+			}
+
+			// Build update map for this specific row
+			rowUpdates := make(map[string]interface{})
+
+			for column, expr := range assignments {
+				// Evaluate the expression for this row
+				value, err := e.evaluateExpression(expr, record, int(rowIdx), colNameToIdx)
+				if err != nil {
+					return nil, fmt.Errorf("failed to evaluate expression for column %s: %w", column, err)
+				}
+				rowUpdates[column] = value
+				logger.Info("Evaluated expression",
+					zap.String("column", column),
+					zap.Any("value", value),
+					zap.Int64("row", rowIdx))
+			}
+
+			// Create a filter for this specific row using primary key or all columns
+			// For simplicity, create filter using first column (usually id)
+			var rowFilter []storage.Filter
+			if len(schema.Fields()) > 0 {
+				firstCol := schema.Field(0)
+				firstColValue := e.getColumnValue(record, 0, int(rowIdx))
+				if firstColValue != nil {
+					rowFilter = append(rowFilter, storage.Filter{
+						Column:   firstCol.Name,
+						Operator: "=",
+						Value:    firstColValue,
+					})
+				}
+			}
+
+			// Perform update for this specific row
+			logger.Info("Applying update to row",
+				zap.String("table", tableName),
+				zap.Any("updates", rowUpdates),
+				zap.Any("filter", rowFilter))
+
+			if err := e.dataManager.UpdateDataWithFilters(dbName, tableName, rowUpdates, rowFilter); err != nil {
+				logger.Error("Failed to update row",
+					zap.Error(err),
+					zap.Any("updates", rowUpdates))
+				return nil, fmt.Errorf("failed to update row: %w", err)
+			}
+			updatedCount++
+		}
+	}
+
+	logger.Info("Expression UPDATE completed",
+		zap.Int64("updated_count", updatedCount))
+
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// evaluateExpression evaluates an expression for a specific row
+func (e *ExecutorImpl) evaluateExpression(expr interface{}, record arrow.Record, rowIdx int, colNameToIdx map[string]int) (interface{}, error) {
+	switch exprNode := expr.(type) {
+	case *optimizer.LiteralValue:
+		logger.Debug("Evaluating LiteralValue", zap.Any("value", exprNode.Value))
+		return exprNode.Value, nil
+	case *parser.StringLiteral:
+		return exprNode.Value, nil
+	case *parser.IntegerLiteral:
+		logger.Debug("Evaluating IntegerLiteral", zap.Int64("value", exprNode.Value))
+		return exprNode.Value, nil
+	case *parser.FloatLiteral:
+		logger.Debug("Evaluating FloatLiteral", zap.Float64("value", exprNode.Value))
+		return exprNode.Value, nil
+	case *parser.BooleanLiteral:
+		return exprNode.Value, nil
+	case *parser.BinaryExpr:
+		// Handle binary expressions like "price * 1.1" or "quantity + 10"
+		logger.Info("Evaluating BinaryExpr", zap.String("operator", exprNode.Operator))
+		left, err := e.evaluateExpression(exprNode.Left, record, rowIdx, colNameToIdx)
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("BinaryExpr left evaluated", zap.Any("value", left))
+
+		right, err := e.evaluateExpression(exprNode.Right, record, rowIdx, colNameToIdx)
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("BinaryExpr right evaluated", zap.Any("value", right))
+
+		// Perform the operation
+		result, err := e.performBinaryOperation(left, right, exprNode.Operator)
+		logger.Info("BinaryExpr result", zap.Any("result", result), zap.Error(err))
+		return result, err
+	case *parser.ColumnRef:
+		// Get the current value of the column for this row
+		colIdx, ok := colNameToIdx[exprNode.Column]
+		if !ok {
+			return nil, fmt.Errorf("column %s not found", exprNode.Column)
+		}
+		value := e.getColumnValue(record, colIdx, rowIdx)
+		logger.Info("Evaluating ColumnRef",
+			zap.String("column", exprNode.Column),
+			zap.Int("colIdx", colIdx),
+			zap.Int("rowIdx", rowIdx),
+			zap.Any("value", value))
+		return value, nil
+	default:
+		return nil, fmt.Errorf("unsupported expression type: %T", expr)
+	}
+}
+
+// performBinaryOperation performs arithmetic operations
+func (e *ExecutorImpl) performBinaryOperation(left, right interface{}, operator string) (interface{}, error) {
+	// Convert to float64 for arithmetic operations
+	leftFloat, leftOk := e.toFloat64(left)
+	rightFloat, rightOk := e.toFloat64(right)
+
+	if !leftOk || !rightOk {
+		return nil, fmt.Errorf("cannot perform arithmetic on non-numeric values")
+	}
+
+	switch operator {
+	case "+":
+		return leftFloat + rightFloat, nil
+	case "-":
+		return leftFloat - rightFloat, nil
+	case "*":
+		return leftFloat * rightFloat, nil
+	case "/":
+		if rightFloat == 0 {
+			return nil, fmt.Errorf("division by zero")
+		}
+		return leftFloat / rightFloat, nil
+	default:
+		return nil, fmt.Errorf("unsupported operator: %s", operator)
+	}
+}
+
+// toFloat64 converts a value to float64
+func (e *ExecutorImpl) toFloat64(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	default:
+		return 0, false
+	}
+}
+
+// rowMatchesFilters checks if a row matches all WHERE clause filters
+func (e *ExecutorImpl) rowMatchesFilters(record arrow.Record, rowIdx int, filters []storage.Filter, colNameToIdx map[string]int) bool {
+	for _, filter := range filters {
+		colIdx, exists := colNameToIdx[filter.Column]
+		if !exists {
+			return false
+		}
+
+		colValue := e.getColumnValue(record, colIdx, rowIdx)
+		filterValue := filter.Value
+
+		// Compare values based on operator
+		switch filter.Operator {
+		case "=":
+			if !e.valuesEqual(colValue, filterValue) {
+				return false
+			}
+		case ">":
+			if !e.valueGreater(colValue, filterValue) {
+				return false
+			}
+		case "<":
+			if !e.valueLess(colValue, filterValue) {
+				return false
+			}
+		case ">=":
+			if !e.valueGreaterOrEqual(colValue, filterValue) {
+				return false
+			}
+		case "<=":
+			if !e.valueLessOrEqual(colValue, filterValue) {
+				return false
+			}
+		case "!=":
+			if e.valuesEqual(colValue, filterValue) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// Helper comparison functions
+func (e *ExecutorImpl) valuesEqual(a, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	// Try numeric comparison
+	if aFloat, ok := e.toFloat64(a); ok {
+		if bFloat, ok := e.toFloat64(b); ok {
+			return aFloat == bFloat
+		}
+	}
+	// String comparison
+	return fmt.Sprint(a) == fmt.Sprint(b)
+}
+
+func (e *ExecutorImpl) valueGreater(a, b interface{}) bool {
+	if aFloat, ok := e.toFloat64(a); ok {
+		if bFloat, ok := e.toFloat64(b); ok {
+			return aFloat > bFloat
+		}
+	}
+	return false
+}
+
+func (e *ExecutorImpl) valueLess(a, b interface{}) bool {
+	if aFloat, ok := e.toFloat64(a); ok {
+		if bFloat, ok := e.toFloat64(b); ok {
+			return aFloat < bFloat
+		}
+	}
+	return false
+}
+
+func (e *ExecutorImpl) valueGreaterOrEqual(a, b interface{}) bool {
+	if aFloat, ok := e.toFloat64(a); ok {
+		if bFloat, ok := e.toFloat64(b); ok {
+			return aFloat >= bFloat
+		}
+	}
+	return false
+}
+
+func (e *ExecutorImpl) valueLessOrEqual(a, b interface{}) bool {
+	if aFloat, ok := e.toFloat64(a); ok {
+		if bFloat, ok := e.toFloat64(b); ok {
+			return aFloat <= bFloat
+		}
+	}
+	return false
+}
+
+// getColumnValue retrieves a column value from a record at a specific row
+func (e *ExecutorImpl) getColumnValue(record arrow.Record, colIdx, rowIdx int) interface{} {
+	column := record.Column(colIdx)
+	switch col := column.(type) {
+	case *array.Int64:
+		if col.IsNull(rowIdx) {
+			return nil
+		}
+		return col.Value(rowIdx)
+	case *array.Float64:
+		if col.IsNull(rowIdx) {
+			return nil
+		}
+		return col.Value(rowIdx)
+	case *array.String:
+		if col.IsNull(rowIdx) {
+			return nil
+		}
+		return col.Value(rowIdx)
+	case *array.Boolean:
+		if col.IsNull(rowIdx) {
+			return nil
+		}
+		return col.Value(rowIdx)
+	default:
+		return nil
+	}
 }
 
 // evaluateWhereCondition 评估WHERE条件
@@ -851,16 +1256,19 @@ func (e *ExecutorImpl) evaluateInCondition(record arrow.Record, rowIdx int, expr
 func (e *ExecutorImpl) executeDelete(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.DeleteProperties)
 
-	// 将WHERE表达式转换为storage.Filter
-	filters := e.whereToFilters(props.Where)
-
+	// 使用 DataManager 删除数据
 	// 使用会话中的当前数据库
 	currentDB := sess.CurrentDB
 	if currentDB == "" {
 		currentDB = "default"
 	}
 
-	// 使用 DataManager 删除数据（传递filters而不是whereCondition）
+	// Convert WHERE condition to storage filters
+	var filters []storage.Filter
+	if props.Where != nil {
+		filters = e.convertWhereToFilters(props.Where)
+	}
+
 	err := e.dataManager.DeleteDataWithFilters(currentDB, props.Table, filters)
 	if err != nil {
 		return nil, err
@@ -905,114 +1313,292 @@ func (e *ExecutorImpl) executeDropDatabase(plan *optimizer.Plan, sess *session.S
 	}, nil
 }
 
+// executeDropTable 执行删除表操作
+func (e *ExecutorImpl) executeDropTable(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.DropTableProperties)
+
+	// 使用会话中的当前数据库
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// 从catalog中删除表元数据
+	err := e.catalog.DropTable(currentDB, props.Table)
+	if err != nil {
+		return nil, fmt.Errorf("failed to drop table: %w", err)
+	}
+
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// executeCreateIndex 执行创建索引操作
+func (e *ExecutorImpl) executeCreateIndex(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.CreateIndexProperties)
+
+	// 使用会话中的当前数据库
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// 构建IndexMeta
+	indexMeta := catalog.IndexMeta{
+		Database:  currentDB,
+		Table:     props.Table,
+		Name:      props.Name,
+		Columns:   props.Columns,
+		IsUnique:  props.IsUnique,
+		IndexType: "BTREE", // 默认使用BTREE索引
+	}
+
+	// 调用catalog创建索引
+	err := e.catalog.CreateIndex(indexMeta)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create index: %w", err)
+	}
+
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// executeDropIndex 执行删除索引操作
+func (e *ExecutorImpl) executeDropIndex(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.DropIndexProperties)
+
+	// 使用会话中的当前数据库
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// 调用catalog删除索引
+	err := e.catalog.DropIndex(currentDB, props.Table, props.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to drop index: %w", err)
+	}
+
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// executeAnalyze 执行ANALYZE TABLE命令
+func (e *ExecutorImpl) executeAnalyze(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.AnalyzeProperties)
+
+	// 使用会话中的当前数据库
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// TODO: 实际实现统计信息收集
+	// 当前作为占位符，返回成功
+	logger.WithComponent("executor").Info("Analyzing table statistics",
+		zap.String("database", currentDB),
+		zap.String("table", props.Table),
+		zap.Strings("columns", props.Columns))
+
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// executeTransaction 执行事务控制命令 (START TRANSACTION, COMMIT, ROLLBACK)
+func (e *ExecutorImpl) executeTransaction(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.TransactionProperties)
+
+	// TODO: 实现完整的事务控制
+	// 当前作为占位符，记录事务操作
+	logger.WithComponent("executor").Info("Transaction operation",
+		zap.String("type", props.Type),
+		zap.Int64("session_id", sess.ID))
+
+	// 根据事务类型更新会话状态 (未来可用于事务管理)
+	switch props.Type {
+	case "BEGIN", "START":
+		// 标记事务开始
+		logger.WithComponent("executor").Debug("Transaction started", zap.Int64("session_id", sess.ID))
+	case "COMMIT":
+		// 提交事务
+		logger.WithComponent("executor").Debug("Transaction committed", zap.Int64("session_id", sess.ID))
+	case "ROLLBACK":
+		// 回滚事务
+		logger.WithComponent("executor").Debug("Transaction rolled back", zap.Int64("session_id", sess.ID))
+	}
+
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// executeUseDatabase 执行USE DATABASE命令
+func (e *ExecutorImpl) executeUseDatabase(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.UseProperties)
+
+	// 检查数据库是否存在
+	_, err := e.catalog.GetDatabase(props.Database)
+	if err != nil {
+		return nil, fmt.Errorf("database '%s' does not exist", props.Database)
+	}
+
+	// 更新会话的当前数据库
+	sess.CurrentDB = props.Database
+
+	logger.WithComponent("executor").Info("Database switched",
+		zap.String("database", props.Database),
+		zap.Int64("session_id", sess.ID))
+
+	return &ResultSet{
+		Headers: []string{"status"},
+		rows:    []*types.Batch{},
+		curRow:  -1,
+	}, nil
+}
+
+// executeExplain 执行EXPLAIN命令
+func (e *ExecutorImpl) executeExplain(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
+	props := plan.Properties.(*optimizer.ExplainProperties)
+
+	// 生成执行计划的文本表示
+	planText := e.explainPlan(props.Query, 0)
+
+	// 创建包含执行计划的结果集
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "Query Plan", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	// 添加执行计划文本
+	strBuilder := builder.Field(0).(*array.StringBuilder)
+	strBuilder.Append(planText)
+
+	record := builder.NewRecord()
+	batch := types.NewBatch(record)
+
+	return &ResultSet{
+		Headers: []string{"Query Plan"},
+		rows:    []*types.Batch{batch},
+		curRow:  -1,
+	}, nil
+}
+
+// explainPlan 生成执行计划的文本表示
+func (e *ExecutorImpl) explainPlan(plan *optimizer.Plan, depth int) string {
+	if plan == nil {
+		return ""
+	}
+
+	indent := strings.Repeat("  ", depth)
+	result := indent + plan.Type.String()
+
+	if plan.Properties != nil {
+		if explainable, ok := plan.Properties.(optimizer.PlanProperties); ok {
+			result += "\n" + indent + "  " + explainable.Explain()
+		}
+	}
+
+	for _, child := range plan.Children {
+		childPlan := e.explainPlan(child, depth+1)
+		if childPlan != "" {
+			result += "\n" + childPlan
+		}
+	}
+
+	return result
+}
+
 // executeShow 执行SHOW命令
 func (e *ExecutorImpl) executeShow(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
-	// 使用类型断言判断是ShowProperties还是ShowIndexesProperties
-	switch props := plan.Properties.(type) {
-	case *optimizer.ShowProperties:
-		// 处理 SHOW DATABASES 和 SHOW TABLES
-		switch props.Type {
-		case "DATABASES":
-			databaseNames, err := e.catalog.GetAllDatabases()
-			if err != nil {
-				return nil, err
-			}
+	// 首先检查是否是 SHOW INDEXES
+	if indexProps, ok := plan.Properties.(*optimizer.ShowIndexesProperties); ok {
+		return e.executeShowIndexes(indexProps, sess)
+	}
 
-			// 如果没有数据库，返回空结果集
-			if len(databaseNames) == 0 {
-				return &ResultSet{
-					Headers: []string{"Database"},
-					rows:    []*types.Batch{},
-					curRow:  -1,
-				}, nil
-			}
+	// 否则处理常规 SHOW 命令
+	props := plan.Properties.(*optimizer.ShowProperties)
 
-			// 创建包含数据库名的结果集
-			batch, err := e.createDatabaseListBatch(databaseNames)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create database list batch: %w", err)
-			}
+	switch props.Type {
+	case "DATABASES":
+		databaseNames, err := e.catalog.GetAllDatabases()
+		if err != nil {
+			return nil, err
+		}
 
+		// 如果没有数据库，返回空结果集
+		if len(databaseNames) == 0 {
 			return &ResultSet{
 				Headers: []string{"Database"},
-				rows:    []*types.Batch{batch},
-				curRow:  -1,
-			}, nil
-
-		case "TABLES":
-			// 获取当前数据库名
-			currentDB := sess.CurrentDB
-			if currentDB == "" {
-				currentDB = "default"
-			}
-
-			// 从catalog获取表列表
-			tableNames, err := e.catalog.GetAllTables(currentDB)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get table list: %w", err)
-			}
-
-			// 如果没有表，返回空结果集但不出错
-			if len(tableNames) == 0 {
-				return &ResultSet{
-					Headers: []string{"Tables_in_" + currentDB},
-					rows:    []*types.Batch{},
-					curRow:  -1,
-				}, nil
-			}
-
-			// 创建包含表名的结果集
-			batch, err := e.createTableListBatch(tableNames, currentDB)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create table list batch: %w", err)
-			}
-
-			return &ResultSet{
-				Headers: []string{"Tables_in_" + currentDB},
-				rows:    []*types.Batch{batch},
-				curRow:  -1,
-			}, nil
-
-		default:
-			return nil, fmt.Errorf("unsupported SHOW type: %s", props.Type)
-		}
-
-	case *optimizer.ShowIndexesProperties:
-		// 处理 SHOW INDEXES
-		currentDB := sess.CurrentDB
-		if currentDB == "" {
-			currentDB = "default"
-		}
-
-		// 从catalog获取索引列表
-		indexes, err := e.catalog.GetAllIndexes(currentDB, props.Table)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get indexes: %w", err)
-		}
-
-		// 如果没有索引，返回空结果集
-		if len(indexes) == 0 {
-			return &ResultSet{
-				Headers: []string{"Table", "Index_name", "Column_name", "Is_unique"},
 				rows:    []*types.Batch{},
 				curRow:  -1,
 			}, nil
 		}
 
-		// 创建包含索引信息的结果集
-		batch, err := e.createIndexListBatch(indexes, props.Table)
+		// 创建包含数据库名的结果集
+		batch, err := e.createDatabaseListBatch(databaseNames)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create index list batch: %w", err)
+			return nil, fmt.Errorf("failed to create database list batch: %w", err)
 		}
 
 		return &ResultSet{
-			Headers: []string{"Table", "Index_name", "Column_name", "Is_unique"},
+			Headers: []string{"Database"},
+			rows:    []*types.Batch{batch},
+			curRow:  -1,
+		}, nil
+
+	case "TABLES":
+		// 获取当前数据库名
+		currentDB := sess.CurrentDB
+		if currentDB == "" {
+			currentDB = "default"
+		}
+
+		// 从catalog获取表列表
+		tableNames, err := e.catalog.GetAllTables(currentDB)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get table list: %w", err)
+		}
+
+		// 如果没有表，返回空结果集但不出错
+		if len(tableNames) == 0 {
+			return &ResultSet{
+				Headers: []string{"Tables_in_" + currentDB},
+				rows:    []*types.Batch{},
+				curRow:  -1,
+			}, nil
+		}
+
+		// 创建包含表名的结果集
+		batch, err := e.createTableListBatch(tableNames, currentDB)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create table list batch: %w", err)
+		}
+
+		return &ResultSet{
+			Headers: []string{"Tables_in_" + currentDB},
 			rows:    []*types.Batch{batch},
 			curRow:  -1,
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("unsupported SHOW properties type: %T", props)
+		return nil, fmt.Errorf("unsupported SHOW type: %s", props.Type)
 	}
 }
 
@@ -1070,14 +1656,35 @@ func (e *ExecutorImpl) createDatabaseListBatch(databaseNames []string) (*types.B
 	return batch, nil
 }
 
-// createIndexListBatch 创建包含索引信息的批次数据
-func (e *ExecutorImpl) createIndexListBatch(indexes []catalog.IndexMeta, tableName string) (*types.Batch, error) {
-	// 创建Arrow schema，包含四个字符串列
+// executeShowIndexes 执行SHOW INDEXES命令
+func (e *ExecutorImpl) executeShowIndexes(props *optimizer.ShowIndexesProperties, sess *session.Session) (*ResultSet, error) {
+	// 获取当前数据库名
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// 从catalog获取索引列表
+	indexes, err := e.catalog.GetAllIndexes(currentDB, props.Table)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get indexes: %w", err)
+	}
+
+	// 如果没有索引，返回空结果集
+	if len(indexes) == 0 {
+		return &ResultSet{
+			Headers: []string{"Index Name", "Table", "Columns", "Unique"},
+			rows:    []*types.Batch{},
+			curRow:  -1,
+		}, nil
+	}
+
+	// 创建Arrow schema
 	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "Index Name", Type: arrow.BinaryTypes.String},
 		{Name: "Table", Type: arrow.BinaryTypes.String},
-		{Name: "Index_name", Type: arrow.BinaryTypes.String},
-		{Name: "Column_name", Type: arrow.BinaryTypes.String},
-		{Name: "Is_unique", Type: arrow.BinaryTypes.String},
+		{Name: "Columns", Type: arrow.BinaryTypes.String},
+		{Name: "Unique", Type: arrow.BinaryTypes.String},
 	}, nil)
 
 	// 创建Arrow记录
@@ -1085,23 +1692,15 @@ func (e *ExecutorImpl) createIndexListBatch(indexes []catalog.IndexMeta, tableNa
 	builder := array.NewRecordBuilder(pool, schema)
 	defer builder.Release()
 
-	// 获取各列的builder
-	tableBuilder := builder.Field(0).(*array.StringBuilder)
-	indexNameBuilder := builder.Field(1).(*array.StringBuilder)
-	columnNameBuilder := builder.Field(2).(*array.StringBuilder)
-	isUniqueBuilder := builder.Field(3).(*array.StringBuilder)
-
 	// 填充索引数据
 	for _, index := range indexes {
-		for _, column := range index.Columns {
-			tableBuilder.Append(tableName)
-			indexNameBuilder.Append(index.Name)
-			columnNameBuilder.Append(column)
-			if index.IsUnique {
-				isUniqueBuilder.Append("YES")
-			} else {
-				isUniqueBuilder.Append("NO")
-			}
+		builder.Field(0).(*array.StringBuilder).Append(index.Name)
+		builder.Field(1).(*array.StringBuilder).Append(index.Table)
+		builder.Field(2).(*array.StringBuilder).Append(strings.Join(index.Columns, ","))
+		if index.IsUnique {
+			builder.Field(3).(*array.StringBuilder).Append("YES")
+		} else {
+			builder.Field(3).(*array.StringBuilder).Append("NO")
 		}
 	}
 
@@ -1111,7 +1710,12 @@ func (e *ExecutorImpl) createIndexListBatch(indexes []catalog.IndexMeta, tableNa
 
 	// 创建批次
 	batch := types.NewBatch(record)
-	return batch, nil
+
+	return &ResultSet{
+		Headers: []string{"Index Name", "Table", "Columns", "Unique"},
+		rows:    []*types.Batch{batch},
+		curRow:  -1,
+	}, nil
 }
 
 // convertToArrowType 将字符串类型转换为 Arrow 类型
@@ -1148,586 +1752,88 @@ func (e *ExecutorImpl) convertSQLTypeToArrow(sqlType string) arrow.DataType {
 	}
 }
 
-// executeCreateIndex 执行创建索引操作
-func (e *ExecutorImpl) executeCreateIndex(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
-	props := plan.Properties.(*optimizer.CreateIndexProperties)
-
-	currentDB := sess.CurrentDB
-	if currentDB == "" {
-		currentDB = "default"
-	}
-
-	// 创建索引元数据
-	indexMeta := catalog.IndexMeta{
-		Database:  currentDB,
-		Table:     props.Table,
-		Name:      props.Name,
-		Columns:   props.Columns,
-		IsUnique:  props.IsUnique,
-		IndexType: "BTREE", // 默认使用B树索引
-	}
-
-	// 调用catalog创建索引
-	err := e.catalog.CreateIndex(indexMeta)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create index: %w", err)
-	}
-
-	// 返回成功结果
-	return &ResultSet{
-		Headers: []string{"status"},
-		rows:    []*types.Batch{},
-		curRow:  -1,
-	}, nil
-}
-
-// executeDropIndex 执行删除索引操作
-func (e *ExecutorImpl) executeDropIndex(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
-	props := plan.Properties.(*optimizer.DropIndexProperties)
-
-	currentDB := sess.CurrentDB
-	if currentDB == "" {
-		currentDB = "default"
-	}
-
-	// 调用catalog删除索引
-	err := e.catalog.DropIndex(currentDB, props.Table, props.Name)
-	if err != nil {
-		return nil, fmt.Errorf("failed to drop index: %w", err)
-	}
-
-	// 返回成功结果
-	return &ResultSet{
-		Headers: []string{"status"},
-		rows:    []*types.Batch{},
-		curRow:  -1,
-	}, nil
-}
-
-// whereToFilters converts WHERE expression to storage.Filter slice
-func (e *ExecutorImpl) whereToFilters(whereExpr interface{}) []storage.Filter {
-	if whereExpr == nil {
-		logger.Debug("whereToFilters: no WHERE clause")
-		return []storage.Filter{}
-	}
-
+// convertWhereToFilters 将WHERE条件表达式转换为storage.Filter数组
+func (e *ExecutorImpl) convertWhereToFilters(whereExpr interface{}) []storage.Filter {
 	var filters []storage.Filter
 
-	// Handle BinaryExpr (e.g., "name = 'John'" or "age > 25")
+	// 处理BinaryExpr（如 price > 100, id = 1）
 	if binExpr, ok := whereExpr.(*parser.BinaryExpr); ok {
 		filter := e.binaryExprToFilter(binExpr)
 		if filter != nil {
 			filters = append(filters, *filter)
-			logger.Debug("whereToFilters: converted BinaryExpr to filter",
-				zap.String("column", filter.Column),
-				zap.String("operator", filter.Operator),
-				zap.Any("value", filter.Value))
-		} else {
-			logger.Warn("whereToFilters: failed to convert BinaryExpr to filter")
 		}
-	} else {
-		logger.Warn("whereToFilters: WHERE expression is not a BinaryExpr",
-			zap.String("type", fmt.Sprintf("%T", whereExpr)))
 	}
 
-	// Handle AND expressions (multiple filters)
-	// 实现对 OR, NOT, AND 和复杂表达式的支持
-	if logicalExpr, ok := whereExpr.(*parser.LogicalExpr); ok {
-		switch logicalExpr.Operator {
-		case "AND":
-			// 处理 AND 表达式：递归处理左右子表达式
-			leftFilters := e.whereToFilters(logicalExpr.Left)
-			rightFilters := e.whereToFilters(logicalExpr.Right)
-			filters = append(filters, leftFilters...)
-			filters = append(filters, rightFilters...)
-			logger.Debug("whereToFilters: processed AND expression",
-				zap.Int("left_filters", len(leftFilters)),
-				zap.Int("right_filters", len(rightFilters)))
-		case "OR":
-			// 处理 OR 表达式：在简化实现中，OR操作较复杂
-			// 当前设计中每个storage.Filter表示一个AND条件
-			// 对于OR操作，我们需要特殊处理或在更高层实现
-			logger.Warn("whereToFilters: OR expressions not fully supported yet",
-				zap.String("suggestion", "consider using IN operator or multiple queries"))
-			// 暂时处理为分别收集两边的过滤条件（这不是真正的OR语义）
-			leftFilters := e.whereToFilters(logicalExpr.Left)
-			rightFilters := e.whereToFilters(logicalExpr.Right)
-			// 注意：这里的实现不是真正的OR逻辑，需要在storage层改进
-			filters = append(filters, leftFilters...)
-			filters = append(filters, rightFilters...)
-		case "NOT":
-			// 处理 NOT 表达式：需要将内部条件取反
-			// 注意：在LogicalExpr中，NOT是一元操作，只有Left操作数
-			innerFilters := e.whereToFilters(logicalExpr.Left)
-			for _, filter := range innerFilters {
-				// 将操作符取反
-				negatedFilter := e.negateFilter(filter)
-				if negatedFilter != nil {
-					filters = append(filters, *negatedFilter)
-					logger.Debug("whereToFilters: negated filter",
-						zap.String("original_op", filter.Operator),
-						zap.String("negated_op", negatedFilter.Operator))
-				}
-			}
+	// 处理InExpr（如 id IN (1, 2, 3)）
+	if inExpr, ok := whereExpr.(*parser.InExpr); ok {
+		filter := e.inExprToFilter(inExpr)
+		if filter != nil {
+			filters = append(filters, *filter)
 		}
 	}
 
 	return filters
 }
 
-// binaryExprToFilter converts a binary expression to a storage.Filter
+// binaryExprToFilter 将二元表达式转换为Filter
 func (e *ExecutorImpl) binaryExprToFilter(expr *parser.BinaryExpr) *storage.Filter {
-	// Left side should be a column reference
+	// 提取列名
 	var column string
 	if colRef, ok := expr.Left.(*parser.ColumnRef); ok {
 		column = colRef.Column
 	} else {
-		logger.Warn("binaryExprToFilter: left side is not a column reference",
-			zap.String("type", fmt.Sprintf("%T", expr.Left)))
-		return nil // Cannot convert non-column reference
+		return nil // 不支持的左操作数类型
 	}
 
-	// Operator mapping
-	operator := expr.Operator
-
-	// Right side should be a literal value
+	// 提取值
 	var value interface{}
-	switch right := expr.Right.(type) {
-	case *parser.StringLiteral:
-		value = right.Value
-	case *parser.IntegerLiteral:
-		value = right.Value
-	case *parser.FloatLiteral:
-		value = right.Value
-	case *parser.BooleanLiteral:
-		value = right.Value
-	default:
-		logger.Warn("binaryExprToFilter: right side is not a literal",
-			zap.String("type", fmt.Sprintf("%T", expr.Right)))
-		return nil // Cannot convert non-literal value
+	if intLit, ok := expr.Right.(*parser.IntegerLiteral); ok {
+		value = intLit.Value
+	} else if strLit, ok := expr.Right.(*parser.StringLiteral); ok {
+		value = strLit.Value
+	} else if floatLit, ok := expr.Right.(*parser.FloatLiteral); ok {
+		value = floatLit.Value
+	} else if boolLit, ok := expr.Right.(*parser.BooleanLiteral); ok {
+		value = boolLit.Value
+	} else {
+		return nil // 不支持的右操作数类型
 	}
-
-	logger.Debug("binaryExprToFilter: successfully converted",
-		zap.String("column", column),
-		zap.String("operator", operator),
-		zap.Any("value", value))
 
 	return &storage.Filter{
 		Column:   column,
-		Operator: operator,
+		Operator: expr.Operator,
 		Value:    value,
 	}
 }
 
-// negateFilter 将过滤条件取反
-func (e *ExecutorImpl) negateFilter(filter storage.Filter) *storage.Filter {
-	var negatedOp string
-
-	// 将操作符映射到其否定形式
-	switch filter.Operator {
-	case "=":
-		negatedOp = "!="
-	case "!=", "<>":
-		negatedOp = "="
-	case "<":
-		negatedOp = ">="
-	case "<=":
-		negatedOp = ">"
-	case ">":
-		negatedOp = "<="
-	case ">=":
-		negatedOp = "<"
-	case "LIKE":
-		negatedOp = "NOT LIKE"
-	case "NOT LIKE":
-		negatedOp = "LIKE"
-	case "IN":
-		negatedOp = "NOT IN"
-	case "NOT IN":
-		negatedOp = "IN"
-	default:
-		// 对于不支持的操作符，记录警告并返回nil
-		logger.Warn("negateFilter: unsupported operator for negation",
-			zap.String("operator", filter.Operator))
+// inExprToFilter 将IN表达式转换为Filter
+func (e *ExecutorImpl) inExprToFilter(expr *parser.InExpr) *storage.Filter {
+	// 提取列名
+	var column string
+	if colRef, ok := expr.Left.(*parser.ColumnRef); ok {
+		column = colRef.Column
+	} else {
 		return nil
 	}
 
+	// 提取值列表
+	var values []interface{}
+	for _, val := range expr.Values {
+		if intLit, ok := val.(*parser.IntegerLiteral); ok {
+			values = append(values, intLit.Value)
+		} else if strLit, ok := val.(*parser.StringLiteral); ok {
+			values = append(values, strLit.Value)
+		} else if floatLit, ok := val.(*parser.FloatLiteral); ok {
+			values = append(values, floatLit.Value)
+		}
+	}
+
+	// 使用已经解析的操作符（IN 或 NOT IN）
+	operator := expr.Operator
+
 	return &storage.Filter{
-		Column:   filter.Column,
-		Operator: negatedOp,
-		Value:    filter.Value,
+		Column:   column,
+		Operator: operator,
+		Values:   values,
 	}
-}
-
-// executeAnalyze 执行ANALYZE TABLE语句
-func (e *ExecutorImpl) executeAnalyze(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
-	props, ok := plan.Properties.(*optimizer.AnalyzeProperties)
-	if !ok {
-		return nil, fmt.Errorf("invalid ANALYZE plan properties")
-	}
-
-	logger.WithComponent("executor").Info("Executing ANALYZE TABLE",
-		zap.String("table", props.Table),
-		zap.Strings("columns", props.Columns))
-
-	// 解析表名（可能包含数据库名）
-	tableParts := strings.Split(props.Table, ".")
-	var dbName, tableName string
-	if len(tableParts) == 2 {
-		dbName = tableParts[0]
-		tableName = tableParts[1]
-	} else {
-		dbName = sess.CurrentDB
-		tableName = props.Table
-	}
-
-	if dbName == "" {
-		return nil, fmt.Errorf("no database selected")
-	}
-
-	// 检查表是否存在
-	table, err := e.catalog.GetTable(dbName, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("table %s.%s not found: %w", dbName, tableName, err)
-	}
-
-	// 获取ParquetEngine通过类型断言
-	storageEngine := e.catalog.GetStorageEngine()
-	engine, ok := storageEngine.(*storage.ParquetEngine)
-	if !ok {
-		return nil, fmt.Errorf("storage engine is not ParquetEngine")
-	}
-
-	// 确保sys数据库和系统表存在
-	if err := e.ensureSystemTables(engine); err != nil {
-		return nil, fmt.Errorf("failed to ensure system tables: %w", err)
-	}
-
-	// 收集表级统计信息
-	if err := e.collectTableStatistics(engine, dbName, tableName); err != nil {
-		return nil, fmt.Errorf("failed to collect table statistics: %w", err)
-	}
-
-	// 收集列级统计信息
-	columns := props.Columns
-	if len(columns) == 0 {
-		// 如果未指定列，收集所有列的统计信息
-		for _, field := range table.Schema.Fields() {
-			columns = append(columns, field.Name)
-		}
-	}
-
-	if err := e.collectColumnStatistics(engine, dbName, tableName, columns); err != nil {
-		return nil, fmt.Errorf("failed to collect column statistics: %w", err)
-	}
-
-	logger.WithComponent("executor").Info("ANALYZE TABLE completed successfully",
-		zap.String("table", props.Table),
-		zap.Int("columns_analyzed", len(columns)))
-
-	// 返回成功消息
-	return &ResultSet{
-		Headers: []string{"status"},
-		rows:    []*types.Batch{},
-		curRow:  -1,
-	}, nil
-}
-
-// ensureSystemTables 确保系统表存在
-func (e *ExecutorImpl) ensureSystemTables(engine *storage.ParquetEngine) error {
-	// 创建sys数据库（如果不存在）
-	if err := engine.CreateDatabase("sys"); err != nil && !strings.Contains(err.Error(), "already exists") {
-		return fmt.Errorf("failed to create sys database: %w", err)
-	}
-
-	// 创建sys.table_statistics表（如果不存在）
-	tableStatsSchema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_id", Type: arrow.BinaryTypes.String},
-		{Name: "version", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "file_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "total_size_bytes", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "last_updated", Type: arrow.PrimitiveTypes.Int64},
-	}, nil)
-
-	if err := engine.CreateTable("sys", "table_statistics", tableStatsSchema); err != nil && !strings.Contains(err.Error(), "already exists") {
-		return fmt.Errorf("failed to create sys.table_statistics: %w", err)
-	}
-
-	// 创建sys.column_statistics表（如果不存在）
-	columnStatsSchema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_id", Type: arrow.BinaryTypes.String},
-		{Name: "column_name", Type: arrow.BinaryTypes.String},
-		{Name: "data_type", Type: arrow.BinaryTypes.String},
-		{Name: "min_value", Type: arrow.BinaryTypes.String},
-		{Name: "max_value", Type: arrow.BinaryTypes.String},
-		{Name: "null_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "distinct_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "last_updated", Type: arrow.PrimitiveTypes.Int64},
-	}, nil)
-
-	if err := engine.CreateTable("sys", "column_statistics", columnStatsSchema); err != nil && !strings.Contains(err.Error(), "already exists") {
-		return fmt.Errorf("failed to create sys.column_statistics: %w", err)
-	}
-
-	return nil
-}
-
-// collectTableStatistics 收集表级统计信息
-func (e *ExecutorImpl) collectTableStatistics(engine *storage.ParquetEngine, dbName, tableName string) error {
-	tableID := fmt.Sprintf("%s.%s", dbName, tableName)
-
-	// 使用COUNT(*)查询获取行数
-	rowCount, err := e.getRowCount(engine, dbName, tableName)
-	if err != nil {
-		return fmt.Errorf("failed to get row count: %w", err)
-	}
-
-	// 构建统计记录
-	pool := memory.NewGoAllocator()
-	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_id", Type: arrow.BinaryTypes.String},
-		{Name: "version", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "file_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "total_size_bytes", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "last_updated", Type: arrow.PrimitiveTypes.Int64},
-	}, nil)
-
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
-
-	builder.Field(0).(*array.StringBuilder).Append(tableID)
-	builder.Field(1).(*array.Int64Builder).Append(0) // version: 0 for now
-	builder.Field(2).(*array.Int64Builder).Append(rowCount)
-	builder.Field(3).(*array.Int64Builder).Append(0) // file_count: 0 for now
-	builder.Field(4).(*array.Int64Builder).Append(0) // total_size_bytes: 0 for now
-	builder.Field(5).(*array.Int64Builder).Append(time.Now().Unix())
-
-	record := builder.NewRecord()
-	defer record.Release()
-
-	// 写入sys.table_statistics
-	ctx := context.Background()
-	if err := engine.Write(ctx, "sys", "table_statistics", record); err != nil {
-		return fmt.Errorf("failed to write table statistics: %w", err)
-	}
-
-	logger.WithComponent("executor").Info("Table statistics collected",
-		zap.String("table_id", tableID),
-		zap.Int64("row_count", rowCount))
-
-	return nil
-}
-
-// collectColumnStatistics 收集列级统计信息
-func (e *ExecutorImpl) collectColumnStatistics(engine *storage.ParquetEngine, dbName, tableName string, columns []string) error {
-	tableID := fmt.Sprintf("%s.%s", dbName, tableName)
-
-	// 获取表schema
-	table, err := e.catalog.GetTable(dbName, tableName)
-	if err != nil {
-		return fmt.Errorf("failed to get table: %w", err)
-	}
-
-	pool := memory.NewGoAllocator()
-	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "table_id", Type: arrow.BinaryTypes.String},
-		{Name: "column_name", Type: arrow.BinaryTypes.String},
-		{Name: "data_type", Type: arrow.BinaryTypes.String},
-		{Name: "min_value", Type: arrow.BinaryTypes.String},
-		{Name: "max_value", Type: arrow.BinaryTypes.String},
-		{Name: "null_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "distinct_count", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "last_updated", Type: arrow.PrimitiveTypes.Int64},
-	}, nil)
-
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
-
-	// 扫描表数据收集统计
-	ctx := context.Background()
-	iterator, err := engine.Scan(ctx, dbName, tableName, nil)
-	if err != nil {
-		return fmt.Errorf("failed to scan table: %w", err)
-	}
-
-	// 为每个列初始化统计收集器
-	columnStats := make(map[string]*ColumnStatsCollector)
-	for _, colName := range columns {
-		// 查找列的数据类型
-		var colType arrow.DataType
-		for _, field := range table.Schema.Fields() {
-			if field.Name == colName {
-				colType = field.Type
-				break
-			}
-		}
-		if colType == nil {
-			logger.WithComponent("executor").Warn("Column not found in schema, skipping",
-				zap.String("column", colName))
-			continue
-		}
-		columnStats[colName] = NewColumnStatsCollector(colType)
-	}
-
-	// 遍历数据收集统计
-	for iterator.Next() {
-		record := iterator.Record()
-		for colName, collector := range columnStats {
-			// 找到列索引
-			colIdx := -1
-			for i, field := range record.Schema().Fields() {
-				if field.Name == colName {
-					colIdx = i
-					break
-				}
-			}
-			if colIdx >= 0 {
-				collector.Collect(record.Column(colIdx))
-			}
-		}
-	}
-
-	if err := iterator.Err(); err != nil {
-		return fmt.Errorf("iterator error: %w", err)
-	}
-
-	// 构建统计记录
-	timestamp := time.Now().Unix()
-	for _, colName := range columns {
-		collector, ok := columnStats[colName]
-		if !ok {
-			continue
-		}
-
-		stats := collector.Finalize()
-		builder.Field(0).(*array.StringBuilder).Append(tableID)
-		builder.Field(1).(*array.StringBuilder).Append(colName)
-		builder.Field(2).(*array.StringBuilder).Append(stats.DataType)
-		builder.Field(3).(*array.StringBuilder).Append(stats.MinValue)
-		builder.Field(4).(*array.StringBuilder).Append(stats.MaxValue)
-		builder.Field(5).(*array.Int64Builder).Append(stats.NullCount)
-		builder.Field(6).(*array.Int64Builder).Append(stats.DistinctCount)
-		builder.Field(7).(*array.Int64Builder).Append(timestamp)
-	}
-
-	record := builder.NewRecord()
-	defer record.Release()
-
-	// 写入sys.column_statistics
-	if err := engine.Write(ctx, "sys", "column_statistics", record); err != nil {
-		return fmt.Errorf("failed to write column statistics: %w", err)
-	}
-
-	logger.WithComponent("executor").Info("Column statistics collected",
-		zap.String("table_id", tableID),
-		zap.Int("column_count", len(columns)))
-
-	return nil
-}
-
-// ColumnStats 列统计信息
-type ColumnStats struct {
-	DataType      string
-	MinValue      string
-	MaxValue      string
-	NullCount     int64
-	DistinctCount int64
-}
-
-// ColumnStatsCollector 列统计收集器
-type ColumnStatsCollector struct {
-	dataType       arrow.DataType
-	minValue       interface{}
-	maxValue       interface{}
-	nullCount      int64
-	distinctValues map[string]bool
-}
-
-// NewColumnStatsCollector 创建列统计收集器
-func NewColumnStatsCollector(dataType arrow.DataType) *ColumnStatsCollector {
-	return &ColumnStatsCollector{
-		dataType:       dataType,
-		distinctValues: make(map[string]bool),
-	}
-}
-
-// Collect 收集列的统计信息
-func (c *ColumnStatsCollector) Collect(column arrow.Array) {
-	switch arr := column.(type) {
-	case *array.Int64:
-		for i := 0; i < arr.Len(); i++ {
-			if arr.IsNull(i) {
-				c.nullCount++
-				continue
-			}
-			val := arr.Value(i)
-			c.distinctValues[fmt.Sprintf("%d", val)] = true
-
-			if c.minValue == nil || val < c.minValue.(int64) {
-				c.minValue = val
-			}
-			if c.maxValue == nil || val > c.maxValue.(int64) {
-				c.maxValue = val
-			}
-		}
-	case *array.String:
-		for i := 0; i < arr.Len(); i++ {
-			if arr.IsNull(i) {
-				c.nullCount++
-				continue
-			}
-			val := arr.Value(i)
-			c.distinctValues[val] = true
-
-			if c.minValue == nil || val < c.minValue.(string) {
-				c.minValue = val
-			}
-			if c.maxValue == nil || val > c.maxValue.(string) {
-				c.maxValue = val
-			}
-		}
-	}
-}
-
-// Finalize 完成统计收集并返回结果
-func (c *ColumnStatsCollector) Finalize() ColumnStats {
-	minStr := ""
-	maxStr := ""
-	if c.minValue != nil {
-		minStr = fmt.Sprintf("%v", c.minValue)
-	}
-	if c.maxValue != nil {
-		maxStr = fmt.Sprintf("%v", c.maxValue)
-	}
-
-	return ColumnStats{
-		DataType:      c.dataType.String(),
-		MinValue:      minStr,
-		MaxValue:      maxStr,
-		NullCount:     c.nullCount,
-		DistinctCount: int64(len(c.distinctValues)),
-	}
-}
-
-// getRowCount 获取表的行数
-func (e *ExecutorImpl) getRowCount(engine *storage.ParquetEngine, dbName, tableName string) (int64, error) {
-	ctx := context.Background()
-	iterator, err := engine.Scan(ctx, dbName, tableName, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to scan table: %w", err)
-	}
-
-	var rowCount int64
-	for iterator.Next() {
-		record := iterator.Record()
-		rowCount += record.NumRows()
-	}
-
-	if err := iterator.Err(); err != nil {
-		return 0, fmt.Errorf("iterator error: %w", err)
-	}
-
-	return rowCount, nil
 }

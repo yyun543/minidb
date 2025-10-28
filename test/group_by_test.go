@@ -14,7 +14,8 @@ import (
 
 func TestGroupByFunctionality(t *testing.T) {
 	// 创建 v2.0 Parquet 存储引擎
-	storageEngine, err := storage.NewParquetEngine("./test_data/group_by_test")
+	testDir := SetupTestDir(t, "group_by_test")
+	storageEngine, err := storage.NewParquetEngine(testDir)
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

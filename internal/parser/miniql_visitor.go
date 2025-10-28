@@ -1,7 +1,6 @@
-// Code generated from internal/parser/MiniQL.g4 by ANTLR 4.13.2. DO NOT EDIT.
+// Code generated from MiniQL.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
 package parser // MiniQL
-
 import "github.com/antlr4-go/antlr/v4"
 
 // A complete Visitor for a parse tree produced by MiniQLParser.
@@ -98,11 +97,17 @@ type MiniQLVisitor interface {
 	// Visit a parse tree produced by MiniQLParser#inExpression.
 	VisitInExpression(ctx *InExpressionContext) interface{}
 
+	// Visit a parse tree produced by MiniQLParser#additiveExpression.
+	VisitAdditiveExpression(ctx *AdditiveExpressionContext) interface{}
+
 	// Visit a parse tree produced by MiniQLParser#likeExpression.
 	VisitLikeExpression(ctx *LikeExpressionContext) interface{}
 
 	// Visit a parse tree produced by MiniQLParser#comparisonExpression.
 	VisitComparisonExpression(ctx *ComparisonExpressionContext) interface{}
+
+	// Visit a parse tree produced by MiniQLParser#multiplicativeExpression.
+	VisitMultiplicativeExpression(ctx *MultiplicativeExpressionContext) interface{}
 
 	// Visit a parse tree produced by MiniQLParser#literalExpr.
 	VisitLiteralExpr(ctx *LiteralExprContext) interface{}

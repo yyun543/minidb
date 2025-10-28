@@ -679,6 +679,12 @@ func (dm *DataManager) appendValue(field array.Builder, value interface{}) error
 	case *array.BooleanBuilder:
 		if v, ok := value.(bool); ok {
 			field.Append(v)
+		} else if v, ok := value.(int64); ok {
+			// 支持 0/1 转换为 false/true
+			field.Append(v != 0)
+		} else if v, ok := value.(int); ok {
+			// 支持 0/1 转换为 false/true
+			field.Append(v != 0)
 		} else {
 			field.AppendNull()
 		}

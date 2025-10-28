@@ -14,7 +14,7 @@ import (
 
 // TestUpdateOperation tests UPDATE with Copy-on-Write mechanism
 func TestUpdateOperation(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/update_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "update_test"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -145,7 +145,7 @@ func TestUpdateOperation(t *testing.T) {
 
 // TestDeleteOperation tests DELETE with Delta Log integration
 func TestDeleteOperation(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/delete_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "delete_test"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

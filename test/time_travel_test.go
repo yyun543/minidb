@@ -16,7 +16,7 @@ import (
 
 // TestTimeTravelQueries tests Delta Lake time travel capabilities
 func TestTimeTravelQueries(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/time_travel_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "time_travel_test"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -194,7 +194,7 @@ func TestTimeTravelQueries(t *testing.T) {
 
 // TestDeltaLogSnapshotRetrieval tests snapshot retrieval at different versions
 func TestDeltaLogSnapshotRetrieval(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/snapshot_retrieval_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "snapshot_retrieval_test"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

@@ -15,7 +15,7 @@ import (
 
 // TestShowTablesIntegration 测试SHOW TABLES在实际使用场景中的功能
 func TestShowTablesIntegration(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/show_tables_integration.wal")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "show_tables_integration.wal"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

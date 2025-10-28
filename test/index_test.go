@@ -18,7 +18,7 @@ import (
 // TestIndexOperations tests comprehensive index DDL and DQL operations
 func TestIndexOperations(t *testing.T) {
 	// Setup test environment - v2.0 Parquet
-	storageEngine, err := storage.NewParquetEngine("./test_data/index_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "index_test"))
 	require.NoError(t, err)
 	defer storageEngine.Close()
 

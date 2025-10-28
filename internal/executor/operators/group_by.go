@@ -124,6 +124,8 @@ func (op *GroupBy) processGroupBatch(batch *types.Batch) error {
 				groupKeyValues[i] = col.Value(int(rowIdx))
 			case *array.Float64:
 				groupKeyValues[i] = col.Value(int(rowIdx))
+			case *array.Boolean:
+				groupKeyValues[i] = col.Value(int(rowIdx))
 			default:
 				groupKeyValues[i] = nil
 			}
@@ -142,6 +144,8 @@ func (op *GroupBy) processGroupBatch(batch *types.Batch) error {
 			case *array.String:
 				rowData[colIdx] = col.Value(int(rowIdx))
 			case *array.Float64:
+				rowData[colIdx] = col.Value(int(rowIdx))
+			case *array.Boolean:
 				rowData[colIdx] = col.Value(int(rowIdx))
 			default:
 				rowData[colIdx] = nil
@@ -295,9 +299,64 @@ func (op *GroupBy) getNumericValue(column arrow.Array, rowIdx int) *float64 {
 	return nil
 }
 
+// inferGroupKeyType 从分组数据中推断分组键的类型
+func (op *GroupBy) inferGroupKeyType(columnName string) arrow.DataType {
+	// 找到列在groupKeys中的索引
+	keyIndex := -1
+	for i, key := range op.groupKeys {
+		if key.Column == columnName {
+			keyIndex = i
+			break
+		}
+	}
+
+	if keyIndex < 0 {
+		// 默认为字符串
+		return arrow.BinaryTypes.String
+	}
+
+	// 从任意一个分组中获取该键的值类型
+	for _, group := range op.groupedData {
+		if keyIndex < len(group.keys) {
+			value := group.keys[keyIndex]
+			switch value.(type) {
+			case int64, int, int32:
+				return arrow.PrimitiveTypes.Int64
+			case float64, float32:
+				return arrow.PrimitiveTypes.Float64
+			case bool:
+				return arrow.FixedWidthTypes.Boolean
+			case string:
+				return arrow.BinaryTypes.String
+			}
+		}
+		break // 只需要检查第一个分组
+	}
+
+	// 默认为字符串
+	return arrow.BinaryTypes.String
+}
+
 // buildGroupResult 构建分组结果
 func (op *GroupBy) buildGroupResult() (*types.Batch, error) {
-	if len(op.groupedData) == 0 {
+	// Special case: aggregation without GROUP BY (global aggregation)
+	// According to SQL standard, aggregations without GROUP BY must return exactly one row
+	// even when the input is empty
+	if len(op.groupKeys) == 0 && len(op.aggregations) > 0 {
+		// Global aggregation case - must return one row
+		if len(op.groupedData) == 0 {
+			// Create a synthetic empty group for global aggregation
+			op.groupedData[""] = &GroupData{
+				keys:       []interface{}{},
+				count:      0,
+				rows:       [][]interface{}{},
+				aggregates: make(map[string]interface{}),
+				sums:       make(map[string]float64),
+				avgCounts:  make(map[string]int64),
+			}
+		}
+	} else if len(op.groupedData) == 0 {
+		// Regular GROUP BY with no data - return empty result
 		return nil, nil
 	}
 
@@ -327,8 +386,8 @@ func (op *GroupBy) buildGroupResult() (*types.Batch, error) {
 				fieldType = arrow.BinaryTypes.String
 			}
 		} else {
-			// 分组键默认为字符串类型
-			fieldType = arrow.BinaryTypes.String
+			// 分组键应保留原始类型，从groupedData中推断
+			fieldType = op.inferGroupKeyType(col.Column)
 		}
 
 		fields = append(fields, arrow.Field{
@@ -374,6 +433,7 @@ func (op *GroupBy) buildGroupResult() (*types.Batch, error) {
 						if value != nil {
 							intBuilder.Append(value.(int64))
 						} else {
+							// COUNT on empty set returns 0
 							intBuilder.Append(0)
 						}
 					}
@@ -382,20 +442,64 @@ func (op *GroupBy) buildGroupResult() (*types.Batch, error) {
 						if value != nil {
 							floatBuilder.Append(value.(float64))
 						} else {
+							// SUM/AVG/MIN/MAX on empty set returns NULL per SQL standard
 							floatBuilder.AppendNull()
 						}
 					}
 				}
 			} else {
-				// 处理分组键
-				if strBuilder, ok := field.(*array.StringBuilder); ok {
-					// 在分组键中找到对应的值
-					for i, key := range op.groupKeys {
-						if key.Column == col.Column {
-							strBuilder.Append(fmt.Sprintf("%v", group.keys[i]))
-							break
-						}
+				// 处理分组键 - 保留原始类型
+				// 在分组键中找到对应的值
+				keyValue := interface{}(nil)
+				for i, key := range op.groupKeys {
+					if key.Column == col.Column {
+						keyValue = group.keys[i]
+						break
 					}
+				}
+
+				if keyValue == nil {
+					field.AppendNull()
+					continue
+				}
+
+				// 根据字段类型追加值
+				switch builder := field.(type) {
+				case *array.Int64Builder:
+					switch v := keyValue.(type) {
+					case int64:
+						builder.Append(v)
+					case int:
+						builder.Append(int64(v))
+					case int32:
+						builder.Append(int64(v))
+					default:
+						builder.AppendNull()
+					}
+				case *array.Float64Builder:
+					switch v := keyValue.(type) {
+					case float64:
+						builder.Append(v)
+					case float32:
+						builder.Append(float64(v))
+					case int64:
+						builder.Append(float64(v))
+					case int:
+						builder.Append(float64(v))
+					default:
+						builder.AppendNull()
+					}
+				case *array.BooleanBuilder:
+					if v, ok := keyValue.(bool); ok {
+						builder.Append(v)
+					} else {
+						builder.AppendNull()
+					}
+				case *array.StringBuilder:
+					builder.Append(fmt.Sprintf("%v", keyValue))
+				default:
+					// Fallback: append null for unsupported types
+					field.AppendNull()
 				}
 			}
 		}

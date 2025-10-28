@@ -69,7 +69,7 @@ func formatBatch(batch *types.Batch, headers []string) string {
 // TestShowTablesIssue 测试SHOW TABLES命令应该显示已创建的表
 func TestShowTablesIssue(t *testing.T) {
 	// 创建 v2.0 Parquet 存储引擎
-	storageEngine, err := storage.NewParquetEngine("./test_data/show_tables_test")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "show_tables_test"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()

@@ -49,6 +49,7 @@ func (pi *ParquetIterator) Next() bool {
 			Column:   f.Column,
 			Operator: f.Operator,
 			Value:    f.Value,
+			Values:   f.Values, // 支持 IN 操作符的多个值
 		}
 	}
 

@@ -1,6 +1,7 @@
 package operators
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/apache/arrow/go/v18/arrow"
@@ -28,21 +29,26 @@ func NewFilter(condition optimizer.Expression, child Operator, ctx interface{}) 
 
 // Init 初始化算子
 func (op *Filter) Init(ctx interface{}) error {
+	println("DEBUG Filter.Init called, condition=", fmt.Sprintf("%v", op.condition))
 	return op.child.Init(ctx)
 }
 
 // Next 获取下一批数据
 func (op *Filter) Next() (*types.Batch, error) {
+	println("DEBUG Filter.Next called")
 	// 循环直到找到匹配的行或所有数据处理完
 	for {
 		// 获取子算子数据
 		batch, err := op.child.Next()
 		if err != nil {
+			println("DEBUG Filter.Next child.Next returned error:", err.Error())
 			return nil, err
 		}
 		if batch == nil {
+			println("DEBUG Filter.Next child.Next returned nil")
 			return nil, nil
 		}
+		println("DEBUG Filter.Next received batch with", batch.Record().NumRows(), "rows")
 
 		// 应用过滤条件
 		filteredRecord, err := op.applyFilter(batch.Record())
@@ -79,6 +85,8 @@ func (op *Filter) applyFilter(record arrow.Record) (arrow.Record, error) {
 
 // applyBinaryFilter 应用二元表达式过滤
 func (op *Filter) applyBinaryFilter(record arrow.Record, binExpr *optimizer.BinaryExpression) (arrow.Record, error) {
+	println("DEBUG applyBinaryFilter called, operator=", binExpr.Operator, "record.NumRows=", record.NumRows())
+
 	// Check if this is a logical operator (AND/OR)
 	if binExpr.Operator == "AND" || binExpr.Operator == "OR" {
 		return op.applyLogicalFilter(record, binExpr)
@@ -90,7 +98,9 @@ func (op *Filter) applyBinaryFilter(record arrow.Record, binExpr *optimizer.Bina
 
 	if colRef, ok := binExpr.Left.(*optimizer.ColumnReference); ok {
 		colName = colRef.Column
+		println("DEBUG colName=", colName)
 	} else {
+		println("DEBUG left is not ColumnReference, type=", fmt.Sprintf("%T", binExpr.Left))
 		return record, nil // 不支持的左表达式类型
 	}
 
@@ -98,9 +108,12 @@ func (op *Filter) applyBinaryFilter(record arrow.Record, binExpr *optimizer.Bina
 	switch rightExpr := binExpr.Right.(type) {
 	case *optimizer.LiteralValue:
 		compareValue = rightExpr.Value
+		println("DEBUG compareValue from LiteralValue=", compareValue, "type=", fmt.Sprintf("%T", compareValue))
 	case interface{ GetValue() interface{} }:
 		compareValue = rightExpr.GetValue()
+		println("DEBUG compareValue from GetValue()=", compareValue, "type=", fmt.Sprintf("%T", compareValue))
 	default:
+		println("DEBUG right is not LiteralValue, type=", fmt.Sprintf("%T", binExpr.Right))
 		return record, nil // 不支持的右表达式类型
 	}
 
@@ -110,15 +123,18 @@ func (op *Filter) applyBinaryFilter(record arrow.Record, binExpr *optimizer.Bina
 	for i, field := range schema.Fields() {
 		if field.Name == colName {
 			colIndex = i
+			println("DEBUG found column", colName, "at index", i, "type=", field.Type.String())
 			break
 		}
 	}
 
 	if colIndex == -1 {
+		println("DEBUG column", colName, "not found in schema")
 		return record, nil // 列不存在，返回原记录
 	}
 
 	// 根据操作符类型过滤记录
+	println("DEBUG calling filterRecordByColumn, colIndex=", colIndex, "operator=", binExpr.Operator)
 	switch binExpr.Operator {
 	case "=":
 		return op.filterRecordByColumn(record, colIndex, compareValue, "=")
@@ -213,6 +229,10 @@ func (op *Filter) mergeRecords(left, right arrow.Record) (arrow.Record, error) {
 				if intBuilder, ok := field.(*array.Int64Builder); ok {
 					intBuilder.Append(srcCol.Value(int(rowIdx)))
 				}
+			case *array.Int32:
+				if intBuilder, ok := field.(*array.Int32Builder); ok {
+					intBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
 			case *array.String:
 				if strBuilder, ok := field.(*array.StringBuilder); ok {
 					strBuilder.Append(srcCol.Value(int(rowIdx)))
@@ -220,6 +240,18 @@ func (op *Filter) mergeRecords(left, right arrow.Record) (arrow.Record, error) {
 			case *array.Float64:
 				if floatBuilder, ok := field.(*array.Float64Builder); ok {
 					floatBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.Float32:
+				if floatBuilder, ok := field.(*array.Float32Builder); ok {
+					floatBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.Boolean:
+				if boolBuilder, ok := field.(*array.BooleanBuilder); ok {
+					boolBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.Timestamp:
+				if tsBuilder, ok := field.(*array.TimestampBuilder); ok {
+					tsBuilder.Append(srcCol.Value(int(rowIdx)))
 				}
 			}
 		}
@@ -236,6 +268,10 @@ func (op *Filter) mergeRecords(left, right arrow.Record) (arrow.Record, error) {
 				if intBuilder, ok := field.(*array.Int64Builder); ok {
 					intBuilder.Append(srcCol.Value(int(rowIdx)))
 				}
+			case *array.Int32:
+				if intBuilder, ok := field.(*array.Int32Builder); ok {
+					intBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
 			case *array.String:
 				if strBuilder, ok := field.(*array.StringBuilder); ok {
 					strBuilder.Append(srcCol.Value(int(rowIdx)))
@@ -243,6 +279,18 @@ func (op *Filter) mergeRecords(left, right arrow.Record) (arrow.Record, error) {
 			case *array.Float64:
 				if floatBuilder, ok := field.(*array.Float64Builder); ok {
 					floatBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.Float32:
+				if floatBuilder, ok := field.(*array.Float32Builder); ok {
+					floatBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.Boolean:
+				if boolBuilder, ok := field.(*array.BooleanBuilder); ok {
+					boolBuilder.Append(srcCol.Value(int(rowIdx)))
+				}
+			case *array.Timestamp:
+				if tsBuilder, ok := field.(*array.TimestampBuilder); ok {
+					tsBuilder.Append(srcCol.Value(int(rowIdx)))
 				}
 			}
 		}
@@ -258,30 +306,112 @@ func (op *Filter) filterRecordByColumn(record arrow.Record, colIndex int, compar
 	defer builder.Release()
 
 	column := record.Column(colIndex)
+	schema := record.Schema()
+	field := schema.Field(colIndex)
+
+	// Check if this is a boolean column based on schema
+	isBooleanColumn := (field.Type.ID() == arrow.BOOL)
 
 	// 检查每一行
 	for rowIdx := int64(0); rowIdx < record.NumRows(); rowIdx++ {
 		var matches bool
 
-		// 根据列类型和操作符比较值
-		switch col := column.(type) {
-		case *array.Int64:
-			if intVal, ok := compareValue.(int64); ok {
-				columnValue := col.Value(int(rowIdx))
-				matches = op.compareValues(columnValue, intVal, operator)
-			} else if intVal, ok := compareValue.(int); ok {
-				columnValue := col.Value(int(rowIdx))
-				matches = op.compareValues(columnValue, int64(intVal), operator)
+		// Special handling for boolean columns
+		if isBooleanColumn {
+			boolCol, ok := column.(*array.Boolean)
+			if !ok {
+				// Column schema says BOOL but array type is not Boolean - data corruption?
+				continue
 			}
-		case *array.String:
-			if strVal, ok := compareValue.(string); ok {
-				columnValue := col.Value(int(rowIdx))
-				matches = op.compareStrings(columnValue, strVal, operator)
+
+			columnValue := boolCol.Value(int(rowIdx))
+
+			// Convert compareValue to boolean
+			var boolVal bool
+			switch v := compareValue.(type) {
+			case bool:
+				boolVal = v
+			case int64:
+				boolVal = (v != 0)
+			case int:
+				boolVal = (v != 0)
+			case int32:
+				boolVal = (v != 0)
+			case string:
+				// Handle "true"/"false"/"1"/"0"
+				switch v {
+				case "true", "1", "t", "T", "TRUE":
+					boolVal = true
+				case "false", "0", "f", "F", "FALSE":
+					boolVal = false
+				default:
+					continue // Invalid boolean value, skip this row
+				}
+			default:
+				// Unknown type, skip
+				continue
 			}
-		case *array.Float64:
-			if floatVal, ok := compareValue.(float64); ok {
+
+			// Compare booleans
+			switch operator {
+			case "=", "==":
+				matches = (columnValue == boolVal)
+			case "!=", "<>":
+				matches = (columnValue != boolVal)
+			default:
+				matches = false
+			}
+		} else {
+			// 根据列类型和操作符比较值
+			switch col := column.(type) {
+			case *array.Int64:
+				if intVal, ok := compareValue.(int64); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareValues(columnValue, intVal, operator)
+				} else if intVal, ok := compareValue.(int); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareValues(columnValue, int64(intVal), operator)
+				}
+			case *array.Int32:
+				if intVal, ok := compareValue.(int32); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareValues(int64(columnValue), int64(intVal), operator)
+				} else if intVal, ok := compareValue.(int); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareValues(int64(columnValue), int64(intVal), operator)
+				} else if intVal, ok := compareValue.(int64); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareValues(int64(columnValue), intVal, operator)
+				}
+			case *array.String:
+				if strVal, ok := compareValue.(string); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareStrings(columnValue, strVal, operator)
+				}
+			case *array.Float64:
 				columnValue := col.Value(int(rowIdx))
-				matches = op.compareValues(columnValue, floatVal, operator)
+				if floatVal, ok := compareValue.(float64); ok {
+					matches = op.compareValues(columnValue, floatVal, operator)
+				} else if intVal, ok := compareValue.(int64); ok {
+					// 支持int64与float64的比较（常见于HAVING子句中的整数字面量）
+					matches = op.compareValues(columnValue, float64(intVal), operator)
+				} else if intVal, ok := compareValue.(int); ok {
+					// 支持int与float64的比较
+					matches = op.compareValues(columnValue, float64(intVal), operator)
+				}
+			case *array.Float32:
+				if floatVal, ok := compareValue.(float32); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareValues(float64(columnValue), float64(floatVal), operator)
+				} else if floatVal, ok := compareValue.(float64); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareValues(float64(columnValue), floatVal, operator)
+				}
+			case *array.Timestamp:
+				if tsVal, ok := compareValue.(arrow.Timestamp); ok {
+					columnValue := col.Value(int(rowIdx))
+					matches = op.compareValues(int64(columnValue), int64(tsVal), operator)
+				}
 			}
 		}
 
@@ -296,6 +426,10 @@ func (op *Filter) filterRecordByColumn(record arrow.Record, colIndex int, compar
 					if intBuilder, ok := field.(*array.Int64Builder); ok {
 						intBuilder.Append(srcCol.Value(int(rowIdx)))
 					}
+				case *array.Int32:
+					if intBuilder, ok := field.(*array.Int32Builder); ok {
+						intBuilder.Append(srcCol.Value(int(rowIdx)))
+					}
 				case *array.String:
 					if strBuilder, ok := field.(*array.StringBuilder); ok {
 						strBuilder.Append(srcCol.Value(int(rowIdx)))
@@ -303,6 +437,18 @@ func (op *Filter) filterRecordByColumn(record arrow.Record, colIndex int, compar
 				case *array.Float64:
 					if floatBuilder, ok := field.(*array.Float64Builder); ok {
 						floatBuilder.Append(srcCol.Value(int(rowIdx)))
+					}
+				case *array.Float32:
+					if floatBuilder, ok := field.(*array.Float32Builder); ok {
+						floatBuilder.Append(srcCol.Value(int(rowIdx)))
+					}
+				case *array.Boolean:
+					if boolBuilder, ok := field.(*array.BooleanBuilder); ok {
+						boolBuilder.Append(srcCol.Value(int(rowIdx)))
+					}
+				case *array.Timestamp:
+					if tsBuilder, ok := field.(*array.TimestampBuilder); ok {
+						tsBuilder.Append(srcCol.Value(int(rowIdx)))
 					}
 				}
 			}

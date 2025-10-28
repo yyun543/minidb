@@ -1,7 +1,6 @@
-// Code generated from internal/parser/MiniQL.g4 by ANTLR 4.13.2. DO NOT EDIT.
+// Code generated from MiniQL.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
 package parser // MiniQL
-
 import "github.com/antlr4-go/antlr/v4"
 
 type BaseMiniQLVisitor struct {
@@ -128,11 +127,19 @@ func (v *BaseMiniQLVisitor) VisitInExpression(ctx *InExpressionContext) interfac
 	return v.VisitChildren(ctx)
 }
 
+func (v *BaseMiniQLVisitor) VisitAdditiveExpression(ctx *AdditiveExpressionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BaseMiniQLVisitor) VisitLikeExpression(ctx *LikeExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
 func (v *BaseMiniQLVisitor) VisitComparisonExpression(ctx *ComparisonExpressionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseMiniQLVisitor) VisitMultiplicativeExpression(ctx *MultiplicativeExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 

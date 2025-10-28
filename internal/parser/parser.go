@@ -487,18 +487,34 @@ func (v *MiniQLVisitorImpl) VisitInsertStatement(ctx *InsertStatementContext) in
 		}
 	}
 
-	// 获取值列表
-	for _, valueList := range ctx.AllValueList() {
-		if result := v.Visit(valueList); result != nil {
-			// ValueList 返回的是 []Node
+	// 获取值列表 - 支持多行INSERT
+	allValueLists := ctx.AllValueList()
+	logger.WithComponent("parser").Debug("AllValueList called",
+		zap.Int("value_list_count", len(allValueLists)))
+	if len(allValueLists) == 1 {
+		// 单行INSERT - 使用Values字段向后兼容
+		if result := v.Visit(allValueLists[0]); result != nil {
 			stmt.Values = result.([]Node)
 		}
+	} else if len(allValueLists) > 1 {
+		// 多行INSERT - 使用Rows字段
+		stmt.Rows = make([][]Node, 0, len(allValueLists))
+		for _, valueList := range allValueLists {
+			if result := v.Visit(valueList); result != nil {
+				stmt.Rows = append(stmt.Rows, result.([]Node))
+			}
+		}
+	}
+
+	rowCount := len(stmt.Rows)
+	if rowCount == 0 && len(stmt.Values) > 0 {
+		rowCount = 1
 	}
 
 	logger.WithComponent("parser").Info("INSERT statement parsed successfully",
 		zap.String("table_name", stmt.Table),
 		zap.Int("column_count", len(stmt.Columns)),
-		zap.Int("value_count", len(stmt.Values)))
+		zap.Int("value_count", rowCount))
 
 	return stmt
 }
@@ -647,6 +663,7 @@ func (v *MiniQLVisitorImpl) VisitSelectStatement(ctx *SelectStatementContext) in
 				stmt.From = t.Table
 				stmt.Joins = t.Joins
 				stmt.FromAlias = t.Alias
+				stmt.FromSubquery = t.Subquery // 支持 FROM 子查询
 			}
 		}
 	}
@@ -1027,6 +1044,48 @@ func (v *MiniQLVisitorImpl) VisitComparisonExpression(ctx *ComparisonExpressionC
 	}
 }
 
+// VisitMultiplicativeExpression 访问乘除表达式
+func (v *MiniQLVisitorImpl) VisitMultiplicativeExpression(ctx *MultiplicativeExpressionContext) interface{} {
+	left := v.Visit(ctx.Expression(0))
+	right := v.Visit(ctx.Expression(1))
+
+	// Determine operator (* or /)
+	var operator string
+	if ctx.ASTERISK() != nil {
+		operator = "*"
+	} else if ctx.DIVIDE() != nil {
+		operator = "/"
+	}
+
+	return &BinaryExpr{
+		BaseNode: BaseNode{nodeType: BinaryExprNode},
+		Left:     left.(Node),
+		Operator: operator,
+		Right:    right.(Node),
+	}
+}
+
+// VisitAdditiveExpression 访问加减表达式
+func (v *MiniQLVisitorImpl) VisitAdditiveExpression(ctx *AdditiveExpressionContext) interface{} {
+	left := v.Visit(ctx.Expression(0))
+	right := v.Visit(ctx.Expression(1))
+
+	// Determine operator (+ or -)
+	var operator string
+	if ctx.PLUS() != nil {
+		operator = "+"
+	} else if ctx.MINUS() != nil {
+		operator = "-"
+	}
+
+	return &BinaryExpr{
+		BaseNode: BaseNode{nodeType: BinaryExprNode},
+		Left:     left.(Node),
+		Operator: operator,
+		Right:    right.(Node),
+	}
+}
+
 // VisitLiteralExpr 访问字面量表达式
 func (v *MiniQLVisitorImpl) VisitLiteralExpr(ctx *LiteralExprContext) interface{} {
 	if ctx.Literal() != nil {
@@ -1110,6 +1169,9 @@ func (v *MiniQLVisitorImpl) VisitUpdateAssignment(ctx *UpdateAssignmentContext) 
 	// 获取表达式值
 	if ctx.Expression() != nil {
 		if result := v.Visit(ctx.Expression()); result != nil {
+			logger.Info("UPDATE assignment expression parsed",
+				zap.String("column", assignment.Column),
+				zap.String("expr_type", fmt.Sprintf("%T", result)))
 			if expr, ok := result.(Node); ok {
 				assignment.Value = expr
 			}
@@ -1489,6 +1551,9 @@ func (v *MiniQLVisitorImpl) VisitIdentifier(ctx *IdentifierContext) interface{} 
 
 // VisitDataType 访问数据类型
 func (v *MiniQLVisitorImpl) VisitDataType(ctx *DataTypeContext) interface{} {
+	if ctx.INT_TYPE() != nil {
+		return "INTEGER" // 统一将INT映射为INTEGER
+	}
 	if ctx.INTEGER_TYPE() != nil {
 		return "INTEGER"
 	}
@@ -1556,6 +1621,22 @@ func (v *MiniQLVisitorImpl) VisitLiteral(ctx *LiteralContext) interface{} {
 		return &StringLiteral{
 			BaseNode: BaseNode{nodeType: StringLiteralNode},
 			Value:    value,
+		}
+	case ctx.TRUE() != nil:
+		return &BooleanLiteral{
+			BaseNode: BaseNode{nodeType: BooleanLiteralNode},
+			Value:    true,
+		}
+	case ctx.FALSE() != nil:
+		return &BooleanLiteral{
+			BaseNode: BaseNode{nodeType: BooleanLiteralNode},
+			Value:    false,
+		}
+	case ctx.NULL() != nil:
+		// Return nil to represent NULL value
+		return &IntegerLiteral{
+			BaseNode: BaseNode{nodeType: IntegerLiteralNode},
+			Value:    0, // Placeholder for NULL
 		}
 	default:
 		logger.WithComponent("parser").Warn("Unrecognized literal type",

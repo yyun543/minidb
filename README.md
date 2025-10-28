@@ -65,7 +65,7 @@ go mod download
 go build -o minidb ./cmd/server
 
 # Start server
-ENVIRONMENT=development ./minidb
+./minidb
 ```
 
 The server will start on `localhost:7205`.
@@ -105,7 +105,7 @@ HAVING count > 0
 ORDER BY avg_price DESC;
 
 -- Query transaction history (system table bootstrap feature)
-SELECT version, operation, table_name, file_path
+SELECT version, operation, table_id, file_path
 FROM sys.delta_log
 ORDER BY version DESC
 LIMIT 10;
@@ -704,14 +704,51 @@ DROP DATABASE ecommerce;
 USE ecommerce;
 SHOW DATABASES;
 
--- Table management
+-- Table management with all data types
 CREATE TABLE products (
-    id INT,
-    name VARCHAR,
-    price INT,
+    id INTEGER,
+    name VARCHAR(100),
+    price DOUBLE,
+    quantity INTEGER,
+    in_stock BOOLEAN,
+    created_at TIMESTAMP,
     category VARCHAR
 );
+
+-- Table with column constraints
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    email VARCHAR(100) NOT NULL,
+    age INTEGER DEFAULT 18,
+    active BOOLEAN DEFAULT 1
+);
+
+-- Table with table-level PRIMARY KEY constraint
+CREATE TABLE orders (
+    order_id INTEGER,
+    user_id INTEGER NOT NULL,
+    amount DOUBLE,
+    PRIMARY KEY (order_id)
+);
+
+-- Table with partitioning (HASH)
+CREATE TABLE logs_hash (
+    id INTEGER,
+    message VARCHAR,
+    timestamp TIMESTAMP
+) PARTITION BY HASH (id);
+
+-- Table with partitioning (RANGE)
+CREATE TABLE logs_range (
+    id INTEGER,
+    region VARCHAR,
+    data VARCHAR
+) PARTITION BY RANGE (id);
+
+-- Drop tables
 DROP TABLE products;
+DROP TABLE users;
 SHOW TABLES;
 
 -- Index management
@@ -720,46 +757,241 @@ CREATE UNIQUE INDEX idx_id ON products (id);
 CREATE INDEX idx_composite ON products (category, name);
 DROP INDEX idx_category ON products;
 SHOW INDEXES ON products;
+SHOW INDEXES FROM products;
 ```
 
 ### DML (Data Manipulation Language)
 
 ```sql
--- Insertion
-INSERT INTO products VALUES (1, 'Laptop', 999, 'Electronics');
-INSERT INTO products VALUES (2, 'Mouse', 29, 'Electronics');
+-- Single row insertion
+INSERT INTO products VALUES (1, 'Laptop', 999.99, 10, 1, '2024-01-01', 'Electronics');
 
--- Queries
+-- Batch insertion (multiple rows)
+INSERT INTO products VALUES
+    (2, 'Mouse', 29.99, 50, 1, '2024-01-02', 'Electronics'),
+    (3, 'Desk', 299.99, 15, 1, '2024-01-03', 'Furniture'),
+    (4, 'Chair', 199.99, 20, 1, '2024-01-04', 'Furniture');
+
+-- Insert with column list
+INSERT INTO products (id, name, price, category)
+VALUES (5, 'Monitor', 399.99, 'Electronics');
+
+-- Insert multiple rows with column list
+INSERT INTO users (id, username, email, age) VALUES
+    (1, 'alice', 'alice@example.com', 25),
+    (2, 'bob', 'bob@example.com', 30),
+    (3, 'charlie', 'charlie@example.com', 35);
+
+-- Basic queries
 SELECT * FROM products;
-SELECT name, price FROM products WHERE price > 100;
+SELECT name, price FROM products;
+
+-- Queries with column aliases
+SELECT name AS product_name, price AS product_price FROM products;
+SELECT name product_name, price product_price FROM products;
+
+-- Queries with table aliases
+SELECT p.name, p.price FROM products AS p;
+SELECT p.name, p.price FROM products p;
+
+-- WHERE with comparison operators
+SELECT * FROM products WHERE price > 100;
+SELECT * FROM products WHERE price >= 100;
+SELECT * FROM products WHERE price < 500;
+SELECT * FROM products WHERE price <= 500;
+SELECT * FROM products WHERE price = 299.99;
+SELECT * FROM products WHERE price != 299.99;
+SELECT * FROM products WHERE name = 'Laptop';
+
+-- WHERE with logical operators (AND, OR)
 SELECT * FROM products WHERE category = 'Electronics' AND price < 1000;
+SELECT * FROM products WHERE category = 'Electronics' OR category = 'Furniture';
+SELECT * FROM products WHERE price > 100 AND price < 500 AND in_stock = 1;
 
--- Updates (Merge-on-Read)
+-- WHERE with LIKE (pattern matching)
+SELECT * FROM products WHERE name LIKE '%top';
+SELECT * FROM products WHERE name LIKE 'M%';
+SELECT * FROM products WHERE category LIKE '%onic%';
+SELECT * FROM products WHERE name NOT LIKE 'Desk';
+
+-- WHERE with IN operator
+SELECT * FROM products WHERE category IN ('Electronics', 'Furniture');
+SELECT * FROM products WHERE id IN (1, 2, 3);
+SELECT * FROM products WHERE category NOT IN ('Obsolete', 'Discontinued');
+
+-- WHERE with qualified column references
+SELECT * FROM products WHERE products.price > 200;
+
+-- WHERE with parenthesized expressions
+SELECT * FROM products WHERE (price > 100 AND category = 'Electronics') OR (price > 200 AND category = 'Furniture');
+
+-- Single column update
 UPDATE products SET price = 1099 WHERE id = 1;
-UPDATE products SET price = price * 1.1 WHERE category = 'Electronics';
 
--- Deletions (Merge-on-Read)
+-- Multiple column update
+UPDATE products SET price = 349.99, quantity = 25, in_stock = 1 WHERE id = 3;
+
+-- Update with expressions
+UPDATE products SET price = price * 1.1 WHERE category = 'Electronics';
+UPDATE products SET quantity = quantity + 10 WHERE in_stock = 1;
+
+-- Update without WHERE (updates all rows)
+UPDATE products SET in_stock = 1;
+
+-- Deletions with WHERE
 DELETE FROM products WHERE price < 50;
 DELETE FROM products WHERE category = 'Obsolete';
+DELETE FROM products WHERE id = 5;
 
--- JOIN
+-- DELETE without WHERE (deletes all rows - use with caution)
+DELETE FROM products;
+```
+
+### DQL (Data Query Language)
+
+```sql
+-- Aggregate functions
+SELECT COUNT(*) FROM products;
+SELECT COUNT(name) FROM products;
+SELECT SUM(price) FROM products;
+SELECT AVG(price) FROM products;
+SELECT MIN(price) FROM products;
+SELECT MAX(price) FROM products;
+
+-- Aggregate functions with aliases
+SELECT
+    COUNT(*) AS total_products,
+    SUM(price) AS total_value,
+    AVG(price) AS avg_price,
+    MIN(price) AS min_price,
+    MAX(price) AS max_price
+FROM products;
+
+-- GROUP BY with aggregations
+SELECT category, COUNT(*) FROM products GROUP BY category;
+SELECT category, AVG(price) FROM products GROUP BY category;
+SELECT category, SUM(quantity) FROM products GROUP BY category;
+
+-- GROUP BY with multiple aggregations
+SELECT
+    category,
+    COUNT(*) AS product_count,
+    SUM(price) AS total_value,
+    AVG(price) AS avg_price,
+    MIN(price) AS min_price,
+    MAX(price) AS max_price
+FROM products
+GROUP BY category;
+
+-- GROUP BY with HAVING clause
+SELECT category, COUNT(*) AS cnt FROM products GROUP BY category HAVING cnt > 5;
+SELECT category, AVG(price) AS avg_price FROM products GROUP BY category HAVING avg_price > 100;
+SELECT category, SUM(price) AS total FROM products GROUP BY category HAVING total > 1000;
+
+-- ORDER BY (ascending is default)
+SELECT * FROM products ORDER BY price;
+SELECT * FROM products ORDER BY price ASC;
+SELECT * FROM products ORDER BY name ASC;
+
+-- ORDER BY descending
+SELECT * FROM products ORDER BY price DESC;
+SELECT * FROM products ORDER BY quantity DESC;
+
+-- ORDER BY multiple columns
+SELECT * FROM products ORDER BY category ASC, price DESC;
+SELECT * FROM products ORDER BY in_stock DESC, price ASC, name ASC;
+
+-- ORDER BY with expressions
+SELECT name, price FROM products ORDER BY price * quantity DESC;
+
+-- LIMIT clause
+SELECT * FROM products LIMIT 10;
+SELECT * FROM products ORDER BY price DESC LIMIT 5;
+SELECT name, price FROM products WHERE category = 'Electronics' ORDER BY price LIMIT 3;
+
+-- Combined: WHERE + GROUP BY + HAVING + ORDER BY + LIMIT
+SELECT
+    category,
+    COUNT(*) AS product_count,
+    AVG(price) AS avg_price
+FROM products
+WHERE in_stock = 1
+GROUP BY category
+HAVING product_count > 2
+ORDER BY avg_price DESC
+LIMIT 10;
+
+-- INNER JOIN
 SELECT u.name, o.amount, o.order_date
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+-- JOIN (equivalent to INNER JOIN)
+SELECT u.name, o.amount
 FROM users u
 JOIN orders o ON u.id = o.user_id
 WHERE u.age > 25;
 
--- Aggregate queries (vectorized execution)
-SELECT
-    category,
-    COUNT(*) as product_count,
-    SUM(price) as total_value,
-    AVG(price) as avg_price,
-    MIN(price) as min_price,
-    MAX(price) as max_price
-FROM products
-GROUP BY category
-HAVING product_count > 5
-ORDER BY total_value DESC;
+-- LEFT JOIN (LEFT OUTER JOIN)
+SELECT u.name, o.amount
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id;
+
+SELECT u.name, o.amount
+FROM users u
+LEFT OUTER JOIN orders o ON u.id = o.user_id;
+
+-- RIGHT JOIN (RIGHT OUTER JOIN)
+SELECT u.name, o.amount
+FROM users u
+RIGHT JOIN orders o ON u.id = o.user_id;
+
+SELECT u.name, o.amount
+FROM users u
+RIGHT OUTER JOIN orders o ON u.id = o.user_id;
+
+-- FULL OUTER JOIN
+SELECT u.name, o.amount
+FROM users u
+FULL JOIN orders o ON u.id = o.user_id;
+
+SELECT u.name, o.amount
+FROM users u
+FULL OUTER JOIN orders o ON u.id = o.user_id;
+
+-- Multiple JOINs
+SELECT u.name, o.amount, p.name AS product_name
+FROM users u
+JOIN orders o ON u.id = o.user_id
+JOIN products p ON o.product_id = p.id;
+
+-- JOIN with WHERE clause
+SELECT u.name, o.amount
+FROM users u
+JOIN orders o ON u.id = o.user_id
+WHERE o.amount > 100 AND u.age > 25;
+
+-- JOIN with aggregations
+SELECT u.name, COUNT(*) AS order_count, SUM(o.amount) AS total_spent
+FROM users u
+JOIN orders o ON u.id = o.user_id
+GROUP BY u.name;
+
+-- Subquery in FROM clause
+SELECT sub.category, sub.avg_price
+FROM (SELECT category, AVG(price) AS avg_price FROM products GROUP BY category) AS sub
+WHERE sub.avg_price > 100;
+
+-- Subquery with JOIN
+SELECT u.name, sub.total
+FROM users u
+JOIN (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) AS sub ON u.id = sub.user_id;
+
+-- SELECT with function calls in expressions
+SELECT name, price, price * 1.1 AS price_with_tax FROM products;
+SELECT name, price, quantity, price * quantity AS total_value FROM products;
+SELECT UPPER(name) AS upper_name FROM products;
+SELECT COUNT(*), AVG(price) FROM products WHERE category = 'Electronics';
 ```
 
 ### System Table Queries
@@ -792,15 +1024,71 @@ LIMIT 20;
 SELECT file_path, file_size, row_count, status
 FROM sys.table_files
 WHERE db_name = 'ecommerce' AND table_name = 'products';
+
+-- System tables with aggregations
+SELECT db_name, COUNT(*) AS table_count
+FROM sys.table_metadata
+GROUP BY db_name;
+
+-- System tables with JOINs
+SELECT t.table_name, COUNT(c.column_name) AS column_count
+FROM sys.table_metadata t
+JOIN sys.columns_metadata c ON t.table_name = c.table_name
+GROUP BY t.table_name;
+```
+
+### DCL (Data Control Language) - Transaction Control
+
+```sql
+-- Start a transaction
+START TRANSACTION;
+
+-- Commit changes
+COMMIT;
+
+-- Rollback changes
+ROLLBACK;
+
+-- Transaction example with multiple operations
+START TRANSACTION;
+INSERT INTO products VALUES (10, 'Keyboard', 79.99, 30, 1, '2024-01-10', 'Electronics');
+UPDATE products SET price = price * 0.9 WHERE category = 'Electronics';
+DELETE FROM products WHERE quantity = 0;
+COMMIT;
 ```
 
 ### Utility Commands
 
 ```sql
--- View execution plan
+-- View execution plan for SELECT query
 EXPLAIN SELECT * FROM products WHERE category = 'Electronics';
 
--- Output example:
+-- EXPLAIN with JOIN
+EXPLAIN SELECT u.name, o.amount
+FROM users u
+JOIN orders o ON u.id = o.user_id
+WHERE u.age > 25;
+
+-- EXPLAIN with complex query
+EXPLAIN SELECT
+    category,
+    COUNT(*) AS product_count,
+    AVG(price) AS avg_price
+FROM products
+WHERE in_stock = 1
+GROUP BY category
+HAVING product_count > 2
+ORDER BY avg_price DESC
+LIMIT 10;
+
+-- Analyze table statistics (all columns)
+ANALYZE TABLE products;
+
+-- Analyze specific columns
+ANALYZE TABLE products (price, quantity);
+ANALYZE TABLE users (age, active);
+
+-- Output example of EXPLAIN:
 Query Execution Plan:
 --------------------
 Select
@@ -814,29 +1102,67 @@ Select
 
 | Category | Feature | Status | Execution Engine | Notes |
 |---------|------|------|---------|------|
-| **DDL** | CREATE/DROP DATABASE | ✅ | N/A | |
-| | CREATE/DROP TABLE | ✅ | N/A | |
-| | CREATE/DROP INDEX | ✅ | N/A | B-Tree indexes |
-| **DML** | INSERT | ✅ | Regular | Supports batch insert |
+| **DDL** | CREATE/DROP DATABASE | ✅ | N/A | Full support |
+| | CREATE/DROP TABLE | ✅ | N/A | With all data types |
+| | CREATE/DROP INDEX | ✅ | N/A | B-Tree indexes, UNIQUE support |
+| | Column constraints | ✅ | N/A | PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT |
+| | Table constraints | ✅ | N/A | PRIMARY KEY (multi-column) |
+| | PARTITION BY | ✅ | N/A | HASH and RANGE partitioning |
+| **Data Types** | INTEGER | ✅ | Both | Full support |
+| | VARCHAR | ✅ | Both | With optional length |
+| | DOUBLE | ✅ | Both | Floating point |
+| | BOOLEAN | ✅ | Both | True/false values |
+| | TIMESTAMP | ✅ | Both | Date and time |
+| **DML** | INSERT (single) | ✅ | Regular | Single row insertion |
+| | INSERT (batch) | ✅ | Regular | Multiple rows in one statement |
+| | INSERT (column list) | ✅ | Regular | Specify target columns |
 | | SELECT | ✅ | Vectorized | Simple queries |
-| | UPDATE | ✅ | Regular | **Merge-on-Read** |
+| | UPDATE (single) | ✅ | Regular | **Merge-on-Read** |
+| | UPDATE (multiple) | ✅ | Regular | Multiple column updates |
 | | DELETE | ✅ | Regular | **Merge-on-Read** |
-| **WHERE** | =, >, <, >=, <= | ✅ | Vectorized | **Predicate pushdown** |
-| | AND, OR | ✅ | Vectorized | Supports compound conditions |
-| | LIKE | ⚠️ | Regular | Fallback |
-| | IN, BETWEEN | ⚠️ | Regular | Fallback |
+| **WHERE** | =, !=, >, <, >=, <= | ✅ | Vectorized | **Predicate pushdown** |
+| | AND, OR | ✅ | Vectorized | Compound conditions |
+| | LIKE, NOT LIKE | ⚠️ | Regular | Pattern matching, fallback |
+| | IN, NOT IN | ⚠️ | Regular | Value list matching, fallback |
+| | Parenthesized expressions | ✅ | Both | Complex logic grouping |
+| | Qualified column refs | ✅ | Both | table.column syntax |
 | **JOIN** | INNER JOIN | ✅ | Regular | Basic implementation |
-| | LEFT JOIN | ✅ | Regular | Basic implementation |
-| **Aggregation** | COUNT/SUM/AVG | ✅ | Vectorized | **10-100x speedup** |
-| | MIN/MAX | ✅ | Vectorized | |
-| | GROUP BY | ✅ | Vectorized | |
-| | HAVING | ✅ | Vectorized | |
-| **Sorting** | ORDER BY | ✅ | Regular | Basic sorting |
-| | LIMIT | ✅ | Regular | |
-| **System** | SHOW TABLES/DATABASES | ✅ | N/A | |
-| | SHOW INDEXES | ✅ | N/A | |
-| | EXPLAIN | ✅ | N/A | Query plans |
-| | System table queries | ✅ | Vectorized | **SQL Bootstrap** |
+| | JOIN (implicit INNER) | ✅ | Regular | Equivalent to INNER JOIN |
+| | LEFT JOIN | ✅ | Regular | LEFT OUTER JOIN |
+| | RIGHT JOIN | ✅ | Regular | RIGHT OUTER JOIN |
+| | FULL JOIN | ✅ | Regular | FULL OUTER JOIN |
+| | Multiple JOINs | ✅ | Regular | Chain multiple joins |
+| | Subqueries in FROM | ✅ | Regular | Derived tables |
+| **Aggregation** | COUNT, SUM, AVG | ✅ | Vectorized | **10-100x speedup** |
+| | MIN, MAX | ✅ | Vectorized | Optimized execution |
+| | GROUP BY | ✅ | Vectorized | Single and multiple columns |
+| | HAVING | ✅ | Vectorized | Post-aggregation filtering |
+| **Sorting** | ORDER BY (single) | ✅ | Regular | ASC/DESC |
+| | ORDER BY (multiple) | ✅ | Regular | Multiple columns with ASC/DESC |
+| | ORDER BY expressions | ✅ | Regular | Computed expressions |
+| **Limiting** | LIMIT | ✅ | Regular | Result set limiting |
+| **Aliases** | Column aliases (AS) | ✅ | Both | Explicit aliases |
+| | Column aliases (implicit) | ✅ | Both | Without AS keyword |
+| | Table aliases (AS) | ✅ | Both | Explicit table aliases |
+| | Table aliases (implicit) | ✅ | Both | Without AS keyword |
+| **Functions** | Aggregate functions | ✅ | Vectorized | COUNT, SUM, AVG, MIN, MAX |
+| | Expression functions | ⚠️ | Both | Basic support, limited catalog |
+| **Transactions** | START TRANSACTION | ✅ | N/A | Transaction begin |
+| | COMMIT | ✅ | N/A | Commit changes |
+| | ROLLBACK | ✅ | N/A | Rollback changes |
+| **Utility** | SHOW DATABASES | ✅ | N/A | List all databases |
+| | SHOW TABLES | ✅ | N/A | List tables in current DB |
+| | SHOW INDEXES ON | ✅ | N/A | List indexes on table |
+| | SHOW INDEXES FROM | ✅ | N/A | Alternative syntax |
+| | EXPLAIN | ✅ | N/A | Query execution plan |
+| | ANALYZE TABLE | ✅ | N/A | Collect statistics (all/specific columns) |
+| | USE | ✅ | N/A | Switch database context |
+| **System Tables** | sys.db_metadata | ✅ | Vectorized | Database metadata |
+| | sys.table_metadata | ✅ | Vectorized | Table metadata |
+| | sys.columns_metadata | ✅ | Vectorized | Column information |
+| | sys.index_metadata | ✅ | Vectorized | Index information |
+| | sys.delta_log | ✅ | Vectorized | **Transaction log queries** |
+| | sys.table_files | ✅ | Vectorized | File inventory |
 
 ---
 

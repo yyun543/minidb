@@ -405,7 +405,9 @@ func (dl *DeltaLog) GetSnapshot(tableID string, version int64) (*Snapshot, error
 						zap.Int64("version", entry.Version),
 						zap.Error(err))
 				}
-			} else {
+			} else if entry.IndexJSON == "" {
+				// Only warn if both SchemaJSON and IndexJSON are empty
+				// Index operations have IndexJSON but no SchemaJSON, which is normal
 				logger.Warn("METADATA entry has empty SchemaJSON",
 					zap.String("table", tableID),
 					zap.Int64("version", entry.Version))

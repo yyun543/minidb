@@ -15,7 +15,7 @@ import (
 // TestUpdateStandalone 独立的UPDATE测试，验证UPDATE修复是否有效
 func TestUpdateStandalone(t *testing.T) {
 	// 创建完全独立的测试环境
-	storageEngine, err := storage.NewParquetEngine("./test_data/update_standalone.wal")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "update_standalone.wal"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
@@ -108,7 +108,7 @@ func TestUpdateStandalone(t *testing.T) {
 
 // TestUpdateMultipleColumns 测试多列UPDATE
 func TestUpdateMultipleColumns(t *testing.T) {
-	storageEngine, err := storage.NewParquetEngine("./test_data/update_multi.wal")
+	storageEngine, err := storage.NewParquetEngine(SetupTestDir(t, "update_multi.wal"))
 	assert.NoError(t, err)
 	defer storageEngine.Close()
 	err = storageEngine.Open()
