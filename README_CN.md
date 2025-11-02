@@ -727,6 +727,7 @@ CREATE TABLE users (
 -- 带表级PRIMARY KEY约束的表
 CREATE TABLE orders (
     order_id INTEGER,
+    product_id INTEGER,
     user_id INTEGER NOT NULL,
     amount DOUBLE,
     PRIMARY KEY (order_id)
@@ -774,9 +775,9 @@ INSERT INTO products VALUES
 
 
 INSERT INTO orders VALUES
-    (1, 1, 19.99),
-    (2, 2, 29.99),
-    (3, 3, 38.88);
+    (1, 1, 2, 19.99),
+    (2, 2, 3, 29.99),
+    (3, 3, 1, 38.88);
 
 -- 指定列插入
 INSERT INTO products (id, name, price, category)
@@ -792,7 +793,7 @@ INSERT INTO users (id, username, email, age) VALUES
 SELECT * FROM products;
 SELECT name, price FROM products;
 
--- 带列别名的查询
+-- 带列别名的查询**
 SELECT name AS product_name, price AS product_price FROM products;
 SELECT name product_name, price product_price FROM products;
 
@@ -896,7 +897,7 @@ SELECT category, SUM(price) AS total FROM products GROUP BY category HAVING tota
 
 -- ORDER BY(升序为默认)
 SELECT * FROM products ORDER BY price;
-SELECT * FROM products ORDER BY price ASC;
+SELECT * FROM products ORDER BY price DESC;
 SELECT * FROM products ORDER BY name ASC;
 
 -- ORDER BY降序
@@ -997,6 +998,7 @@ JOIN (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) AS sub 
 SELECT name, price, price * 1.1 AS price_with_tax FROM products;
 SELECT name, price, quantity, price * quantity AS total_value FROM products;
 SELECT UPPER(name) AS upper_name FROM products;
+
 SELECT COUNT(*), AVG(price) FROM products WHERE category = 'Electronics';
 ```
 
@@ -1055,7 +1057,7 @@ COMMIT;
 -- 回滚更改
 ROLLBACK;
 
--- 事务示例(多个操作)
+-- 事务示例(多个操作) ** 
 START TRANSACTION;
 INSERT INTO products VALUES (10, 'Keyboard', 79.99, 30, 1, '2024-01-10', 'Electronics');
 UPDATE products SET price = price * 0.9 WHERE category = 'Electronics';

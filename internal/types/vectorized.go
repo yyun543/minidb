@@ -15,17 +15,24 @@ type VectorizedBatch struct {
 	columns []arrow.Array
 	length  int64
 	pool    memory.Allocator
+	id      int64 // DEBUG: unique ID for tracking
 }
+
+var nextBatchID int64 = 1
 
 // NewVectorizedBatch 创建向量化批处理
 func NewVectorizedBatch(schema *arrow.Schema, pool memory.Allocator) *VectorizedBatch {
 	if pool == nil {
 		pool = memory.DefaultAllocator
 	}
+	id := nextBatchID
+	nextBatchID++
+	fmt.Printf("NewVectorizedBatch: created batch ID=%d\n", id)
 	return &VectorizedBatch{
 		schema:  schema,
 		columns: make([]arrow.Array, schema.NumFields()),
 		pool:    pool,
+		id:      id,
 	}
 }
 
@@ -58,17 +65,57 @@ func (vb *VectorizedBatch) SetColumn(i int, column arrow.Array) error {
 		return fmt.Errorf("column index out of range: %d", i)
 	}
 
+	// Release old column if exists
+	if vb.columns[i] != nil {
+		vb.columns[i].Release()
+	}
+
 	// 更新长度（使用第一个非空列的长度）
 	if vb.length == 0 && column != nil {
 		vb.length = int64(column.Len())
 	}
 
+	// IMPORTANT: Retain the column to increment reference count
+	// This prevents the column from being freed when the source record is released
+	if column != nil {
+		column.Retain()
+		fmt.Printf("SetColumn: batch ID=%d, retained column %d, type=%T, len=%d, nullCount=%d\n",
+			vb.id, i, column, column.Len(), column.NullN())
+	}
 	vb.columns[i] = column
+
+	// DEBUG: Verify the column was stored correctly
+	if vb.columns[i] != nil {
+		fmt.Printf("SetColumn: batch ID=%d, stored column %d, type=%T, len=%d, nullCount=%d\n",
+			vb.id, i, vb.columns[i], vb.columns[i].Len(), vb.columns[i].NullN())
+	}
 	return nil
+}
+
+// Release releases all column arrays
+func (vb *VectorizedBatch) Release() {
+	for i, col := range vb.columns {
+		if col != nil {
+			col.Release()
+			vb.columns[i] = nil
+		}
+	}
 }
 
 // ToRecord 转换为Arrow Record
 func (vb *VectorizedBatch) ToRecord() arrow.Record {
+	// DEBUG: Log column state before creating record
+	fmt.Printf("ToRecord: batch ID=%d, creating record with %d columns, length=%d\n", vb.id, len(vb.columns), vb.length)
+	for i, col := range vb.columns {
+		fieldName := vb.schema.Field(i).Name
+		if col != nil {
+			fmt.Printf("ToRecord: batch ID=%d, column %d (%s) is NOT nil, type=%T, len=%d, nullCount=%d\n",
+				vb.id, i, fieldName, col, col.Len(), col.NullN())
+		} else {
+			fmt.Printf("ToRecord: batch ID=%d, column %d (%s) is NIL - will create empty column!\n", vb.id, i, fieldName)
+		}
+	}
+
 	arrays := make([]arrow.Array, len(vb.columns))
 	for i, col := range vb.columns {
 		if col != nil {
@@ -76,15 +123,19 @@ func (vb *VectorizedBatch) ToRecord() arrow.Record {
 		} else {
 			// 如果列为nil，创建一个空列
 			field := vb.schema.Field(i)
+			fmt.Printf("ToRecord: creating empty column for field %s (type=%s)\n", field.Name, field.Type)
 			arrays[i] = vb.createEmptyColumn(field, int(vb.length))
 		}
 	}
-	return array.NewRecord(vb.schema, arrays, vb.length)
+	record := array.NewRecord(vb.schema, arrays, vb.length)
+	fmt.Printf("ToRecord: created record with %d rows, %d cols\n", record.NumRows(), record.NumCols())
+	return record
 }
 
 // createEmptyColumn 创建一个空列
 func (vb *VectorizedBatch) createEmptyColumn(field arrow.Field, length int) arrow.Array {
 	pool := memory.DefaultAllocator
+	fmt.Printf("createEmptyColumn: SHOULD NOT BE CALLED! field=%s, type=%s, length=%d\n", field.Name, field.Type, length)
 	switch field.Type {
 	case arrow.PrimitiveTypes.Int64:
 		builder := array.NewInt64Builder(pool)
@@ -108,6 +159,7 @@ func (vb *VectorizedBatch) createEmptyColumn(field arrow.Field, length int) arro
 		}
 		return builder.NewArray()
 	default:
+		fmt.Printf("createEmptyColumn: WARNING - using default String type for field %s with type %s\n", field.Name, field.Type)
 		// 默认创建string类型的空列
 		builder := array.NewStringBuilder(pool)
 		defer builder.Release()
@@ -206,18 +258,28 @@ func NewProjectOperation(columnIndices []int, newSchema *arrow.Schema) *ProjectO
 
 // Execute 执行投影操作
 func (op *ProjectOperation) Execute(batch *VectorizedBatch) (*VectorizedBatch, error) {
+	fmt.Printf("ProjectOperation.Execute: batch ID=%d, input columns=%d, output columns=%d\n",
+		batch.id, batch.NumColumns(), len(op.columnIndices))
+
 	result := NewVectorizedBatch(op.newSchema, batch.pool)
 	result.length = batch.length
 
 	for i, colIdx := range op.columnIndices {
 		if colIdx >= 0 && colIdx < int(batch.NumColumns()) {
 			column := batch.Column(colIdx)
+			if column == nil {
+				fmt.Printf("ProjectOperation.Execute: WARNING - source column %d is NIL!\n", colIdx)
+			} else {
+				fmt.Printf("ProjectOperation.Execute: copying column %d -> %d, type=%T, len=%d, nullCount=%d\n",
+					colIdx, i, column, column.Len(), column.NullN())
+			}
 			if err := result.SetColumn(i, column); err != nil {
 				return nil, fmt.Errorf("failed to set column %d: %w", i, err)
 			}
 		} else {
 			// 如果列索引无效，创建一个空列
 			field := op.newSchema.Field(i)
+			fmt.Printf("ProjectOperation.Execute: CREATING EMPTY COLUMN for index %d (invalid colIdx=%d)\n", i, colIdx)
 			emptyColumn := op.createEmptyColumn(field, int(batch.length))
 			if err := result.SetColumn(i, emptyColumn); err != nil {
 				return nil, fmt.Errorf("failed to set empty column %d: %w", i, err)

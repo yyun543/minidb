@@ -6,11 +6,15 @@ import (
 	"strings"
 
 	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/catalog"
+	"github.com/yyun543/minidb/internal/logger"
 	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/session"
 	"github.com/yyun543/minidb/internal/statistics"
 	"github.com/yyun543/minidb/internal/types"
+	"go.uber.org/zap"
 )
 
 // VectorizedExecutor 向量化执行器，提供更高性能的查询执行
@@ -190,6 +194,43 @@ func (ve *VectorizedExecutor) buildOperationsFromPlan(ctx context.Context, plan 
 			operations = append(operations, childOps...)
 		}
 
+	case optimizer.ProjectionPlan:
+		// 投影操作 (类似SelectPlan,但使用ProjectionProperties)
+		props := plan.Properties.(*optimizer.ProjectionProperties)
+
+		// 检查是否包含表达式或函数 - vectorized executor不支持
+		for _, col := range props.Columns {
+			if col.Type == optimizer.ColumnRefTypeExpression {
+				return nil, fmt.Errorf("expression columns not supported in vectorized execution - fallback to regular executor")
+			}
+			if col.Type == optimizer.ColumnRefTypeFunction {
+				return nil, fmt.Errorf("aggregate functions not supported in vectorized projection - fallback to regular executor")
+			}
+		}
+
+		// 获取子节点的输出schema，这才是投影操作的输入schema
+		var inputSchema *arrow.Schema
+		if len(plan.Children) > 0 {
+			inputSchema = ve.InferSchema(plan.Children[0], sess)
+		} else {
+			inputSchema = schema
+		}
+
+		// ProjectionPlan总是指定具体列，不支持SELECT *
+		columnIndices, newSchema := ve.buildProjectionMapping(props.Columns, inputSchema)
+
+		projectOp := types.NewProjectOperation(columnIndices, newSchema)
+		operations = append(operations, projectOp)
+
+		// 递归处理子操作 - 使用子节点的输入schema
+		if len(plan.Children) > 0 {
+			childOps, err := ve.buildOperationsFromPlan(ctx, plan.Children[0], inputSchema, sess)
+			if err != nil {
+				return nil, err
+			}
+			operations = append(operations, childOps...)
+		}
+
 	case optimizer.JoinPlan:
 		// 连接操作
 		joinOp, err := ve.buildJoinOperation(ctx, plan, schema)
@@ -209,10 +250,18 @@ func (ve *VectorizedExecutor) buildOperationsFromPlan(ctx context.Context, plan 
 func (ve *VectorizedExecutor) buildTableScanOperation(plan *optimizer.Plan, sess *session.Session) (types.VectorizedOperation, error) {
 	props := plan.Properties.(*optimizer.TableScanProperties)
 
-	// 解析表引用：支持 "database.table" 或 "table" 格式
-	dbName, tableName := ve.parseTableReference(props.Table, sess.CurrentDB)
+	// 解析表名，可能包含数据库前缀（如 sys.db_metadata）
+	database, table := ve.parseTableName(props.Table)
 
-	batches, err := ve.dataManager.GetTableData(dbName, tableName)
+	// 如果没有指定数据库，使用会话中的当前数据库
+	if database == "" {
+		database = sess.CurrentDB
+		if database == "" {
+			database = "default"
+		}
+	}
+
+	batches, err := ve.dataManager.GetTableData(database, table)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +273,7 @@ func (ve *VectorizedExecutor) buildTableScanOperation(plan *optimizer.Plan, sess
 	}
 
 	return &VectorizedTableScanOperation{
-		tableName:  props.Table,
+		tableName:  table, // 使用解析后的表名
 		batches:    vectorizedBatches,
 		currentIdx: 0,
 	}, nil
@@ -232,6 +281,11 @@ func (ve *VectorizedExecutor) buildTableScanOperation(plan *optimizer.Plan, sess
 
 // buildVectorizedPredicate 构建向量化谓词
 func (ve *VectorizedExecutor) buildVectorizedPredicate(condition optimizer.Expression, schema *arrow.Schema) (*types.VectorizedPredicate, error) {
+	// 检查是否是IN表达式 - 不支持向量化
+	if _, ok := condition.(*optimizer.InExpression); ok {
+		return nil, fmt.Errorf("IN expressions not supported in vectorized execution - fallback to regular executor")
+	}
+
 	if binExpr, ok := condition.(*optimizer.BinaryExpression); ok {
 		// 检查是否是逻辑表达式（AND/OR）
 		if binExpr.Operator == "AND" || binExpr.Operator == "OR" {
@@ -327,30 +381,6 @@ func (ve *VectorizedExecutor) buildVectorizedPredicate(condition optimizer.Expre
 					default:
 						return nil, fmt.Errorf("cannot convert %T to float64 for column %s", litVal.Value, colRef.Column)
 					}
-				case arrow.FixedWidthTypes.Boolean:
-					// 确保值是bool类型 - 支持 true/false, 1/0, "true"/"false" 等多种形式
-					switch v := litVal.Value.(type) {
-					case bool:
-						value = v
-					case int64:
-						value = (v != 0)
-					case int:
-						value = (v != 0)
-					case int32:
-						value = (v != 0)
-					case string:
-						// 处理字符串形式的布尔值
-						switch v {
-						case "true", "1", "t", "T", "TRUE":
-							value = true
-						case "false", "0", "f", "F", "FALSE":
-							value = false
-						default:
-							return nil, fmt.Errorf("cannot convert string %q to bool for column %s", v, colRef.Column)
-						}
-					default:
-						return nil, fmt.Errorf("cannot convert %T to bool for column %s", litVal.Value, colRef.Column)
-					}
 				default:
 					value = litVal.Value
 				}
@@ -363,7 +393,7 @@ func (ve *VectorizedExecutor) buildVectorizedPredicate(condition optimizer.Expre
 		}
 	}
 
-	return nil, fmt.Errorf("unsupported predicate type")
+	return nil, fmt.Errorf("unsupported predicate type - fallback to regular executor")
 }
 
 // buildProjectionMapping 构建投影映射
@@ -384,20 +414,15 @@ func (ve *VectorizedExecutor) buildProjectionMapping(columns []optimizer.ColumnR
 		}
 
 		if columnIndex != -1 {
-			// 如果有别名，使用别名作为字段名
-			if col.Alias != "" {
-				foundField.Name = col.Alias
-			}
 			fields[i] = foundField
 			columnIndices[i] = columnIndex
 		} else {
 			// 列未找到，创建一个默认字段
-			fieldName := col.Column
-			if col.Alias != "" {
-				fieldName = col.Alias
-			}
+			logger.WithComponent("vectorized_executor").Warn("Column not found in schema",
+				zap.String("column", col.Column),
+				zap.String("table", col.Table))
 			fields[i] = arrow.Field{
-				Name:     fieldName,
+				Name:     col.Column,
 				Type:     arrow.BinaryTypes.String,
 				Nullable: true,
 			}
@@ -500,13 +525,74 @@ func (ve *VectorizedExecutor) convertToVectorizedBatch(batch *types.Batch) *type
 	record := batch.Record()
 	schema := record.Schema()
 
+	// CRITICAL FIX: Deep copy the record to prevent memory corruption
+	// The iterator might invalidate the data when closed
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	// Copy all rows from the source record
+	for rowIdx := int64(0); rowIdx < record.NumRows(); rowIdx++ {
+		for colIdx := int64(0); colIdx < record.NumCols(); colIdx++ {
+			field := builder.Field(int(colIdx))
+			column := record.Column(int(colIdx))
+			if err := ve.copyColumnValue(field, column, int(rowIdx)); err != nil {
+				logger.WithComponent("vectorized_executor").Error("Failed to copy column value",
+					zap.Error(err),
+					zap.Int("row", int(rowIdx)),
+					zap.Int("col", int(colIdx)))
+			}
+		}
+	}
+
+	// Build the new record with copied data
+	copiedRecord := builder.NewRecord()
+
 	vBatch := types.NewVectorizedBatch(schema, nil)
-	for i := int64(0); i < record.NumCols(); i++ {
-		column := record.Column(int(i))
+	for i := int64(0); i < copiedRecord.NumCols(); i++ {
+		column := copiedRecord.Column(int(i))
 		vBatch.SetColumn(int(i), column)
 	}
 
 	return vBatch
+}
+
+// copyColumnValue copies a value from a source column to a builder
+func (ve *VectorizedExecutor) copyColumnValue(field array.Builder, column arrow.Array, rowIdx int) error {
+	if column.IsNull(rowIdx) {
+		field.AppendNull()
+		return nil
+	}
+
+	switch col := column.(type) {
+	case *array.Int64:
+		if builder, ok := field.(*array.Int64Builder); ok {
+			builder.Append(col.Value(rowIdx))
+		} else {
+			return fmt.Errorf("builder type mismatch for Int64")
+		}
+	case *array.Float64:
+		if builder, ok := field.(*array.Float64Builder); ok {
+			builder.Append(col.Value(rowIdx))
+		} else {
+			return fmt.Errorf("builder type mismatch for Float64")
+		}
+	case *array.String:
+		if builder, ok := field.(*array.StringBuilder); ok {
+			builder.Append(col.Value(rowIdx))
+		} else {
+			return fmt.Errorf("builder type mismatch for String")
+		}
+	case *array.Boolean:
+		if builder, ok := field.(*array.BooleanBuilder); ok {
+			builder.Append(col.Value(rowIdx))
+		} else {
+			return fmt.Errorf("builder type mismatch for Boolean")
+		}
+	default:
+		return fmt.Errorf("unsupported column type: %T", column)
+	}
+	return nil
 }
 
 func (ve *VectorizedExecutor) getSchemaFieldNames(schema *arrow.Schema) []string {
@@ -517,6 +603,24 @@ func (ve *VectorizedExecutor) getSchemaFieldNames(schema *arrow.Schema) []string
 	return names
 }
 
+// parseTableName 解析表名，提取数据库名和表名
+// 支持格式：
+//   - "table_name" -> ("", "table_name")
+//   - "database.table_name" -> ("database", "table_name")
+func (ve *VectorizedExecutor) parseTableName(fullTableName string) (database string, table string) {
+	// 查找第一个点号的位置
+	dotIndex := strings.Index(fullTableName, ".")
+	if dotIndex == -1 {
+		// 没有数据库前缀
+		return "", fullTableName
+	}
+
+	// 有数据库前缀
+	database = fullTableName[:dotIndex]
+	table = fullTableName[dotIndex+1:]
+	return database, table
+}
+
 func (ve *VectorizedExecutor) InferSchema(plan *optimizer.Plan, sess *session.Session) *arrow.Schema {
 	// 简化实现：根据计划推断模式
 	// 实际实现需要更复杂的类型推断逻辑
@@ -524,9 +628,19 @@ func (ve *VectorizedExecutor) InferSchema(plan *optimizer.Plan, sess *session.Se
 	switch plan.Type {
 	case optimizer.TableScanPlan:
 		props := plan.Properties.(*optimizer.TableScanProperties)
-		// 解析表引用：支持 "database.table" 或 "table" 格式
-		dbName, tableName := ve.parseTableReference(props.Table, sess.CurrentDB)
-		if tableMeta, err := ve.catalog.GetTable(dbName, tableName); err == nil {
+
+		// 解析表名，可能包含数据库前缀（如 sys.db_metadata）
+		database, table := ve.parseTableName(props.Table)
+
+		// 如果没有指定数据库，使用会话中的当前数据库
+		if database == "" {
+			database = sess.CurrentDB
+			if database == "" {
+				database = "default"
+			}
+		}
+
+		if tableMeta, err := ve.catalog.GetTable(database, table); err == nil {
 			return tableMeta.Schema
 		}
 
@@ -571,10 +685,144 @@ func (ve *VectorizedExecutor) InferSchema(plan *optimizer.Plan, sess *session.Se
 			}
 			return arrow.NewSchema(fields, nil)
 		}
+
+	case optimizer.ProjectionPlan:
+		// ProjectionPlan的模式推断
+		if len(plan.Children) > 0 {
+			childSchema := ve.InferSchema(plan.Children[0], sess)
+			props := plan.Properties.(*optimizer.ProjectionProperties)
+
+			// ProjectionPlan总是指定具体的列
+			fields := make([]arrow.Field, len(props.Columns))
+			for i, col := range props.Columns {
+				// 确定字段名（使用alias如果有，否则用列名）
+				fieldName := col.Column
+				if col.Alias != "" {
+					fieldName = col.Alias
+				}
+
+				// 根据ColumnRef的类型处理
+				if col.Type == optimizer.ColumnRefTypeExpression {
+					// 表达式列：推断表达式的类型
+					exprType := ve.inferExpressionType(col.Expression, childSchema)
+					fields[i] = arrow.Field{
+						Name: fieldName,
+						Type: exprType,
+					}
+					logger.WithComponent("vectorized_executor").Debug("InferSchema: Expression column",
+						zap.String("field_name", fieldName),
+						zap.String("type", exprType.String()))
+				} else if col.Type == optimizer.ColumnRefTypeFunction {
+					// 聚合函数列：根据函数类型推断
+					funcType := ve.inferFunctionType(col.FunctionName)
+					fields[i] = arrow.Field{
+						Name: fieldName,
+						Type: funcType,
+					}
+				} else {
+					// 普通列引用：从childSchema查找
+					found := false
+					for _, field := range childSchema.Fields() {
+						if field.Name == col.Column {
+							fields[i] = arrow.Field{
+								Name: fieldName,
+								Type: field.Type,
+							}
+							found = true
+							break
+						}
+					}
+					// 如果找不到字段，创建一个默认的字段
+					if !found {
+						logger.WithComponent("vectorized_executor").Warn("InferSchema: Column not found in child schema",
+							zap.String("plan_type", "ProjectionPlan"),
+							zap.String("column", col.Column),
+							zap.String("table", col.Table),
+							zap.Int("child_schema_fields", childSchema.NumFields()))
+						fields[i] = arrow.Field{
+							Name: fieldName,
+							Type: arrow.BinaryTypes.String,
+						}
+					}
+				}
+			}
+			return arrow.NewSchema(fields, nil)
+		}
 	}
 
 	// 默认返回空模式
+	logger.WithComponent("vectorized_executor").Warn("InferSchema: Unhandled plan type, returning empty schema",
+		zap.String("plan_type", plan.Type.String()))
 	return arrow.NewSchema([]arrow.Field{}, nil)
+}
+
+// inferExpressionType 推断表达式的Arrow类型
+func (ve *VectorizedExecutor) inferExpressionType(expr optimizer.Expression, schema *arrow.Schema) arrow.DataType {
+	if expr == nil {
+		return arrow.BinaryTypes.String
+	}
+
+	switch e := expr.(type) {
+	case *optimizer.BinaryExpression:
+		// 算术运算符返回Float64
+		if e.Operator == "+" || e.Operator == "-" || e.Operator == "*" || e.Operator == "/" {
+			return arrow.PrimitiveTypes.Float64
+		}
+		// 比较运算符返回Boolean
+		if e.Operator == "=" || e.Operator == "!=" || e.Operator == ">" || e.Operator == "<" ||
+			e.Operator == ">=" || e.Operator == "<=" {
+			return arrow.FixedWidthTypes.Boolean
+		}
+		// 逻辑运算符返回Boolean
+		if e.Operator == "AND" || e.Operator == "OR" {
+			return arrow.FixedWidthTypes.Boolean
+		}
+		return arrow.BinaryTypes.String
+
+	case *optimizer.LiteralValue:
+		// 根据字面量类型返回
+		switch e.Type {
+		case optimizer.LiteralTypeInteger:
+			return arrow.PrimitiveTypes.Int64
+		case optimizer.LiteralTypeFloat:
+			return arrow.PrimitiveTypes.Float64
+		case optimizer.LiteralTypeString:
+			return arrow.BinaryTypes.String
+		case optimizer.LiteralTypeBoolean:
+			return arrow.FixedWidthTypes.Boolean
+		default:
+			return arrow.BinaryTypes.String
+		}
+
+	case *optimizer.ColumnReference:
+		// 从schema查找列类型
+		for _, field := range schema.Fields() {
+			if field.Name == e.Column {
+				return field.Type
+			}
+		}
+		return arrow.BinaryTypes.String
+
+	default:
+		logger.WithComponent("vectorized_executor").Debug("Unknown expression type, defaulting to String",
+			zap.String("expr_type", fmt.Sprintf("%T", expr)))
+		return arrow.BinaryTypes.String
+	}
+}
+
+// inferFunctionType 推断聚合函数的返回类型
+func (ve *VectorizedExecutor) inferFunctionType(functionName string) arrow.DataType {
+	switch strings.ToUpper(functionName) {
+	case "COUNT":
+		return arrow.PrimitiveTypes.Int64
+	case "SUM", "AVG":
+		return arrow.PrimitiveTypes.Float64
+	case "MIN", "MAX":
+		// MIN/MAX可以是任何类型，这里默认Float64
+		return arrow.PrimitiveTypes.Float64
+	default:
+		return arrow.BinaryTypes.String
+	}
 }
 
 // 执行DDL/DML操作的方法（重用现有逻辑）
@@ -706,57 +954,10 @@ func (ve *VectorizedExecutor) executeDelete(plan *optimizer.Plan, sess *session.
 }
 
 func (ve *VectorizedExecutor) updateStatisticsAfterWrite(plan *optimizer.Plan) {
-	// 异步更新统计信息 - 实现智能的统计信息更新策略
+	// TODO: 异步更新统计信息
+	// 这里可以触发统计信息的重新收集
 	go func() {
 		// 异步更新，避免阻塞写操作
-		// 基于操作类型和表大小决定是否需要立即更新统计信息
-
-		var tableName string
-		var needsUpdate bool
-
-		// 根据计划类型提取表名和确定更新策略
-		switch plan.Type {
-		case optimizer.InsertPlan:
-			if props, ok := plan.Properties.(*optimizer.InsertProperties); ok {
-				tableName = props.Table
-				needsUpdate = true // INSERT总是需要更新统计信息
-			}
-		case optimizer.UpdatePlan:
-			if props, ok := plan.Properties.(*optimizer.UpdateProperties); ok {
-				tableName = props.Table
-				needsUpdate = true // UPDATE可能改变数据分布
-			}
-		case optimizer.DeletePlan:
-			if props, ok := plan.Properties.(*optimizer.DeleteProperties); ok {
-				tableName = props.Table
-				needsUpdate = true // DELETE改变行数统计
-			}
-		}
-
-		// 如果需要更新且有统计管理器，则触发更新
-		if needsUpdate && tableName != "" && ve.statsMgr != nil {
-			// 简化实现：标记统计信息为过期，下次查询时会重新收集
-			// 在生产环境中，这里应该有更复杂的策略：
-			// 1. 检查表大小，小表立即更新，大表延迟更新
-			// 2. 使用采样技术进行快速估算
-			// 3. 维护更新队列，避免重复更新同一张表
-
-			// 当前简化实现：记录需要更新的表，由后台任务处理
-			// ve.statsMgr.MarkTableForUpdate(tableName)
-		}
+		// 实际实现中应该更智能地决定何时更新统计信息
 	}()
-}
-
-// parseTableReference 解析表引用，支持 "database.table" 或 "table" 格式
-func (ve *VectorizedExecutor) parseTableReference(tableRef string, currentDB string) (string, string) {
-	parts := strings.Split(tableRef, ".")
-	if len(parts) == 2 {
-		// "database.table" 格式
-		return parts[0], parts[1]
-	}
-	// "table" 格式，使用当前数据库
-	if currentDB == "" {
-		currentDB = "default"
-	}
-	return currentDB, tableRef
 }

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,8 +60,8 @@ func NewParquetEngine(basePath string, opts ...EngineOption) (*ParquetEngine, er
 		basePath:          basePath,
 		objectStore:       objStore,
 		schemas:           make(map[string]*arrow.Schema),
-		useOptimisticLock: false, // 默认使用悲观锁（向后兼容）
-		maxRetries:        5,     // 默认重试5次
+		useOptimisticLock: true, // 默认使用乐观锁（支持事务）
+		maxRetries:        5,    // 默认重试5次
 	}
 
 	// 应用配置选项
@@ -155,10 +156,35 @@ func (pe *ParquetEngine) persistDeltaLogEntry(entry *delta.LogEntry) error {
 		builder.Field(4).(*array.StringBuilder).Append(entry.FilePath)
 		builder.Field(5).(*array.Int64Builder).Append(entry.FileSize)
 		builder.Field(6).(*array.Int64Builder).Append(entry.RowCount)
-		// TODO: Serialize MinValues, MaxValues, NullCounts as JSON
-		builder.Field(7).(*array.StringBuilder).Append("") // min_values
-		builder.Field(8).(*array.StringBuilder).Append("") // max_values
-		builder.Field(9).(*array.StringBuilder).Append("") // null_counts
+
+		// Serialize MinValues, MaxValues, NullCounts as JSON
+		minValuesJSON, err := json.Marshal(entry.MinValues)
+		if err != nil {
+			logger.Warn("Failed to serialize MinValues",
+				zap.Error(err),
+				zap.String("table", entry.TableID))
+			minValuesJSON = []byte("{}")
+		}
+
+		maxValuesJSON, err := json.Marshal(entry.MaxValues)
+		if err != nil {
+			logger.Warn("Failed to serialize MaxValues",
+				zap.Error(err),
+				zap.String("table", entry.TableID))
+			maxValuesJSON = []byte("{}")
+		}
+
+		nullCountsJSON, err := json.Marshal(entry.NullCounts)
+		if err != nil {
+			logger.Warn("Failed to serialize NullCounts",
+				zap.Error(err),
+				zap.String("table", entry.TableID))
+			nullCountsJSON = []byte("{}")
+		}
+
+		builder.Field(7).(*array.StringBuilder).Append(string(minValuesJSON))
+		builder.Field(8).(*array.StringBuilder).Append(string(maxValuesJSON))
+		builder.Field(9).(*array.StringBuilder).Append(string(nullCountsJSON))
 		builder.Field(10).(*array.BooleanBuilder).Append(entry.DataChange)
 		builder.Field(11).AppendNull()                                   // deletion_timestamp
 		builder.Field(12).AppendNull()                                   // schema_json
@@ -432,6 +458,48 @@ func (pe *ParquetEngine) parseDeltaLogEntry(record arrow.Record, rowIdx int) del
 		case "row_count":
 			if arr, ok := col.(*array.Int64); ok {
 				entry.RowCount = arr.Value(rowIdx)
+			}
+		case "min_values":
+			if arr, ok := col.(*array.String); ok {
+				minValuesStr := arr.Value(rowIdx)
+				if minValuesStr != "" {
+					var minValues map[string]interface{}
+					if err := json.Unmarshal([]byte(minValuesStr), &minValues); err != nil {
+						logger.Warn("Failed to deserialize MinValues",
+							zap.Error(err),
+							zap.String("table_id", entry.TableID))
+					} else {
+						entry.MinValues = minValues
+					}
+				}
+			}
+		case "max_values":
+			if arr, ok := col.(*array.String); ok {
+				maxValuesStr := arr.Value(rowIdx)
+				if maxValuesStr != "" {
+					var maxValues map[string]interface{}
+					if err := json.Unmarshal([]byte(maxValuesStr), &maxValues); err != nil {
+						logger.Warn("Failed to deserialize MaxValues",
+							zap.Error(err),
+							zap.String("table_id", entry.TableID))
+					} else {
+						entry.MaxValues = maxValues
+					}
+				}
+			}
+		case "null_counts":
+			if arr, ok := col.(*array.String); ok {
+				nullCountsStr := arr.Value(rowIdx)
+				if nullCountsStr != "" {
+					var nullCounts map[string]int64
+					if err := json.Unmarshal([]byte(nullCountsStr), &nullCounts); err != nil {
+						logger.Warn("Failed to deserialize NullCounts",
+							zap.Error(err),
+							zap.String("table_id", entry.TableID))
+					} else {
+						entry.NullCounts = nullCounts
+					}
+				}
 			}
 		case "data_change":
 			if arr, ok := col.(*array.Boolean); ok {
@@ -765,6 +833,150 @@ func (pe *ParquetEngine) Write(ctx context.Context, db, table string, batch arro
 		zap.Int64("rows", stats.RowCount))
 
 	return nil
+}
+
+// WriteWithoutCommit 写入Parquet文件但不提交到Delta Log（用于事务）
+// 返回ParquetFile信息，由调用者决定何时提交到Delta Log
+func (pe *ParquetEngine) WriteWithoutCommit(ctx context.Context, db, table string, batch arrow.Record) (*delta.ParquetFile, error) {
+	tableID := fmt.Sprintf("%s.%s", db, table)
+	logger.Info("Writing to table (transaction mode - no commit)",
+		zap.String("table", tableID),
+		zap.Int64("rows", batch.NumRows()))
+
+	// 生成 Parquet 文件路径
+	filePath := pe.generateFilePath(db, table)
+
+	// 写入 Parquet 文件
+	stats, err := parquet.WriteArrowBatch(filePath, batch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write parquet: %w", err)
+	}
+
+	// 创建ParquetFile信息，但不提交到Delta Log
+	parquetFile := &delta.ParquetFile{
+		Path:     filePath,
+		Size:     stats.FileSize,
+		RowCount: stats.RowCount,
+		Stats:    stats,
+	}
+
+	logger.Info("Parquet file written (not committed to Delta Log)",
+		zap.String("table", tableID),
+		zap.String("file", filePath),
+		zap.Int64("rows", stats.RowCount))
+
+	return parquetFile, nil
+}
+
+// DeleteWithoutCommit 执行DELETE操作但不提交到Delta Log（用于事务）
+// 返回ParquetFile信息，由调用者决定何时提交到Delta Log
+func (pe *ParquetEngine) DeleteWithoutCommit(ctx context.Context, db, table string, filters []Filter) (*delta.ParquetFile, int64, error) {
+	tableID := fmt.Sprintf("%s.%s", db, table)
+	logger.Info("Deleting from table (transaction mode - no commit)",
+		zap.String("table", tableID),
+		zap.Int("filter_count", len(filters)))
+
+	// Estimate affected rows
+	affectedRows := pe.estimateAffectedRows(ctx, tableID, filters)
+
+	// Create delta file with delete information
+	deltaFile := &DeltaFile{
+		Type:      "delete",
+		Filters:   filters,
+		Timestamp: time.Now().UnixMilli(),
+		Version:   pe.deltaLog.GetLatestVersion() + 1,
+	}
+
+	// Serialize delta file
+	schema, err := pe.GetTableSchema(db, table)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get table schema: %w", err)
+	}
+
+	record := pe.serializeDeltaFile(deltaFile, schema)
+	defer record.Release()
+
+	// Write delta file
+	fileName := fmt.Sprintf("delta-delete-%d-%s.parquet", time.Now().UnixNano(), uuid.New().String()[:8])
+	deltaPath := filepath.Join(pe.basePath, db, table, "deltas", fileName)
+
+	stats, err := parquet.WriteArrowBatch(deltaPath, record)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to write delta file: %w", err)
+	}
+
+	// KEY: Create ParquetFile info but DON'T commit to Delta Log
+	parquetFile := &delta.ParquetFile{
+		Path:      deltaPath,
+		Size:      stats.FileSize,
+		RowCount:  stats.RowCount,
+		Stats:     stats,
+		IsDelta:   true,
+		DeltaType: "delete",
+	}
+
+	logger.Info("Delta file written (not committed to Delta Log)",
+		zap.String("table", tableID),
+		zap.String("file", deltaPath),
+		zap.Int64("estimated_affected_rows", affectedRows))
+
+	return parquetFile, affectedRows, nil
+}
+
+// UpdateWithoutCommit 执行UPDATE操作但不提交到Delta Log（用于事务）
+// 返回ParquetFile信息，由调用者决定何时提交到Delta Log
+func (pe *ParquetEngine) UpdateWithoutCommit(ctx context.Context, db, table string, filters []Filter, updates map[string]interface{}) (*delta.ParquetFile, int64, error) {
+	tableID := fmt.Sprintf("%s.%s", db, table)
+	logger.Info("Updating table (transaction mode - no commit)",
+		zap.String("table", tableID),
+		zap.Int("filter_count", len(filters)))
+
+	// Estimate affected rows
+	affectedRows := pe.estimateAffectedRows(ctx, tableID, filters)
+
+	// Create delta file with update information
+	deltaFile := &DeltaFile{
+		Type:      "update",
+		Filters:   filters,
+		Updates:   updates,
+		Timestamp: time.Now().UnixMilli(),
+		Version:   pe.deltaLog.GetLatestVersion() + 1,
+	}
+
+	// Serialize delta file
+	schema, err := pe.GetTableSchema(db, table)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get table schema: %w", err)
+	}
+
+	record := pe.serializeDeltaFile(deltaFile, schema)
+	defer record.Release()
+
+	// Write delta file
+	fileName := fmt.Sprintf("delta-update-%d-%s.parquet", time.Now().UnixNano(), uuid.New().String()[:8])
+	deltaPath := filepath.Join(pe.basePath, db, table, "deltas", fileName)
+
+	stats, err := parquet.WriteArrowBatch(deltaPath, record)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to write delta file: %w", err)
+	}
+
+	// KEY: Create ParquetFile info but DON'T commit to Delta Log
+	parquetFile := &delta.ParquetFile{
+		Path:      deltaPath,
+		Size:      stats.FileSize,
+		RowCount:  stats.RowCount,
+		Stats:     stats,
+		IsDelta:   true,
+		DeltaType: "update",
+	}
+
+	logger.Info("Delta file written (not committed to Delta Log)",
+		zap.String("table", tableID),
+		zap.String("file", deltaPath),
+		zap.Int64("estimated_affected_rows", affectedRows))
+
+	return parquetFile, affectedRows, nil
 }
 
 // matchesFilters checks if a row matches all filters

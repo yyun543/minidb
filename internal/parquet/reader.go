@@ -8,7 +8,9 @@ import (
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
 	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow/go/v18/parquet"
 	"github.com/apache/arrow/go/v18/parquet/file"
+	"github.com/apache/arrow/go/v18/parquet/metadata"
 	"github.com/apache/arrow/go/v18/parquet/pqarrow"
 	"github.com/yyun543/minidb/internal/logger"
 	"go.uber.org/zap"
@@ -22,7 +24,16 @@ type Filter struct {
 	Values   []interface{} // IN 操作符使用多个值
 }
 
+// RowGroupStats Row Group 统计信息
+type RowGroupStats struct {
+	RowGroupIndex int
+	NumRows       int64
+	MinValues     map[string]interface{}
+	MaxValues     map[string]interface{}
+}
+
 // ReadParquetFile 读取 Parquet 文件并返回 Arrow Record (使用 Arrow 原生 reader)
+// P1.4: 增强为支持 Row Group 级别的数据跳过 (Data Skipping)
 func ReadParquetFile(path string, filters []Filter) (arrow.Record, error) {
 	logger.Info("Reading Parquet file",
 		zap.String("path", path),
@@ -42,26 +53,178 @@ func ReadParquetFile(path string, filters []Filter) (arrow.Record, error) {
 	}
 	defer reader.Close()
 
-	// 创建 Arrow file reader
+	// 创建 Arrow file reader (需要在 Row Group 检查之前创建)
 	arrowReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create arrow file reader: %w", err)
 	}
 
-	// 读取整个表为 Arrow Table
-	ctx := context.Background()
-	table, err := arrowReader.ReadTable(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read table: %w", err)
-	}
-	defer table.Release()
+	// P1.4: Row Group 过滤 (基于 Min/Max 统计信息)
+	numRowGroups := reader.NumRowGroups()
+	var rowGroupsToRead []int
 
-	// 将 Table 转换为单个 Record
-	// Note: 这里简化处理，假设数据量不大
-	// 在生产环境中应该使用分批读取或 TableReader
-	if table.NumRows() == 0 {
-		// 返回空 Record
-		schema := table.Schema()
+	logger.Debug("Parquet file Row Group information",
+		zap.String("path", path),
+		zap.Int("num_row_groups", numRowGroups),
+		zap.Int("filter_count", len(filters)))
+
+	if len(filters) > 0 && numRowGroups > 0 {
+		// 检查每个 Row Group 的统计信息
+		for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
+			rgReader := reader.RowGroup(rgIdx)
+			stats := extractRowGroupStats(rgIdx, rgReader)
+
+			// 使用统计信息判断是否可以跳过此 Row Group
+			if !canSkipRowGroup(stats, filters) {
+				rowGroupsToRead = append(rowGroupsToRead, rgIdx)
+			} else {
+				logger.Debug("Skipping Row Group based on statistics",
+					zap.String("path", path),
+					zap.Int("row_group", rgIdx),
+					zap.Int64("rows", stats.NumRows))
+			}
+		}
+
+		// 如果所有 Row Group 都被跳过，返回空结果
+		if len(rowGroupsToRead) == 0 {
+			logger.Info("All Row Groups skipped by predicate pushdown",
+				zap.String("path", path),
+				zap.Int("total_row_groups", numRowGroups))
+
+			// 创建空 Record
+			arrowReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create arrow file reader: %w", err)
+			}
+			schema, err := arrowReader.Schema()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get schema: %w", err)
+			}
+
+			pool := memory.NewGoAllocator()
+			builder := array.NewRecordBuilder(pool, schema)
+			defer builder.Release()
+			return builder.NewRecord(), nil
+		}
+
+		logger.Info("Row Group filtering results",
+			zap.String("path", path),
+			zap.Int("total_row_groups", numRowGroups),
+			zap.Int("row_groups_to_read", len(rowGroupsToRead)),
+			zap.Int("row_groups_skipped", numRowGroups-len(rowGroupsToRead)))
+	} else if numRowGroups > 0 {
+		// 无过滤条件，读取所有 Row Groups
+		for i := 0; i < numRowGroups; i++ {
+			rowGroupsToRead = append(rowGroupsToRead, i)
+		}
+		logger.Debug("No filters, reading all Row Groups",
+			zap.String("path", path),
+			zap.Int("num_row_groups", numRowGroups))
+	} else {
+		// 文件没有 Row Groups，可能是空文件或者单个小文件
+		logger.Debug("No Row Groups found in file, returning empty result",
+			zap.String("path", path))
+
+		schema, err := arrowReader.Schema()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get schema: %w", err)
+		}
+		pool := memory.NewGoAllocator()
+		builder := array.NewRecordBuilder(pool, schema)
+		defer builder.Release()
+		return builder.NewRecord(), nil
+	}
+
+	// 如果没有 Row Groups 要读取，返回空结果
+	if len(rowGroupsToRead) == 0 {
+		logger.Info("No Row Groups selected after filtering",
+			zap.String("path", path))
+
+		schema, err := arrowReader.Schema()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get schema: %w", err)
+		}
+		pool := memory.NewGoAllocator()
+		builder := array.NewRecordBuilder(pool, schema)
+		defer builder.Release()
+		return builder.NewRecord(), nil
+	}
+
+	// P1.4: Row Group 过滤
+	// 如果启用了过滤且能跳过部分 Row Groups，使用 GetRecordReader
+	// 否则使用原始的 ReadTable 方法（更稳定）
+	ctx := context.Background()
+	var records []arrow.Record
+
+	useRowGroupFiltering := len(filters) > 0 && len(rowGroupsToRead) > 0 && len(rowGroupsToRead) < numRowGroups
+
+	if useRowGroupFiltering {
+		// 使用 Row Group 过滤
+		logger.Info("Using Row Group filtering",
+			zap.String("path", path),
+			zap.Int("total_row_groups", numRowGroups),
+			zap.Int("row_groups_to_read", len(rowGroupsToRead)),
+			zap.Int("row_groups_skipped", numRowGroups-len(rowGroupsToRead)))
+
+		rgReader, err := arrowReader.GetRecordReader(ctx, nil, rowGroupsToRead)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get record reader for row groups: %w", err)
+		}
+		defer rgReader.Release()
+
+		for rgReader.Next() {
+			rec := rgReader.Record()
+			rec.Retain()
+			records = append(records, rec)
+		}
+
+		if err := rgReader.Err(); err != nil {
+			for _, rec := range records {
+				rec.Release()
+			}
+			return nil, fmt.Errorf("failed to read row groups: %w", err)
+		}
+	} else {
+		// 使用原始的 ReadTable 方法（兼容性更好）
+		table, err := arrowReader.ReadTable(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read table: %w", err)
+		}
+		defer table.Release()
+
+		if table.NumRows() == 0 {
+			// 返回空 Record
+			schema := table.Schema()
+			pool := memory.NewGoAllocator()
+			builder := array.NewRecordBuilder(pool, schema)
+			defer builder.Release()
+			return builder.NewRecord(), nil
+		}
+
+		// 使用 TableReader 来获取 Records
+		tr := array.NewTableReader(table, table.NumRows())
+		defer tr.Release()
+
+		for tr.Next() {
+			rec := tr.Record()
+			rec.Retain()
+			records = append(records, rec)
+		}
+
+		if err := tr.Err(); err != nil {
+			for _, rec := range records {
+				rec.Release()
+			}
+			return nil, fmt.Errorf("failed to read records from table: %w", err)
+		}
+	}
+
+	// 如果没有读取到任何记录，返回空结果
+	if len(records) == 0 {
+		schema, err := arrowReader.Schema()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get schema: %w", err)
+		}
 		pool := memory.NewGoAllocator()
 		builder := array.NewRecordBuilder(pool, schema)
 		defer builder.Release()
@@ -74,70 +237,37 @@ func ReadParquetFile(path string, filters []Filter) (arrow.Record, error) {
 		return record, nil
 	}
 
-	// 将 Table 的所有 chunk 合并为一个 Record
-	// 这里使用 TableReader 来获取 Record
-	tr := array.NewTableReader(table, table.NumRows())
-	defer tr.Release()
-
-	var records []arrow.Record
-	for tr.Next() {
-		rec := tr.Record()
-		rec.Retain() // 保留引用
-		records = append(records, rec)
-	}
-
-	if err := tr.Err(); err != nil {
-		for _, rec := range records {
-			rec.Release()
-		}
-		return nil, fmt.Errorf("failed to read records from table: %w", err)
-	}
-
-	// 如果只有一个 record，应用过滤后返回
+	// 合并多个 Row Groups 的记录
+	var mergedRecord arrow.Record
 	if len(records) == 1 {
-		record := records[0]
-		logger.Info("Parquet file read",
+		mergedRecord = records[0]
+	} else {
+		logger.Info("Merging multiple Row Group records",
 			zap.String("path", path),
-			zap.Int64("rows", record.NumRows()))
+			zap.Int("record_count", len(records)))
 
-		// 应用过滤条件
-		if len(filters) > 0 {
-			filteredRecord, err := applyFilters(record, filters)
-			if err != nil {
-				record.Release()
-				return nil, fmt.Errorf("failed to apply filters: %w", err)
+		mergedRecord, err = mergeRecords(records)
+		if err != nil {
+			for _, rec := range records {
+				rec.Release()
 			}
-			record.Release()
-			return filteredRecord, nil
+			return nil, fmt.Errorf("failed to merge records: %w", err)
 		}
 
-		return record, nil
-	}
-
-	// 合并多个 records 为一个 record
-	logger.Info("Merging multiple records",
-		zap.String("path", path),
-		zap.Int("record_count", len(records)))
-
-	mergedRecord, err := mergeRecords(records)
-	if err != nil {
+		// 释放原始 records
 		for _, rec := range records {
 			rec.Release()
 		}
-		return nil, fmt.Errorf("failed to merge records: %w", err)
 	}
 
-	// 释放原始 records
-	for _, rec := range records {
-		rec.Release()
-	}
-
-	logger.Info("Parquet file read (merged)",
+	logger.Info("Parquet file read with Row Group filtering",
 		zap.String("path", path),
 		zap.Int64("rows", mergedRecord.NumRows()),
-		zap.Int("merged_from", len(records)))
+		zap.Int("row_groups_read", len(rowGroupsToRead)),
+		zap.Int("row_groups_skipped", numRowGroups-len(rowGroupsToRead)))
 
-	// 应用过滤条件 (predicate pushdown)
+	// P1.4: Row Group filtering 已经大幅减少了数据读取
+	// 但仍需要应用 record 级别的过滤以处理 Row Group 内的不匹配行
 	if len(filters) > 0 {
 		filteredRecord, err := applyFilters(mergedRecord, filters)
 		if err != nil {
@@ -149,6 +279,313 @@ func ReadParquetFile(path string, filters []Filter) (arrow.Record, error) {
 	}
 
 	return mergedRecord, nil
+}
+
+// extractRowGroupStats 从 Row Group 元数据中提取统计信息
+func extractRowGroupStats(rgIdx int, rgReader *file.RowGroupReader) *RowGroupStats {
+	stats := &RowGroupStats{
+		RowGroupIndex: rgIdx,
+		NumRows:       rgReader.NumRows(),
+		MinValues:     make(map[string]interface{}),
+		MaxValues:     make(map[string]interface{}),
+	}
+
+	// 获取 Row Group 元数据
+	rgMeta := rgReader.MetaData()
+	if rgMeta == nil {
+		return stats
+	}
+
+	// 遍历所有列，提取 Min/Max 统计信息
+	for colIdx := 0; colIdx < rgMeta.NumColumns(); colIdx++ {
+		colChunkMeta, err := rgMeta.ColumnChunk(colIdx)
+		if err != nil {
+			continue
+		}
+
+		// 检查是否有统计信息
+		statsSet, err := colChunkMeta.StatsSet()
+		if err != nil || !statsSet {
+			continue
+		}
+
+		colStats, err := colChunkMeta.Statistics()
+		if err != nil {
+			continue
+		}
+
+		// 获取列路径（列名）
+		colPath := colChunkMeta.PathInSchema()
+		colName := colPath.String()
+
+		// 根据列类型提取 Min/Max
+		switch colChunkMeta.Type() {
+		case parquet.Types.Int64:
+			if typedStats, ok := colStats.(*metadata.Int64Statistics); ok && typedStats.HasMinMax() {
+				stats.MinValues[colName] = typedStats.Min()
+				stats.MaxValues[colName] = typedStats.Max()
+			}
+		case parquet.Types.Int32:
+			if typedStats, ok := colStats.(*metadata.Int32Statistics); ok && typedStats.HasMinMax() {
+				stats.MinValues[colName] = typedStats.Min()
+				stats.MaxValues[colName] = typedStats.Max()
+			}
+		case parquet.Types.Float:
+			if typedStats, ok := colStats.(*metadata.Float32Statistics); ok && typedStats.HasMinMax() {
+				stats.MinValues[colName] = typedStats.Min()
+				stats.MaxValues[colName] = typedStats.Max()
+			}
+		case parquet.Types.Double:
+			if typedStats, ok := colStats.(*metadata.Float64Statistics); ok && typedStats.HasMinMax() {
+				stats.MinValues[colName] = typedStats.Min()
+				stats.MaxValues[colName] = typedStats.Max()
+			}
+		case parquet.Types.ByteArray:
+			if typedStats, ok := colStats.(*metadata.ByteArrayStatistics); ok && typedStats.HasMinMax() {
+				// 字符串类型
+				stats.MinValues[colName] = string(typedStats.Min().Bytes())
+				stats.MaxValues[colName] = string(typedStats.Max().Bytes())
+			}
+		}
+	}
+
+	return stats
+}
+
+// canSkipRowGroup 判断是否可以跳过某个 Row Group
+// 返回 true 表示可以跳过（Row Group 不包含任何匹配数据）
+// 返回 false 表示不能跳过（Row Group 可能包含匹配数据）
+func canSkipRowGroup(stats *RowGroupStats, filters []Filter) bool {
+	for _, filter := range filters {
+		// 如果该列没有统计信息，保守起见不跳过
+		minVal, hasMin := stats.MinValues[filter.Column]
+		maxVal, hasMax := stats.MaxValues[filter.Column]
+
+		if !hasMin || !hasMax {
+			return false
+		}
+
+		// 根据操作符判断是否可以跳过
+		switch filter.Operator {
+		case "=", "==":
+			// 等值查询：如果 value 不在 [min, max] 范围内，可以跳过
+			if canSkipEquality(minVal, maxVal, filter.Value) {
+				return true
+			}
+
+		case ">":
+			// 大于查询：如果 max <= value，可以跳过
+			if canSkipGreaterThan(maxVal, filter.Value) {
+				return true
+			}
+
+		case ">=":
+			// 大于等于查询：如果 max < value，可以跳过
+			if canSkipGreaterThanOrEqual(maxVal, filter.Value) {
+				return true
+			}
+
+		case "<":
+			// 小于查询：如果 min >= value，可以跳过
+			if canSkipLessThan(minVal, filter.Value) {
+				return true
+			}
+
+		case "<=":
+			// 小于等于查询：如果 min > value，可以跳过
+			if canSkipLessThanOrEqual(minVal, filter.Value) {
+				return true
+			}
+
+		case "!=", "<>":
+			// 不等于查询：如果 min == max == value，可以跳过
+			if canSkipNotEqual(minVal, maxVal, filter.Value) {
+				return true
+			}
+
+		case "IN":
+			// IN 查询：如果所有 values 都不在 [min, max] 范围内，可以跳过
+			if canSkipIN(minVal, maxVal, filter.Values) {
+				return true
+			}
+		}
+	}
+
+	// 没有找到可以跳过的理由，不跳过
+	return false
+}
+
+// 辅助函数：比较函数
+
+func canSkipEquality(min, max, value interface{}) bool {
+	switch min := min.(type) {
+	case int64:
+		maxInt := max.(int64)
+		valInt := convertToInt64(value)
+		return valInt < min || valInt > maxInt
+
+	case int32:
+		maxInt := max.(int32)
+		valInt := int32(convertToInt64(value))
+		return valInt < min || valInt > maxInt
+
+	case float64:
+		maxFloat := max.(float64)
+		valFloat := convertToFloat64(value)
+		return valFloat < min || valFloat > maxFloat
+
+	case float32:
+		maxFloat := max.(float32)
+		valFloat := float32(convertToFloat64(value))
+		return valFloat < min || valFloat > maxFloat
+
+	case string:
+		maxStr := max.(string)
+		valStr := value.(string)
+		return valStr < min || valStr > maxStr
+	}
+	return false
+}
+
+func canSkipGreaterThan(max, value interface{}) bool {
+	switch max := max.(type) {
+	case int64:
+		return max <= convertToInt64(value)
+	case int32:
+		return max <= int32(convertToInt64(value))
+	case float64:
+		return max <= convertToFloat64(value)
+	case float32:
+		return max <= float32(convertToFloat64(value))
+	case string:
+		return max <= value.(string)
+	}
+	return false
+}
+
+func canSkipGreaterThanOrEqual(max, value interface{}) bool {
+	switch max := max.(type) {
+	case int64:
+		return max < convertToInt64(value)
+	case int32:
+		return max < int32(convertToInt64(value))
+	case float64:
+		return max < convertToFloat64(value)
+	case float32:
+		return max < float32(convertToFloat64(value))
+	case string:
+		return max < value.(string)
+	}
+	return false
+}
+
+func canSkipLessThan(min, value interface{}) bool {
+	switch min := min.(type) {
+	case int64:
+		return min >= convertToInt64(value)
+	case int32:
+		return min >= int32(convertToInt64(value))
+	case float64:
+		return min >= convertToFloat64(value)
+	case float32:
+		return min >= float32(convertToFloat64(value))
+	case string:
+		return min >= value.(string)
+	}
+	return false
+}
+
+func canSkipLessThanOrEqual(min, value interface{}) bool {
+	switch min := min.(type) {
+	case int64:
+		return min > convertToInt64(value)
+	case int32:
+		return min > int32(convertToInt64(value))
+	case float64:
+		return min > convertToFloat64(value)
+	case float32:
+		return min > float32(convertToFloat64(value))
+	case string:
+		return min > value.(string)
+	}
+	return false
+}
+
+func canSkipNotEqual(min, max, value interface{}) bool {
+	// 只有当 min == max == value 时才能跳过
+	switch min := min.(type) {
+	case int64:
+		maxInt := max.(int64)
+		valInt := convertToInt64(value)
+		return min == maxInt && min == valInt
+
+	case int32:
+		maxInt := max.(int32)
+		valInt := int32(convertToInt64(value))
+		return min == maxInt && min == valInt
+
+	case float64:
+		maxFloat := max.(float64)
+		valFloat := convertToFloat64(value)
+		return min == maxFloat && min == valFloat
+
+	case float32:
+		maxFloat := max.(float32)
+		valFloat := float32(convertToFloat64(value))
+		return min == maxFloat && min == valFloat
+
+	case string:
+		maxStr := max.(string)
+		valStr := value.(string)
+		return min == maxStr && min == valStr
+	}
+	return false
+}
+
+func canSkipIN(min, max interface{}, values []interface{}) bool {
+	// 如果所有 IN 值都不在 [min, max] 范围内，可以跳过
+	for _, value := range values {
+		if !canSkipEquality(min, max, value) {
+			// 至少有一个值在范围内，不能跳过
+			return false
+		}
+	}
+	// 所有值都不在范围内，可以跳过
+	return true
+}
+
+func convertToInt64(value interface{}) int64 {
+	switch v := value.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case float32:
+		return int64(v)
+	default:
+		return 0
+	}
+}
+
+func convertToFloat64(value interface{}) float64 {
+	switch v := value.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int32:
+		return float64(v)
+	default:
+		return 0.0
+	}
 }
 
 // mergeRecords 合并多个 Arrow Records 为一个 Record

@@ -189,24 +189,37 @@ func (op *Join) getColumnValue(record arrow.Record, rowIdx int64, expr optimizer
 			matches := false
 
 			// 情况1: 字段名直接匹配列名 (如 "id" == "id")
+			// 这是最常见的情况，特别是当使用表别名时 (如 u.id，字段名只是"id")
 			if field.Name == colRef.Column {
 				matches = true
 			}
 
 			// 情况2: 字段名匹配"表.列"格式 (如 "users.id" == "users" + "id")
-			if colRef.Table != "" {
+			// 注意：这里colRef.Table可能是别名(如"u")或实际表名(如"users")
+			if !matches && colRef.Table != "" {
 				expectedName := colRef.Table + "." + colRef.Column
 				if field.Name == expectedName {
 					matches = true
 				}
 			}
 
-			// 情况3: 字段名包含表前缀，但colRef只有列名 (如 "users.id" contains "id")
-			// 这种情况不应该匹配，因为可能有歧义
-
-			// 情况4: 字段名是"列"，colRef是"表.列" - 也应该匹配（用于子查询）
-			// 例如：subquery输出"user_id"，JOIN条件引用"sub.user_id"
-			// 这种情况已经被情况1覆盖了
+			// 情况3: 字段名是"表.列"格式，但colRef只有列名
+			// 例如：字段名是"users.id"，colRef.Column是"id"
+			// 这种情况需要额外检查，以支持带前缀的字段名
+			if !matches && colRef.Table == "" {
+				// 如果字段名包含点，提取列名部分进行匹配
+				if dotIdx := len(field.Name) - 1; dotIdx > 0 {
+					for ; dotIdx >= 0; dotIdx-- {
+						if field.Name[dotIdx] == '.' {
+							columnPart := field.Name[dotIdx+1:]
+							if columnPart == colRef.Column {
+								matches = true
+							}
+							break
+						}
+					}
+				}
+			}
 
 			if matches {
 				column := record.Column(i)
@@ -216,6 +229,11 @@ func (op *Join) getColumnValue(record arrow.Record, rowIdx int64, expr optimizer
 						return nil
 					}
 					return col.Value(int(rowIdx))
+				case *array.Int32:
+					if col.IsNull(int(rowIdx)) {
+						return nil
+					}
+					return int64(col.Value(int(rowIdx)))
 				case *array.String:
 					if col.IsNull(int(rowIdx)) {
 						return nil
@@ -226,6 +244,11 @@ func (op *Join) getColumnValue(record arrow.Record, rowIdx int64, expr optimizer
 						return nil
 					}
 					return col.Value(int(rowIdx))
+				case *array.Float32:
+					if col.IsNull(int(rowIdx)) {
+						return nil
+					}
+					return float64(col.Value(int(rowIdx)))
 				case *array.Boolean:
 					if col.IsNull(int(rowIdx)) {
 						return nil

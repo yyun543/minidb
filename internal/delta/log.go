@@ -131,11 +131,15 @@ func (dl *DeltaLog) AppendAdd(tableID string, file *ParquetFile) error {
 
 	// 检查是否需要创建 Checkpoint (每10个事务)
 	if version%10 == 0 {
-		if dl.checkpointCallback != nil {
-			go dl.checkpointCallback(tableID, version)
-		} else {
-			go dl.createCheckpoint(tableID, version)
-		}
+		// 异步创建checkpoint，不阻塞写入
+		go func() {
+			if err := dl.createCheckpoint(tableID, version); err != nil {
+				logger.Error("Failed to create checkpoint",
+					zap.String("table", tableID),
+					zap.Int64("version", version),
+					zap.Error(err))
+			}
+		}()
 	}
 
 	return nil
@@ -459,7 +463,7 @@ func (dl *DeltaLog) GetVersionByTimestamp(tableID string, ts int64) (int64, erro
 // 根据架构文档 (lines 662-698, 741-777):
 // 每10个事务创建checkpoint，将snapshot序列化为Parquet文件
 // 实现 P0 优先级改进 - 完整的Checkpoint机制
-func (dl *DeltaLog) createCheckpoint(tableID string, version int64) {
+func (dl *DeltaLog) createCheckpoint(tableID string, version int64) error {
 	logger.Info("Creating checkpoint",
 		zap.String("table", tableID),
 		zap.Int64("version", version))
@@ -471,23 +475,30 @@ func (dl *DeltaLog) createCheckpoint(tableID string, version int64) {
 			zap.String("table", tableID),
 			zap.Int64("version", version),
 			zap.Error(err))
-		return
+		return err
 	}
 
-	// 使用CheckpointManager创建checkpoint
-	// Note: 需要从外部注入basePath，这里暂时跳过实际写入
-	// 完整实现需要在DeltaLog结构体中添加CheckpointManager字段
+	// 调用checkpoint回调（由ParquetEngine提供）
+	if dl.checkpointCallback != nil {
+		if err := dl.checkpointCallback(tableID, version); err != nil {
+			logger.Error("Failed to persist checkpoint",
+				zap.String("table", tableID),
+				zap.Int64("version", version),
+				zap.Error(err))
+			return err
+		}
+	} else {
+		logger.Warn("Checkpoint callback not set, skipping checkpoint creation",
+			zap.String("table", tableID),
+			zap.Int64("version", version))
+	}
 
-	logger.Info("Checkpoint created",
+	logger.Info("Checkpoint created successfully",
 		zap.String("table", tableID),
 		zap.Int64("version", version),
 		zap.Int("file_count", len(snapshot.Files)))
 
-	// TODO: 集成CheckpointManager
-	// checkpointMgr := NewCheckpointManager(basePath)
-	// if err := checkpointMgr.CreateCheckpoint(tableID, snapshot); err != nil {
-	//     logger.Error("Failed to persist checkpoint", zap.Error(err))
-	// }
+	return nil
 }
 
 // ListTables 列出所有表

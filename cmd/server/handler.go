@@ -7,14 +7,40 @@ import (
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/yyun543/minidb/internal/cache"
 	"github.com/yyun543/minidb/internal/catalog"
+	"github.com/yyun543/minidb/internal/config"
 	"github.com/yyun543/minidb/internal/executor"
+	"github.com/yyun543/minidb/internal/logger"
 	"github.com/yyun543/minidb/internal/optimizer"
 	"github.com/yyun543/minidb/internal/parser"
 	"github.com/yyun543/minidb/internal/session"
 	"github.com/yyun543/minidb/internal/statistics"
 	"github.com/yyun543/minidb/internal/storage"
+	"go.uber.org/zap"
 )
+
+// catalogAdapter 适配catalog到optimizer的CatalogInterface
+// 解决类型不匹配问题: catalog.TableMeta vs optimizer.TableMeta
+type catalogAdapter struct {
+	cat *catalog.Catalog
+}
+
+// GetTable 实现optimizer.CatalogInterface接口
+func (a *catalogAdapter) GetTable(database, table string) (optimizer.TableMeta, error) {
+	// 调用catalog的GetTable
+	catMeta, err := a.cat.GetTable(database, table)
+	if err != nil {
+		return optimizer.TableMeta{}, err
+	}
+
+	// 转换类型
+	return optimizer.TableMeta{
+		Database: catMeta.Database,
+		Table:    catMeta.Table,
+		Schema:   catMeta.Schema,
+	}, nil
+}
 
 // CatalogSQLAdapter 为catalog提供SQL执行能力的适配器
 // 这个适配器直接操作系统表存储，避免循环依赖
@@ -97,6 +123,7 @@ type QueryHandler struct {
 	sessionManager         *session.SessionManager
 	statisticsManager      *statistics.StatisticsManager
 	storageEngine          storage.StorageEngine // v2.0: Using new StorageEngine interface
+	queryCache             *cache.QueryCache     // P1.1: Query result cache
 	useVectorizedExecution bool
 }
 
@@ -140,7 +167,11 @@ func NewQueryHandler() (*QueryHandler, error) {
 		return nil, fmt.Errorf("Failed to initialize catalog: %v", err)
 	}
 
-	// 9. 创建QueryHandler
+	// 9. 创建查询缓存 (P1.1)
+	queryCacheConfig := cache.DefaultCacheConfig()
+	queryCache := cache.NewQueryCache(queryCacheConfig)
+
+	// 10. 创建QueryHandler
 	handler := &QueryHandler{
 		catalog:                cat,
 		executor:               exec,
@@ -148,10 +179,90 @@ func NewQueryHandler() (*QueryHandler, error) {
 		sessionManager:         sessMgr,
 		statisticsManager:      statsMgr,
 		storageEngine:          storageEngine,
-		useVectorizedExecution: true, // 默认启用向量化执行
+		queryCache:             queryCache, // P1.1: Initialize query cache
+		useVectorizedExecution: true,       // 默认启用向量化执行
 	}
 
-	// 10. 启动后台服务
+	// 11. 启动后台服务
+	go handler.startBackgroundServices()
+
+	return handler, nil
+}
+
+// NewQueryHandlerWithConfig 创建带配置的查询处理器 (P1.3)
+func NewQueryHandlerWithConfig(cfg *config.Config) (*QueryHandler, error) {
+	// 1. 创建 Parquet 存储引擎 (使用配置的路径)
+	storageEngine, err := storage.NewParquetEngine(cfg.Storage.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create Parquet storage engine: %v", err)
+	}
+	if err := storageEngine.Open(); err != nil {
+		return nil, fmt.Errorf("Failed to open Parquet storage engine: %v", err)
+	}
+
+	// 2. 创建会话管理器
+	sessMgr, err := session.NewSessionManager()
+	if err != nil {
+		return nil, fmt.Errorf("Failure to create session manager: %v", err)
+	}
+
+	// 3. 创建 catalog
+	cat := catalog.NewCatalog()
+	cat.SetStorageEngine(storageEngine)
+
+	// 4. 创建统计信息管理器
+	statsMgr := statistics.NewStatisticsManager()
+
+	// 5. 创建共享的数据管理器
+	dataManager := executor.NewDataManager(cat)
+
+	// 6. 创建执行器（常规和向量化）
+	exec := executor.NewExecutorWithDataManager(cat, dataManager)
+	vectorizedExec := executor.NewVectorizedExecutorWithDataManager(cat, dataManager, statsMgr)
+
+	// 7. 创建catalog的SQL执行器适配器
+	sqlAdapter := NewCatalogSQLAdapter(cat, exec, vectorizedExec)
+	cat.SetSQLRunner(sqlAdapter)
+
+	// 8. 初始化catalog
+	if err := cat.Init(); err != nil {
+		return nil, fmt.Errorf("Failed to initialize catalog: %v", err)
+	}
+
+	// 9. 创建查询缓存 (P1.1) - 使用配置
+	var queryCache *cache.QueryCache
+	if cfg.QueryCache.Enabled {
+		queryCacheConfig := &cache.CacheConfig{
+			MaxSizeMB:        int64(cfg.QueryCache.MaxSizeMB),
+			TTL:              cfg.QueryCache.GetTTL(),
+			MinComputeTimeMs: int64(cfg.QueryCache.MinComputeTimeMS),
+		}
+		queryCache = cache.NewQueryCache(queryCacheConfig)
+		logger.WithComponent("handler").Info("Query cache enabled from config",
+			zap.Int("max_size_mb", cfg.QueryCache.MaxSizeMB),
+			zap.Duration("ttl", queryCacheConfig.TTL))
+	} else {
+		logger.WithComponent("handler").Info("Query cache disabled by config")
+	}
+
+	// 10. 创建QueryHandler
+	handler := &QueryHandler{
+		catalog:                cat,
+		executor:               exec,
+		vectorizedExecutor:     vectorizedExec,
+		sessionManager:         sessMgr,
+		statisticsManager:      statsMgr,
+		storageEngine:          storageEngine,
+		queryCache:             queryCache,
+		useVectorizedExecution: cfg.Vectorization.Enabled,
+	}
+
+	logger.WithComponent("handler").Info("QueryHandler created with configuration",
+		zap.String("storage_dir", cfg.Storage.DataDir),
+		zap.Bool("vectorization", cfg.Vectorization.Enabled),
+		zap.Bool("cache_enabled", cfg.QueryCache.Enabled))
+
+	// 11. 启动后台服务
 	go handler.startBackgroundServices()
 
 	return handler, nil
@@ -225,6 +336,9 @@ func (h *QueryHandler) HandleQuery(sessionID int64, sql string) (string, error) 
 
 	// 3. 优化查询
 	opt := optimizer.NewOptimizer()
+	// P0.2: 设置catalog和当前数据库,使SELECT *展开优化生效
+	opt.SetCatalog(&catalogAdapter{cat: h.catalog})
+	opt.SetCurrentDatabase(sess.CurrentDB)
 	plan, err := opt.Optimize(ast)
 	if err != nil {
 		return "", fmt.Errorf("optimization error: %v", err)
@@ -235,19 +349,53 @@ func (h *QueryHandler) HandleQuery(sessionID int64, sql string) (string, error) 
 		return "", fmt.Errorf("optimizer returned nil plan")
 	}
 
+	// P1.1: Check if this is a cacheable SELECT query
+	isCacheable := h.isCacheableQuery(plan, ast)
+	var cacheKey cache.CacheKey
+	if isCacheable {
+		// Build cache key
+		currentDB := sess.CurrentDB
+		if currentDB == "" {
+			currentDB = "default"
+		}
+		cacheKey = cache.CacheKey{
+			SQL:          sql,
+			Database:     currentDB,
+			TableVersion: 1, // TODO: Get actual table version from Delta Log
+		}
+
+		// Check cache
+		if cached, found := h.queryCache.Get(cacheKey); found {
+			// Cache hit! Return cached result
+			return h.formatExecutionResult(cached), nil
+		}
+	}
+
 	// 4. 执行查询（选择向量化或常规执行器）
+	startTime := time.Now()
 	var result interface{}
 	if h.useVectorizedExecution && h.isVectorizableQuery(plan) {
 		// 使用向量化执行器
 		vectorizedResult, err := h.vectorizedExecutor.Execute(plan, sess)
 		if err != nil {
-			// 为BETWEEN操作提供更好的错误信息
-			if strings.Contains(err.Error(), "unsupported predicate type") {
-				return "", fmt.Errorf("BETWEEN operator is not yet supported. Please use equivalent conditions like: column >= value1 AND column <= value2")
+			// 检查是否需要回退到常规执行器
+			if strings.Contains(err.Error(), "fallback to regular executor") ||
+				strings.Contains(err.Error(), "not supported in vectorized execution") ||
+				strings.Contains(err.Error(), "unsupported predicate type") {
+				// 自动回退到常规执行器
+				logger.WithComponent("handler").Debug("Falling back to regular executor",
+					zap.String("reason", err.Error()))
+				regularResult, err := h.executor.Execute(plan, sess)
+				if err != nil {
+					return "", fmt.Errorf("execution error: %v", err)
+				}
+				result = regularResult
+			} else {
+				return "", fmt.Errorf("vectorized execution error: %v", err)
 			}
-			return "", fmt.Errorf("vectorized execution error: %v", err)
+		} else {
+			result = vectorizedResult
 		}
-		result = vectorizedResult
 	} else {
 		// 使用常规执行器
 		regularResult, err := h.executor.Execute(plan, sess)
@@ -256,6 +404,17 @@ func (h *QueryHandler) HandleQuery(sessionID int64, sql string) (string, error) 
 		}
 		result = regularResult
 	}
+	computeTime := time.Since(startTime)
+
+	// P1.1: Cache the result if this is a cacheable query
+	if isCacheable {
+		if resultSet, ok := result.(*executor.ResultSet); ok {
+			h.queryCache.Put(cacheKey, resultSet, computeTime)
+		}
+	}
+
+	// P1.1: Invalidate cache for DML operations
+	h.invalidateCacheForDML(plan, sess)
 
 	// 5. 格式化结果
 	return h.formatExecutionResult(result), nil
@@ -377,6 +536,75 @@ func (h *QueryHandler) isVectorizableQuery(plan *optimizer.Plan) bool {
 	return h.checkPlanVectorizable(plan)
 }
 
+// isCacheableQuery determines if a query result should be cached (P1.1)
+// Only SELECT queries are cacheable; DML operations should invalidate cache
+func (h *QueryHandler) isCacheableQuery(plan *optimizer.Plan, ast interface{}) bool {
+	if plan == nil {
+		return false
+	}
+
+	// Only cache SELECT queries (read-only)
+	switch plan.Type {
+	case optimizer.SelectPlan, optimizer.TableScanPlan, optimizer.FilterPlan,
+		optimizer.ProjectionPlan, optimizer.GroupPlan, optimizer.OrderPlan,
+		optimizer.JoinPlan, optimizer.LimitPlan, optimizer.HavingPlan:
+		// These are read-only query operations - cacheable
+		return true
+	case optimizer.InsertPlan, optimizer.UpdatePlan, optimizer.DeletePlan,
+		optimizer.CreateTablePlan, optimizer.CreateDatabasePlan,
+		optimizer.DropTablePlan, optimizer.DropDatabasePlan:
+		// DML/DDL operations - not cacheable
+		return false
+	case optimizer.ShowPlan:
+		// System queries - not cacheable (metadata may change)
+		return false
+	default:
+		// Unknown plan types - don't cache to be safe
+		return false
+	}
+}
+
+// invalidateCacheForDML invalidates cache entries when tables are modified (P1.1)
+func (h *QueryHandler) invalidateCacheForDML(plan *optimizer.Plan, sess *session.Session) {
+	if plan == nil {
+		return
+	}
+
+	currentDB := sess.CurrentDB
+	if currentDB == "" {
+		currentDB = "default"
+	}
+
+	// Check if this is a DML or DDL operation that modifies tables
+	switch plan.Type {
+	case optimizer.InsertPlan:
+		props, ok := plan.Properties.(*optimizer.InsertProperties)
+		if ok && props.Table != "" {
+			h.queryCache.InvalidateTable(currentDB, props.Table)
+		}
+	case optimizer.UpdatePlan:
+		props, ok := plan.Properties.(*optimizer.UpdateProperties)
+		if ok && props.Table != "" {
+			h.queryCache.InvalidateTable(currentDB, props.Table)
+		}
+	case optimizer.DeletePlan:
+		props, ok := plan.Properties.(*optimizer.DeleteProperties)
+		if ok && props.Table != "" {
+			h.queryCache.InvalidateTable(currentDB, props.Table)
+		}
+	case optimizer.DropTablePlan:
+		props, ok := plan.Properties.(*optimizer.DropTableProperties)
+		if ok && props.Table != "" {
+			h.queryCache.InvalidateTable(currentDB, props.Table)
+		}
+	case optimizer.CreateTablePlan:
+		// New table creation - no need to invalidate (no cached queries yet)
+	case optimizer.DropDatabasePlan, optimizer.CreateDatabasePlan:
+		// Database-level operations - clear entire cache to be safe
+		h.queryCache.Clear()
+	}
+}
+
 // checkPlanVectorizable 递归检查计划节点是否支持向量化
 func (h *QueryHandler) checkPlanVectorizable(plan *optimizer.Plan) bool {
 	// 检查plan是否为nil
@@ -390,7 +618,12 @@ func (h *QueryHandler) checkPlanVectorizable(plan *optimizer.Plan) bool {
 		optimizer.DropTablePlan, optimizer.DropDatabasePlan,
 		optimizer.ShowPlan:
 		return false
-	case optimizer.JoinPlan, optimizer.GroupPlan, optimizer.OrderPlan,
+	case optimizer.JoinPlan:
+		// JOIN operations work fine with regular executor
+		// Recursively check if children are vectorizable
+		// For now, use regular executor for JOINs
+		return false
+	case optimizer.GroupPlan, optimizer.OrderPlan,
 		optimizer.HavingPlan, optimizer.LimitPlan:
 		// 复杂操作暂时不支持向量化，回退到常规执行器
 		return false
@@ -400,7 +633,7 @@ func (h *QueryHandler) checkPlanVectorizable(plan *optimizer.Plan) bool {
 		if !h.checkExpressionVectorizable(props.Condition) {
 			return false
 		}
-	case optimizer.SelectPlan, optimizer.TableScanPlan:
+	case optimizer.SelectPlan, optimizer.TableScanPlan, optimizer.ProjectionPlan:
 		// 基本操作支持向量化
 		break
 	case optimizer.InsertPlan, optimizer.UpdatePlan, optimizer.DeletePlan:
@@ -622,21 +855,37 @@ func (h *QueryHandler) formatVectorizedResult(result *executor.VectorizedResultS
 
 // getColumnValue 从 Arrow 列中获取指定行的值
 func (h *QueryHandler) getColumnValue(column arrow.Array, rowIdx int) interface{} {
+	logger.WithComponent("handler").Info("getColumnValue called",
+		zap.String("column_type", fmt.Sprintf("%T", column)),
+		zap.Int("rowIdx", rowIdx),
+		zap.Bool("is_null", column.IsNull(rowIdx)))
+
 	if column.IsNull(rowIdx) {
+		logger.WithComponent("handler").Info("getColumnValue: returning NULL")
 		return "NULL"
 	}
 
 	switch col := column.(type) {
 	case *array.Int64:
-		return col.Value(rowIdx)
+		value := col.Value(rowIdx)
+		logger.WithComponent("handler").Info("getColumnValue: Int64", zap.Int64("value", value))
+		return value
 	case *array.Int32:
-		return col.Value(rowIdx)
+		value := col.Value(rowIdx)
+		logger.WithComponent("handler").Info("getColumnValue: Int32", zap.Int32("value", value))
+		return value
 	case *array.Float64:
-		return col.Value(rowIdx)
+		value := col.Value(rowIdx)
+		logger.WithComponent("handler").Info("getColumnValue: Float64", zap.Float64("value", value))
+		return value
 	case *array.Float32:
-		return col.Value(rowIdx)
+		value := col.Value(rowIdx)
+		logger.WithComponent("handler").Info("getColumnValue: Float32", zap.Float32("value", value))
+		return value
 	case *array.String:
-		return col.Value(rowIdx)
+		value := col.Value(rowIdx)
+		logger.WithComponent("handler").Info("getColumnValue: String", zap.String("value", value))
+		return value
 	case *array.Boolean:
 		return col.Value(rowIdx)
 	default:

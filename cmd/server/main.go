@@ -10,14 +10,16 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/yyun543/minidb/internal/config"
 	"github.com/yyun543/minidb/internal/logger"
 	"go.uber.org/zap"
 )
 
 var (
-	host = flag.String("host", "localhost", "Host to bind to")
-	port = flag.String("port", "7205", "Port to bind to")
-	help = flag.Bool("h", false, "Show help")
+	host       = flag.String("host", "", "Host to bind to (overrides config file)")
+	port       = flag.String("port", "", "Port to bind to (overrides config file)")
+	configFile = flag.String("config", "config.yaml", "Path to configuration file")
+	help       = flag.Bool("h", false, "Show help")
 )
 
 func main() {
@@ -28,23 +30,72 @@ func main() {
 		return
 	}
 
-	// 初始化日志系统
+	// P1.3: Load configuration
+	cfg, err := config.LoadGlobal(*configFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Command-line flags override config file
+	if *host != "" {
+		cfg.Server.Host = *host
+	}
+	if *port != "" {
+		// Convert string port to int
+		var portNum int
+		fmt.Sscanf(*port, "%d", &portNum)
+		if portNum > 0 {
+			cfg.Server.Port = portNum
+		}
+	}
+
+	// 初始化日志系统 - 优先使用config.yaml，环境变量可以覆盖
 	logConfig := logger.ConfigFromEnv()
+
+	// Apply config.yaml logging settings if present
+	if cfg != nil {
+		// Map config.yaml logging settings to logger config
+		logConfig.Level = logger.LogLevel(strings.ToLower(cfg.Logging.Level))
+		logConfig.LogDir = "logs" // config.yaml uses output field, we use LogDir
+
+		if cfg.Logging.Format == "json" {
+			// JSON format is default
+		}
+
+		if cfg.Logging.Rotation.Enabled {
+			logConfig.MaxSize = cfg.Logging.Rotation.MaxSizeMB
+			logConfig.MaxBackups = cfg.Logging.Rotation.MaxBackups
+			logConfig.MaxAge = cfg.Logging.Rotation.MaxAgeDays
+		}
+
+		// Enable console logging in development
+		if logConfig.Environment == logger.DevelopmentEnv {
+			logConfig.EnableConsole = true
+		}
+	}
+
 	if err := logger.InitLogger(logConfig); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)
 	}
 	defer logger.Sync()
 
-	// 创建全局查询处理器
-	handler, err := NewQueryHandler()
+	logger.Info("Configuration loaded successfully",
+		zap.String("config_file", *configFile),
+		zap.String("host", cfg.Server.Host),
+		zap.Int("port", cfg.Server.Port),
+		zap.String("log_level", string(logConfig.Level)))
+
+	// 创建全局查询处理器 (with configuration)
+	handler, err := NewQueryHandlerWithConfig(cfg)
 	if err != nil {
 		logger.Fatal("Failed to create query handler", zap.Error(err))
 	}
 	defer handler.Close()
 
 	// 启动TCP服务器
-	address := *host + ":" + *port
+	address := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		logger.Fatal("Unable to start server",

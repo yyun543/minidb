@@ -263,33 +263,28 @@ type MergeOnReadIterator struct {
 
 // NewMergeOnReadIterator creates a new merge-on-read iterator
 func NewMergeOnReadIterator(baseFiles, deltaFiles []delta.FileInfo, filters []Filter) (RecordIterator, error) {
-	// Find the MINIMUM delta timestamp - any file added after ANY delta should be immune
-	// Delta files should ONLY apply to files that existed BEFORE the delta was created
+	// Find the MAXIMUM delta timestamp - any file added after ALL deltas should be immune
+	// A base file should have deltas applied if there exists ANY delta created after it
 	// This ensures correct Merge-on-Read semantics
-	var minDeltaTimestamp int64 = int64(^uint64(0) >> 1) // Max int64
+	var maxDeltaTimestamp int64 = 0
 	hasDelta := false
 	for _, deltaFile := range deltaFiles {
 		hasDelta = true
-		if deltaFile.AddedAt < minDeltaTimestamp {
-			minDeltaTimestamp = deltaFile.AddedAt
+		if deltaFile.AddedAt > maxDeltaTimestamp {
+			maxDeltaTimestamp = deltaFile.AddedAt
 		}
-	}
-
-	// If no deltas, all files are "new" (no merging needed)
-	if !hasDelta {
-		minDeltaTimestamp = 0
 	}
 
 	// Separate base files into "old" (affected by deltas) and "new" (immune to all deltas)
 	var oldBaseFiles, newBaseFiles []delta.FileInfo
 	for _, baseFile := range baseFiles {
-		if hasDelta && baseFile.AddedAt >= minDeltaTimestamp {
-			// This file was added AT OR AFTER any delta file was created
-			// No deltas should apply to it - it contains fresh data
+		if hasDelta && baseFile.AddedAt >= maxDeltaTimestamp {
+			// This file was added AT OR AFTER ALL deltas were created
+			// No deltas should apply to it - it contains fresh data written after all updates
 			newBaseFiles = append(newBaseFiles, baseFile)
 		} else {
-			// This file was added BEFORE all deltas
-			// All deltas should be applied to it
+			// This file was added BEFORE at least one delta
+			// All relevant deltas should be applied to it during merge
 			oldBaseFiles = append(oldBaseFiles, baseFile)
 		}
 	}

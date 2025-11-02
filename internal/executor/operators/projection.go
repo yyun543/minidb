@@ -131,7 +131,12 @@ func (op *Projection) applyProjection(batch *types.Batch) (*types.Batch, error) 
 				}
 			}
 			if !found {
-				return nil, fmt.Errorf("column not found: %s", op.formatColumnName(projCol))
+				// Debug: print available fields
+				availableFields := make([]string, record.Schema().NumFields())
+				for i, f := range record.Schema().Fields() {
+					availableFields[i] = f.Name
+				}
+				return nil, fmt.Errorf("column not found: %s (available: %v)", op.formatColumnName(projCol), availableFields)
 			}
 		}
 	}

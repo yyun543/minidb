@@ -16,6 +16,7 @@ type Session struct {
 	CreatedAt    time.Time              // 创建时间
 	LastAccessAt time.Time              // 最后访问时间
 	Variables    map[string]interface{} // 会话变量
+	Transaction  *Transaction           // 当前活跃事务（nil表示无事务）
 }
 
 // SessionManager 会话管理器

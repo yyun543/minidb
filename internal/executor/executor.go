@@ -10,6 +10,7 @@ import (
 	"github.com/apache/arrow/go/v18/arrow/array"
 	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/catalog"
+	"github.com/yyun543/minidb/internal/delta"
 	"github.com/yyun543/minidb/internal/executor/operators"
 	"github.com/yyun543/minidb/internal/logger"
 	"github.com/yyun543/minidb/internal/optimizer"
@@ -299,6 +300,17 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 		if err != nil {
 			return nil, err
 		}
+
+		// Decide whether to use vectorized JOIN
+		useVectorized := e.shouldUseVectorizedJoin(props)
+		if useVectorized {
+			logger.WithComponent("executor").Info("Using vectorized JOIN",
+				zap.String("join_type", props.JoinType))
+			return operators.NewVectorizedJoin(props.JoinType, props.Condition, left, right, ctx), nil
+		}
+
+		logger.WithComponent("executor").Info("Using regular JOIN",
+			zap.String("join_type", props.JoinType))
 		return operators.NewJoin(props.JoinType, props.Condition, left, right, ctx), nil
 
 	case optimizer.ProjectionPlan:
@@ -348,10 +360,8 @@ func (e *ExecutorImpl) buildOperator(plan *optimizer.Plan, ctx *Context) (operat
 		if err != nil {
 			return nil, err
 		}
-		// For now, create a simple limit operator (can be implemented later)
-		// Return child for basic functionality
-		_ = props // avoid unused variable error
-		return child, nil
+		// Create Limit operator with offset=0 (OFFSET support can be added later if needed)
+		return operators.NewLimit(props.Limit, 0, child, ctx), nil
 
 	case optimizer.DropTablePlan:
 		// For DDL operations, create simple NoOp operator
@@ -616,6 +626,15 @@ func (e *ExecutorImpl) executeInsert(plan *optimizer.Plan, sess *session.Session
 		}
 	}
 
+	// 检查是否在事务中
+	inTransaction := sess.Transaction != nil && sess.Transaction.IsActive()
+
+	if inTransaction {
+		logger.WithComponent("executor").Info("INSERT in transaction - buffering operations",
+			zap.Int64("session_id", sess.ID),
+			zap.String("table", props.Table))
+	}
+
 	// 处理多行INSERT或单行INSERT
 	if len(props.Rows) > 0 {
 		// 多行INSERT - 逐行插入
@@ -624,13 +643,28 @@ func (e *ExecutorImpl) executeInsert(plan *optimizer.Plan, sess *session.Session
 			for i, expr := range row {
 				if lit, ok := expr.(*optimizer.LiteralValue); ok {
 					values[i] = lit.Value
+				} else {
+					logger.WithComponent("executor").Error("INSERT: expression is not LiteralValue",
+						zap.Int("index", i),
+						zap.String("type", fmt.Sprintf("%T", expr)))
 				}
 			}
+			logger.WithComponent("executor").Info("INSERT values",
+				zap.Int("value_count", len(values)),
+				zap.Any("values", values),
+				zap.Strings("columns", columns))
 
-			// 插入每一行
-			err := e.dataManager.InsertData(currentDB, props.Table, columns, values)
-			if err != nil {
-				return nil, fmt.Errorf("failed to insert row: %w", err)
+			// 插入每一行（区分事务内外）
+			if inTransaction {
+				err := e.dataManager.InsertDataInTransaction(currentDB, props.Table, columns, values, sess.Transaction)
+				if err != nil {
+					return nil, fmt.Errorf("failed to insert row in transaction: %w", err)
+				}
+			} else {
+				err := e.dataManager.InsertData(currentDB, props.Table, columns, values)
+				if err != nil {
+					return nil, fmt.Errorf("failed to insert row: %w", err)
+				}
 			}
 		}
 	} else {
@@ -639,12 +673,27 @@ func (e *ExecutorImpl) executeInsert(plan *optimizer.Plan, sess *session.Session
 		for i, expr := range props.Values {
 			if lit, ok := expr.(*optimizer.LiteralValue); ok {
 				values[i] = lit.Value
+			} else {
+				logger.WithComponent("executor").Error("INSERT: expression is not LiteralValue",
+					zap.Int("index", i),
+					zap.String("type", fmt.Sprintf("%T", expr)))
 			}
 		}
+		logger.WithComponent("executor").Info("INSERT values",
+			zap.Int("value_count", len(values)),
+			zap.Any("values", values),
+			zap.Strings("columns", columns))
 
-		err := e.dataManager.InsertData(currentDB, props.Table, columns, values)
-		if err != nil {
-			return nil, err
+		if inTransaction {
+			err := e.dataManager.InsertDataInTransaction(currentDB, props.Table, columns, values, sess.Transaction)
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert in transaction: %w", err)
+			}
+		} else {
+			err := e.dataManager.InsertData(currentDB, props.Table, columns, values)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -712,10 +761,32 @@ func (e *ExecutorImpl) executeUpdate(plan *optimizer.Plan, sess *session.Session
 		}
 	}
 
-	err := e.dataManager.UpdateDataWithFilters(currentDB, props.Table, assignments, filters)
-	if err != nil {
-		return nil, err
+	// KEY FIX: Check if in transaction
+	inTransaction := sess.Transaction != nil && sess.Transaction.IsActive()
+
+	if inTransaction {
+		logger.WithComponent("executor").Info("UPDATE in transaction - buffering operations",
+			zap.Int64("session_id", sess.ID),
+			zap.String("table", props.Table))
 	}
+
+	var updatedCount int64
+	var err error
+
+	// KEY FIX: Route to transaction-aware method
+	if inTransaction {
+		updatedCount, err = e.dataManager.UpdateDataInTransaction(currentDB, props.Table, assignments, filters, sess.Transaction)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update in transaction: %w", err)
+		}
+	} else {
+		err = e.dataManager.UpdateDataWithFilters(currentDB, props.Table, assignments, filters)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update: %w", err)
+		}
+	}
+
+	_ = updatedCount // Successfully updated
 
 	return &ResultSet{
 		Headers: []string{"status"},
@@ -1256,7 +1327,6 @@ func (e *ExecutorImpl) evaluateInCondition(record arrow.Record, rowIdx int, expr
 func (e *ExecutorImpl) executeDelete(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.DeleteProperties)
 
-	// 使用 DataManager 删除数据
 	// 使用会话中的当前数据库
 	currentDB := sess.CurrentDB
 	if currentDB == "" {
@@ -1269,10 +1339,32 @@ func (e *ExecutorImpl) executeDelete(plan *optimizer.Plan, sess *session.Session
 		filters = e.convertWhereToFilters(props.Where)
 	}
 
-	err := e.dataManager.DeleteDataWithFilters(currentDB, props.Table, filters)
-	if err != nil {
-		return nil, err
+	// KEY FIX: Check if in transaction
+	inTransaction := sess.Transaction != nil && sess.Transaction.IsActive()
+
+	if inTransaction {
+		logger.WithComponent("executor").Info("DELETE in transaction - buffering operations",
+			zap.Int64("session_id", sess.ID),
+			zap.String("table", props.Table))
 	}
+
+	var deletedCount int64
+	var err error
+
+	// KEY FIX: Route to transaction-aware method
+	if inTransaction {
+		deletedCount, err = e.dataManager.DeleteDataInTransaction(currentDB, props.Table, filters, sess.Transaction)
+		if err != nil {
+			return nil, fmt.Errorf("failed to delete in transaction: %w", err)
+		}
+	} else {
+		err = e.dataManager.DeleteDataWithFilters(currentDB, props.Table, filters)
+		if err != nil {
+			return nil, fmt.Errorf("failed to delete: %w", err)
+		}
+	}
+
+	_ = deletedCount // Successfully deleted
 
 	return &ResultSet{
 		Headers: []string{"status"},
@@ -1396,18 +1488,137 @@ func (e *ExecutorImpl) executeDropIndex(plan *optimizer.Plan, sess *session.Sess
 func (e *ExecutorImpl) executeAnalyze(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.AnalyzeProperties)
 
-	// 使用会话中的当前数据库
-	currentDB := sess.CurrentDB
-	if currentDB == "" {
-		currentDB = "default"
+	// 解析数据库和表名
+	var database, tableName string
+	parts := strings.Split(props.Table, ".")
+	if len(parts) == 2 {
+		database = parts[0]
+		tableName = parts[1]
+	} else {
+		database = sess.CurrentDB
+		if database == "" {
+			database = "default"
+		}
+		tableName = props.Table
 	}
 
-	// TODO: 实际实现统计信息收集
-	// 当前作为占位符，返回成功
 	logger.WithComponent("executor").Info("Analyzing table statistics",
-		zap.String("database", currentDB),
-		zap.String("table", props.Table),
+		zap.String("database", database),
+		zap.String("table", tableName),
 		zap.Strings("columns", props.Columns))
+
+	ctx := context.Background()
+	storageEngine := e.catalog.GetStorageEngine()
+
+	// 1. 获取表schema
+	schema, err := storageEngine.GetTableSchema(database, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table schema: %w", err)
+	}
+
+	// 2. 扫描表数据收集统计信息
+	iterator, err := storageEngine.Scan(ctx, database, tableName, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan table: %w", err)
+	}
+	defer iterator.Close()
+
+	// 统计信息收集器
+	var totalRows int64
+	columnStats := make(map[string]*columnStatistics)
+
+	// 初始化列统计
+	for _, field := range schema.Fields() {
+		// 如果指定了列列表，只分析指定的列
+		if len(props.Columns) > 0 {
+			found := false
+			for _, col := range props.Columns {
+				if col == field.Name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+
+		columnStats[field.Name] = &columnStatistics{
+			columnName:     field.Name,
+			dataType:       field.Type.String(),
+			nullCount:      0,
+			distinctValues: make(map[string]bool),
+		}
+	}
+
+	// 遍历所有数据
+	for iterator.Next() {
+		record := iterator.Record()
+		totalRows += record.NumRows()
+
+		// 收集列统计
+		for colName, stats := range columnStats {
+			colIdx := -1
+			for i, field := range schema.Fields() {
+				if field.Name == colName {
+					colIdx = i
+					break
+				}
+			}
+			if colIdx == -1 {
+				continue
+			}
+
+			column := record.Column(colIdx)
+			stats.collectFromColumn(column)
+		}
+	}
+
+	// 3. 获取文件信息（用于表级统计）
+	var fileCount int64
+	var totalSize int64
+
+	// 通过Delta Log获取文件信息（使用类型断言）
+	if pe, ok := storageEngine.(*storage.ParquetEngine); ok {
+		deltaLog := pe.GetDeltaLog()
+		if deltaLog != nil {
+			tableID := fmt.Sprintf("%s.%s", database, tableName)
+			// 获取最新版本的快照（version = -1）
+			snapshot, err := deltaLog.GetSnapshot(tableID, -1)
+			if err == nil {
+				files := snapshot.Files
+				fileCount = int64(len(files))
+				for _, file := range files {
+					totalSize += file.Size
+				}
+			}
+		}
+	}
+
+	// 4. 写入表级统计信息到 sys.table_statistics
+	analyzedAt := time.Now().UnixNano()
+	tableID := fmt.Sprintf("%s.%s", database, tableName)
+
+	if err := e.writeTableStatistics(ctx, tableID, database, totalRows, fileCount, totalSize, analyzedAt); err != nil {
+		logger.WithComponent("executor").Error("Failed to write table statistics",
+			zap.String("table", tableID),
+			zap.Error(err))
+		return nil, fmt.Errorf("failed to write table statistics: %w", err)
+	}
+
+	// 5. 写入列级统计信息到 sys.column_statistics
+	if err := e.writeColumnStatistics(ctx, tableID, columnStats, analyzedAt); err != nil {
+		logger.WithComponent("executor").Error("Failed to write column statistics",
+			zap.String("table", tableID),
+			zap.Error(err))
+		return nil, fmt.Errorf("failed to write column statistics: %w", err)
+	}
+
+	logger.WithComponent("executor").Info("Table analysis completed",
+		zap.String("table", tableID),
+		zap.Int64("total_rows", totalRows),
+		zap.Int64("file_count", fileCount),
+		zap.Int("columns_analyzed", len(columnStats)))
 
 	return &ResultSet{
 		Headers: []string{"status"},
@@ -1420,28 +1631,95 @@ func (e *ExecutorImpl) executeAnalyze(plan *optimizer.Plan, sess *session.Sessio
 func (e *ExecutorImpl) executeTransaction(plan *optimizer.Plan, sess *session.Session) (*ResultSet, error) {
 	props := plan.Properties.(*optimizer.TransactionProperties)
 
-	// TODO: 实现完整的事务控制
-	// 当前作为占位符，记录事务操作
+	// 完整的事务控制实现（乐观并发控制）
 	logger.WithComponent("executor").Info("Transaction operation",
 		zap.String("type", props.Type),
 		zap.Int64("session_id", sess.ID))
 
-	// 根据事务类型更新会话状态 (未来可用于事务管理)
+	// 获取DeltaLog
+	storageEngine := e.catalog.GetStorageEngine()
+	parquetEngine, ok := storageEngine.(*storage.ParquetEngine)
+	if !ok {
+		return nil, fmt.Errorf("storage engine does not support transactions")
+	}
+	deltaLog := parquetEngine.GetDeltaLog()
+
+	// 类型断言：确保是OptimisticDeltaLog
+	optimisticLog, ok := deltaLog.(*delta.OptimisticDeltaLog)
+	if !ok {
+		return nil, fmt.Errorf("transaction requires OptimisticDeltaLog")
+	}
+
+	var status string
+	var err error
+
 	switch props.Type {
 	case "BEGIN", "START":
-		// 标记事务开始
-		logger.WithComponent("executor").Debug("Transaction started", zap.Int64("session_id", sess.ID))
+		// 开始新事务
+		if sess.Transaction != nil && sess.Transaction.IsActive() {
+			return nil, fmt.Errorf("transaction already in progress")
+		}
+		// Use READ_COMMITTED as default isolation level
+		// TODO: Read from configuration or allow SET TRANSACTION ISOLATION LEVEL
+		isolationLevel := session.IsolationReadCommitted
+		sess.Transaction = session.NewTransaction(sess.ID, optimisticLog, isolationLevel)
+		status = fmt.Sprintf("Transaction started (isolation: %s)", isolationLevel.String())
+		logger.WithComponent("executor").Info("Transaction started",
+			zap.Int64("session_id", sess.ID),
+			zap.Int64("start_version", sess.Transaction.StartVersion),
+			zap.String("isolation_level", isolationLevel.String()))
+
 	case "COMMIT":
 		// 提交事务
-		logger.WithComponent("executor").Debug("Transaction committed", zap.Int64("session_id", sess.ID))
+		if sess.Transaction == nil || !sess.Transaction.IsActive() {
+			return nil, fmt.Errorf("no active transaction to commit")
+		}
+		err = sess.Transaction.Commit()
+		if err != nil {
+			return nil, fmt.Errorf("transaction commit failed: %w", err)
+		}
+		status = fmt.Sprintf("Transaction committed (%d operations)", sess.Transaction.GetOperationCount())
+		logger.WithComponent("executor").Info("Transaction committed",
+			zap.Int64("session_id", sess.ID),
+			zap.Int("operations", sess.Transaction.GetOperationCount()))
+		sess.Transaction = nil // 清理事务
+
 	case "ROLLBACK":
 		// 回滚事务
-		logger.WithComponent("executor").Debug("Transaction rolled back", zap.Int64("session_id", sess.ID))
+		if sess.Transaction == nil || !sess.Transaction.IsActive() {
+			return nil, fmt.Errorf("no active transaction to rollback")
+		}
+		err = sess.Transaction.Rollback()
+		if err != nil {
+			return nil, fmt.Errorf("transaction rollback failed: %w", err)
+		}
+		status = "Transaction rolled back"
+		logger.WithComponent("executor").Info("Transaction rolled back",
+			zap.Int64("session_id", sess.ID))
+		sess.Transaction = nil // 清理事务
+
+	default:
+		return nil, fmt.Errorf("unknown transaction type: %s", props.Type)
 	}
+
+	// 创建结果集
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "status", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	strBuilder := builder.Field(0).(*array.StringBuilder)
+	strBuilder.Append(status)
+
+	record := builder.NewRecord()
+	batch := types.NewBatch(record)
 
 	return &ResultSet{
 		Headers: []string{"status"},
-		rows:    []*types.Batch{},
+		rows:    []*types.Batch{batch},
 		curRow:  -1,
 	}, nil
 }
@@ -1836,4 +2114,189 @@ func (e *ExecutorImpl) inExprToFilter(expr *parser.InExpr) *storage.Filter {
 		Operator: operator,
 		Values:   values,
 	}
+}
+
+// shouldUseVectorizedJoin determines whether to use vectorized JOIN
+func (e *ExecutorImpl) shouldUseVectorizedJoin(props *optimizer.JoinProperties) bool {
+	// Currently, always prefer vectorized JOIN for supported types
+	// In the future, this could be based on cost estimation
+
+	// Only support INNER and LEFT JOIN for now
+	if props.JoinType != "INNER" && props.JoinType != "LEFT" {
+		return false
+	}
+
+	// Check if condition is a simple equality join
+	if binExpr, ok := props.Condition.(*optimizer.BinaryExpression); ok {
+		if binExpr.Operator == "=" {
+			// Simple equality join - good candidate for hash join
+			return true
+		}
+	}
+
+	// For other conditions, fall back to regular JOIN
+	return false
+}
+
+// columnStatistics 列统计信息收集器
+type columnStatistics struct {
+	columnName     string
+	dataType       string
+	minValue       interface{}
+	maxValue       interface{}
+	nullCount      int64
+	distinctValues map[string]bool
+}
+
+// collectFromColumn 从Arrow列收集统计信息
+func (cs *columnStatistics) collectFromColumn(column arrow.Array) {
+	for i := 0; i < column.Len(); i++ {
+		if column.IsNull(i) {
+			cs.nullCount++
+			continue
+		}
+
+		var value interface{}
+		switch col := column.(type) {
+		case *array.Int64:
+			value = col.Value(i)
+		case *array.Float64:
+			value = col.Value(i)
+		case *array.String:
+			value = col.Value(i)
+		case *array.Boolean:
+			value = col.Value(i)
+		default:
+			continue
+		}
+
+		// 更新最小值和最大值
+		if cs.minValue == nil || compareValues(value, cs.minValue) < 0 {
+			cs.minValue = value
+		}
+		if cs.maxValue == nil || compareValues(value, cs.maxValue) > 0 {
+			cs.maxValue = value
+		}
+
+		// 收集不同值（用于基数估计）
+		valueStr := fmt.Sprintf("%v", value)
+		cs.distinctValues[valueStr] = true
+	}
+}
+
+// compareValues 比较两个值
+func compareValues(a, b interface{}) int {
+	switch va := a.(type) {
+	case int64:
+		vb := b.(int64)
+		if va < vb {
+			return -1
+		} else if va > vb {
+			return 1
+		}
+		return 0
+	case float64:
+		vb := b.(float64)
+		if va < vb {
+			return -1
+		} else if va > vb {
+			return 1
+		}
+		return 0
+	case string:
+		vb := b.(string)
+		if va < vb {
+			return -1
+		} else if va > vb {
+			return 1
+		}
+		return 0
+	case bool:
+		vb := b.(bool)
+		if va == vb {
+			return 0
+		}
+		if !va && vb {
+			return -1
+		}
+		return 1
+	default:
+		return 0
+	}
+}
+
+// writeTableStatistics 写入表级统计信息
+func (e *ExecutorImpl) writeTableStatistics(ctx context.Context, tableID, database string,
+	rowCount, fileCount, totalSize, analyzedAt int64) error {
+
+	storageEngine := e.catalog.GetStorageEngine()
+
+	// 创建Arrow Record
+	pool := memory.NewGoAllocator()
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_id", Type: arrow.BinaryTypes.String},
+		{Name: "database", Type: arrow.BinaryTypes.String},
+		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "file_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "total_size", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "analyzed_at", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	builder.Field(0).(*array.StringBuilder).Append(tableID)
+	builder.Field(1).(*array.StringBuilder).Append(database)
+	builder.Field(2).(*array.Int64Builder).Append(rowCount)
+	builder.Field(3).(*array.Int64Builder).Append(fileCount)
+	builder.Field(4).(*array.Int64Builder).Append(totalSize)
+	builder.Field(5).(*array.Int64Builder).Append(analyzedAt)
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	return storageEngine.Write(ctx, "sys", "table_statistics", record)
+}
+
+// writeColumnStatistics 写入列级统计信息
+func (e *ExecutorImpl) writeColumnStatistics(ctx context.Context, tableID string,
+	columnStats map[string]*columnStatistics, analyzedAt int64) error {
+
+	if len(columnStats) == 0 {
+		return nil
+	}
+
+	storageEngine := e.catalog.GetStorageEngine()
+
+	// 创建Arrow Record
+	pool := memory.NewGoAllocator()
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_id", Type: arrow.BinaryTypes.String},
+		{Name: "column_name", Type: arrow.BinaryTypes.String},
+		{Name: "data_type", Type: arrow.BinaryTypes.String},
+		{Name: "min_value", Type: arrow.BinaryTypes.String},
+		{Name: "max_value", Type: arrow.BinaryTypes.String},
+		{Name: "null_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "distinct_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "analyzed_at", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	for _, stats := range columnStats {
+		builder.Field(0).(*array.StringBuilder).Append(tableID)
+		builder.Field(1).(*array.StringBuilder).Append(stats.columnName)
+		builder.Field(2).(*array.StringBuilder).Append(stats.dataType)
+		builder.Field(3).(*array.StringBuilder).Append(fmt.Sprintf("%v", stats.minValue))
+		builder.Field(4).(*array.StringBuilder).Append(fmt.Sprintf("%v", stats.maxValue))
+		builder.Field(5).(*array.Int64Builder).Append(stats.nullCount)
+		builder.Field(6).(*array.Int64Builder).Append(int64(len(stats.distinctValues)))
+		builder.Field(7).(*array.Int64Builder).Append(analyzedAt)
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	return storageEngine.Write(ctx, "sys", "column_statistics", record)
 }

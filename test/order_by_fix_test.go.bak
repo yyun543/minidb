@@ -1,0 +1,194 @@
+package test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/yyun543/minidb/internal/catalog"
+	"github.com/yyun543/minidb/internal/executor"
+	"github.com/yyun543/minidb/internal/parser"
+	"github.com/yyun543/minidb/internal/session"
+	"github.com/yyun543/minidb/internal/storage"
+)
+
+// TestOrderByWithAllTypes tests ORDER BY with all supported column types
+func TestOrderByWithAllTypes(t *testing.T) {
+	// Setup
+	pool := memory.NewGoAllocator()
+	cat := catalog.NewSimpleCatalog()
+	storageEngine := storage.NewParquetEngine("minidb_data", nil)
+	dataManager := executor.NewDataManager(cat, storageEngine)
+	exec := executor.NewExecutor(cat, dataManager, storageEngine)
+	sess := session.NewSession("test-session")
+
+	// Create database and table
+	ctx := context.Background()
+	dbName := "testdb_orderby"
+	tableName := "products"
+
+	// Clean up
+	defer func() {
+		_ = storageEngine.DropDatabase(ctx, dbName)
+	}()
+
+	// Create database
+	if err := cat.CreateDatabase(dbName); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	// Create table schema with all types
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "name", Type: arrow.BinaryTypes.String},
+			{Name: "price", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "quantity", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "in_stock", Type: arrow.FixedWidthTypes.Boolean},
+			{Name: "created_at", Type: arrow.BinaryTypes.String}, // Timestamp stored as string
+			{Name: "category", Type: arrow.BinaryTypes.String},
+		}, nil,
+	)
+
+	if err := cat.CreateTable(dbName, tableName, schema); err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	if err := storageEngine.CreateTable(ctx, dbName, tableName, schema); err != nil {
+		t.Fatalf("Failed to create table in storage: %v", err)
+	}
+
+	sess.CurrentDB = dbName
+
+	// Insert test data
+	insertSQL := `INSERT INTO products VALUES (1, 'Laptop', 999.99, 10, 1, '2024-01-01', 'Electronics')`
+	if _, err := parseAndExecute(insertSQL, exec, sess); err != nil {
+		t.Fatalf("Failed to insert row 1: %v", err)
+	}
+
+	insertSQL = `INSERT INTO products VALUES (2, 'Mouse', 29.99, 50, 1, '2024-01-02', 'Electronics')`
+	if _, err := parseAndExecute(insertSQL, exec, sess); err != nil {
+		t.Fatalf("Failed to insert row 2: %v", err)
+	}
+
+	insertSQL = `INSERT INTO products VALUES (3, 'Desk', 299.99, 15, 1, '2024-01-03', 'Furniture')`
+	if _, err := parseAndExecute(insertSQL, exec, sess); err != nil {
+		t.Fatalf("Failed to insert row 3: %v", err)
+	}
+
+	insertSQL = `INSERT INTO products VALUES (4, 'Chair', 199.99, 20, 0, '2024-01-04', 'Furniture')`
+	if _, err := parseAndExecute(insertSQL, exec, sess); err != nil {
+		t.Fatalf("Failed to insert row 4: %v", err)
+	}
+
+	// Test ORDER BY on different column types
+	tests := []struct {
+		name     string
+		sql      string
+		wantErr  bool
+		checkFn  func(*testing.T, executor.ResultSet)
+	}{
+		{
+			name:    "ORDER BY integer column (price)",
+			sql:     "SELECT * FROM products ORDER BY price",
+			wantErr: false,
+			checkFn: func(t *testing.T, rs executor.ResultSet) {
+				rows := collectAllRows(t, &rs)
+				if len(rows) != 4 {
+					t.Errorf("Expected 4 rows, got %d", len(rows))
+				}
+				// First row should be Mouse (29.99)
+				if len(rows) > 0 && rows[0]["name"] != "Mouse" {
+					t.Errorf("Expected first row to be Mouse, got %v", rows[0]["name"])
+				}
+			},
+		},
+		{
+			name:    "ORDER BY string column (name)",
+			sql:     "SELECT * FROM products ORDER BY name",
+			wantErr: false,
+			checkFn: func(t *testing.T, rs executor.ResultSet) {
+				rows := collectAllRows(t, &rs)
+				if len(rows) != 4 {
+					t.Errorf("Expected 4 rows, got %d", len(rows))
+				}
+				// First row should be Chair (alphabetically)
+				if len(rows) > 0 && rows[0]["name"] != "Chair" {
+					t.Errorf("Expected first row to be Chair, got %v", rows[0]["name"])
+				}
+			},
+		},
+		{
+			name:    "ORDER BY boolean column (in_stock)",
+			sql:     "SELECT * FROM products ORDER BY in_stock ASC",
+			wantErr: false,
+			checkFn: func(t *testing.T, rs executor.ResultSet) {
+				rows := collectAllRows(t, &rs)
+				if len(rows) != 4 {
+					t.Errorf("Expected 4 rows, got %d", len(rows))
+				}
+				// First row should have in_stock = false (Chair)
+				if len(rows) > 0 {
+					inStock, ok := rows[0]["in_stock"].(bool)
+					if !ok || inStock {
+						t.Errorf("Expected first row to have in_stock=false, got %v", rows[0]["in_stock"])
+					}
+				}
+			},
+		},
+		{
+			name:    "ORDER BY timestamp column (created_at)",
+			sql:     "SELECT * FROM products ORDER BY created_at DESC",
+			wantErr: false,
+			checkFn: func(t *testing.T, rs executor.ResultSet) {
+				rows := collectAllRows(t, &rs)
+				if len(rows) != 4 {
+					t.Errorf("Expected 4 rows, got %d", len(rows))
+				}
+				// First row should be Chair (2024-01-04)
+				if len(rows) > 0 && rows[0]["name"] != "Chair" {
+					t.Errorf("Expected first row to be Chair (latest date), got %v", rows[0]["name"])
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs, err := parseAndExecute(tt.sql, exec, sess)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Execute() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && tt.checkFn != nil {
+				tt.checkFn(t, *rs)
+			}
+		})
+	}
+}
+
+func parseAndExecute(sql string, exec executor.Executor, sess *session.Session) (*executor.ResultSet, error) {
+	p := parser.NewParser()
+	stmt, err := p.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	return exec.Execute(stmt, sess)
+}
+
+func collectAllRows(t *testing.T, rs *executor.ResultSet) []map[string]interface{} {
+	var rows []map[string]interface{}
+	for rs.Next() {
+		row := make(map[string]interface{})
+		values := rs.Values()
+		headers := rs.Headers()
+		for i, header := range headers {
+			if i < len(values) {
+				row[header] = values[i]
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}

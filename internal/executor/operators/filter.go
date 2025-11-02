@@ -77,7 +77,10 @@ func (op *Filter) applyFilter(record arrow.Record) (arrow.Record, error) {
 		return op.applyBinaryFilter(record, binExpr)
 	}
 
-	// TODO: Support IN expressions when optimizer.InExpression is implemented
+	// 支持IN表达式 (优化版本，使用HashSet)
+	if inExpr, ok := op.condition.(*optimizer.InExpression); ok {
+		return op.applyInFilter(record, inExpr)
+	}
 
 	// 如果不支持的条件类型，返回原记录
 	return record, nil
@@ -561,4 +564,133 @@ func (op *Filter) matchLikePattern(value, pattern string) bool {
 
 	// 其他情况暂不支持，返回false
 	return false
+}
+
+// applyInFilter 应用IN表达式过滤 (优化版本：使用HashSet，O(1)查找)
+func (op *Filter) applyInFilter(record arrow.Record, inExpr *optimizer.InExpression) (arrow.Record, error) {
+	// 获取列名
+	var colName string
+	if colRef, ok := inExpr.Column.(*optimizer.ColumnReference); ok {
+		colName = colRef.Column
+	} else {
+		// IN表达式的左侧必须是列引用
+		return record, nil
+	}
+
+	// 找到列索引
+	schema := record.Schema()
+	colIdx := -1
+	for i := 0; i < len(schema.Fields()); i++ {
+		if schema.Field(i).Name == colName {
+			colIdx = i
+			break
+		}
+	}
+
+	if colIdx == -1 {
+		// 列不存在，返回空记录
+		return nil, nil
+	}
+
+	col := record.Column(colIdx)
+	numRows := int(record.NumRows())
+
+	// 创建匹配掩码
+	matchMask := make([]bool, numRows)
+	matchCount := 0
+
+	// 使用HashSet进行O(1)查找
+	for i := 0; i < numRows; i++ {
+		if col.IsNull(i) {
+			matchMask[i] = false
+			continue
+		}
+
+		// 获取当前行的值
+		var rowValue interface{}
+		switch arr := col.(type) {
+		case *array.Int64:
+			rowValue = arr.Value(i)
+		case *array.Float64:
+			rowValue = arr.Value(i)
+		case *array.String:
+			rowValue = arr.Value(i)
+		case *array.Boolean:
+			rowValue = arr.Value(i)
+		default:
+			matchMask[i] = false
+			continue
+		}
+
+		// 使用预构建的HashSet进行O(1)查找
+		found := false
+		if len(inExpr.ValueSet) > 0 {
+			// 使用HashSet快速查找
+			_, found = inExpr.ValueSet[rowValue]
+		} else {
+			// 回退到逐个比较（用于非字面量情况）
+			for _, val := range inExpr.Values {
+				if lit, ok := val.(*optimizer.LiteralValue); ok {
+					if lit.Value == rowValue {
+						found = true
+						break
+					}
+				}
+			}
+		}
+
+		// 根据是否为NOT IN决定匹配结果
+		if inExpr.IsNotIn {
+			matchMask[i] = !found
+		} else {
+			matchMask[i] = found
+		}
+
+		if matchMask[i] {
+			matchCount++
+		}
+	}
+
+	// 如果没有匹配的行，返回nil
+	if matchCount == 0 {
+		return nil, nil
+	}
+
+	// 如果所有行都匹配，返回原记录
+	if matchCount == numRows {
+		return record, nil
+	}
+
+	// 构建过滤后的记录
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, record.Schema())
+	defer builder.Release()
+
+	// 复制匹配的行
+	for i := 0; i < numRows; i++ {
+		if matchMask[i] {
+			for colIdx := 0; colIdx < int(record.NumCols()); colIdx++ {
+				col := record.Column(colIdx)
+				if col.IsNull(i) {
+					builder.Field(colIdx).AppendNull()
+					continue
+				}
+
+				switch arr := col.(type) {
+				case *array.Int64:
+					builder.Field(colIdx).(*array.Int64Builder).Append(arr.Value(i))
+				case *array.Float64:
+					builder.Field(colIdx).(*array.Float64Builder).Append(arr.Value(i))
+				case *array.String:
+					builder.Field(colIdx).(*array.StringBuilder).Append(arr.Value(i))
+				case *array.Boolean:
+					builder.Field(colIdx).(*array.BooleanBuilder).Append(arr.Value(i))
+				default:
+					builder.Field(colIdx).AppendNull()
+				}
+			}
+		}
+	}
+
+	return builder.NewRecord(), nil
 }

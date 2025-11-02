@@ -5,14 +5,30 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/yyun543/minidb/internal/logger"
 	"github.com/yyun543/minidb/internal/parser"
 	"go.uber.org/zap"
 )
 
+// CatalogInterface 定义optimizer需要的catalog接口
+// 这是一个最小接口,避免circular dependency
+type CatalogInterface interface {
+	GetTable(database, table string) (TableMeta, error)
+}
+
+// TableMeta 表元数据(最小定义)
+type TableMeta struct {
+	Database string
+	Table    string
+	Schema   *arrow.Schema
+}
+
 // Optimizer 查询优化器
 type Optimizer struct {
-	rules []Rule // 优化规则
+	rules           []Rule           // 优化规则
+	catalog         CatalogInterface // catalog接口用于元数据访问(可选)
+	currentDatabase string           // 当前数据库名(用于SELECT *展开)
 }
 
 // NewOptimizer 创建新的优化器实例
@@ -20,7 +36,9 @@ func NewOptimizer() *Optimizer {
 	logger.WithComponent("optimizer").Info("Creating new query optimizer")
 
 	opt := &Optimizer{
-		rules: make([]Rule, 0),
+		rules:           make([]Rule, 0),
+		catalog:         nil, // 可选,稍后通过SetCatalog设置
+		currentDatabase: "",
 	}
 	// 添加优化规则
 	opt.rules = append(opt.rules,
@@ -33,6 +51,21 @@ func NewOptimizer() *Optimizer {
 		zap.Int("rules_count", len(opt.rules)))
 
 	return opt
+}
+
+// SetCatalog 设置catalog接口(可选)
+// 设置后optimizer可以在优化时进行SELECT *展开等元数据依赖的优化
+func (o *Optimizer) SetCatalog(catalog CatalogInterface) {
+	o.catalog = catalog
+	logger.WithComponent("optimizer").Debug("Catalog set for optimizer")
+}
+
+// SetCurrentDatabase 设置当前数据库
+// 用于SELECT *展开时解析表名
+func (o *Optimizer) SetCurrentDatabase(database string) {
+	o.currentDatabase = database
+	logger.WithComponent("optimizer").Debug("Current database set for optimizer",
+		zap.String("database", database))
 }
 
 // Optimize 优化查询
@@ -134,9 +167,27 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 	// 如果没有指定列，或者指定了"*"，则认为是SELECT *
 	isSelectAll := len(stmt.Columns) == 0 || (len(stmt.Columns) == 1 && stmt.Columns[0].Column == "*")
 
+	var columns []ColumnRef
+	if isSelectAll && o.catalog != nil && stmt.From != "" {
+		// P0.2: 如果有catalog且是SELECT *,尝试在优化时展开
+		// 这使得投影裁剪优化能够生效,减少I/O
+		columns = o.expandSelectAll(stmt.From)
+		// 如果展开成功(不只是返回星号占位符),则不再标记为All
+		if len(columns) > 0 && columns[0].Column != "*" {
+			isSelectAll = false
+			logger.WithComponent("optimizer").Debug("SELECT * expanded during optimization",
+				zap.String("table", stmt.From),
+				zap.Int("columns", len(columns)))
+		} else {
+			columns = convertSelectItems(stmt.Columns)
+		}
+	} else {
+		columns = convertSelectItems(stmt.Columns)
+	}
+
 	projectPlan.Properties = &SelectProperties{
 		All:     isSelectAll,
-		Columns: convertSelectItems(stmt.Columns),
+		Columns: columns,
 	}
 
 	// 2. 构建表扫描和JOIN
@@ -299,7 +350,7 @@ func (o *Optimizer) buildSelectPlan(stmt *parser.SelectStmt) (*Plan, error) {
 	if !isSelectAll && len(stmt.GroupBy) == 0 && !hasAggregates {
 		projectionPlan := NewPlan(ProjectionPlan)
 		projectionPlan.Properties = &ProjectionProperties{
-			Columns: convertSelectItems(stmt.Columns),
+			Columns: columns, // 使用展开后的columns，而不是stmt.Columns
 		}
 		projectionPlan.AddChild(currentPlan)
 		currentPlan = projectionPlan
@@ -322,8 +373,12 @@ func (o *Optimizer) buildJoinPlan(leftTable string, leftAlias string, joins []*p
 
 	currentPlan := leftScan
 
+	// Track left and right info for the first JOIN
+	currentLeft := leftTable
+	currentLeftAlias := leftAlias
+
 	// 处理每个JOIN子句
-	for _, join := range joins {
+	for joinIdx, join := range joins {
 		joinPlan := NewPlan(JoinPlan)
 
 		var rightPlan *Plan
@@ -357,22 +412,35 @@ func (o *Optimizer) buildJoinPlan(leftTable string, leftAlias string, joins []*p
 		}
 
 		// 设置JOIN属性
-		joinPlan.Properties = &JoinProperties{
-			JoinType:   join.JoinType,
-			Left:       leftTable,
-			LeftAlias:  leftAlias,
-			Right:      rightTable,
-			RightAlias: rightAlias,
-			Condition:  convertExpression(join.Condition),
+		// For multi-table JOINs, after the first JOIN, the left side is the accumulated JOIN result
+		// We keep track of this by leaving Left/LeftAlias empty for subsequent JOINs
+		if joinIdx == 0 {
+			// First JOIN: use the original left table
+			joinPlan.Properties = &JoinProperties{
+				JoinType:   join.JoinType,
+				Left:       currentLeft,
+				LeftAlias:  currentLeftAlias,
+				Right:      rightTable,
+				RightAlias: rightAlias,
+				Condition:  convertExpression(join.Condition),
+			}
+		} else {
+			// Subsequent JOINs: left side is the accumulated JOIN result (indicated by empty Left)
+			joinPlan.Properties = &JoinProperties{
+				JoinType:   join.JoinType,
+				Left:       "", // Empty indicates this is a JOIN on accumulated result
+				LeftAlias:  "",
+				Right:      rightTable,
+				RightAlias: rightAlias,
+				Condition:  convertExpression(join.Condition),
+			}
 		}
 
 		// 添加左右子节点
 		joinPlan.AddChild(currentPlan)
 		joinPlan.AddChild(rightPlan)
 
-		// 更新左侧信息用于下一个JOIN
-		leftTable = rightTable
-		leftAlias = rightAlias
+		// 更新currentPlan为当前JOIN结果，用于下一个JOIN
 		currentPlan = joinPlan
 	}
 
@@ -557,7 +625,7 @@ func convertExpression(expr parser.Node) Expression {
 	return nil
 }
 
-// convertInExpression 转换IN表达式为OR条件链
+// convertInExpression 转换IN表达式 (优化版本：使用HashSet而非OR链)
 func convertInExpression(inExpr *parser.InExpr) Expression {
 	if len(inExpr.Values) == 0 {
 		return nil
@@ -568,46 +636,30 @@ func convertInExpression(inExpr *parser.InExpr) Expression {
 		return nil
 	}
 
-	// 为每个值创建等值比较条件
-	var orChain Expression
-
+	// 转换所有值表达式
+	values := make([]Expression, 0, len(inExpr.Values))
 	for _, value := range inExpr.Values {
 		valueExpr := convertExpression(value)
-		if valueExpr == nil {
-			continue
-		}
-
-		// 创建等值比较: column = value
-		eqExpr := &BinaryExpression{
-			Left:     leftExpr,
-			Operator: "=",
-			Right:    valueExpr,
-		}
-
-		// 如果是NOT IN，使用不等于比较
-		if inExpr.Operator == "NOT IN" {
-			eqExpr.Operator = "!="
-		}
-
-		if orChain == nil {
-			orChain = eqExpr
-		} else {
-			// 构建OR链: (... OR column = value)
-			logicalOp := "OR"
-			if inExpr.Operator == "NOT IN" {
-				// NOT IN 使用 AND: column != val1 AND column != val2
-				logicalOp = "AND"
-			}
-
-			orChain = &BinaryExpression{
-				Left:     orChain,
-				Operator: logicalOp,
-				Right:    eqExpr,
-			}
+		if valueExpr != nil {
+			values = append(values, valueExpr)
 		}
 	}
 
-	return orChain
+	if len(values) == 0 {
+		return nil
+	}
+
+	// 创建优化的InExpression
+	inExp := &InExpression{
+		Column:  leftExpr,
+		Values:  values,
+		IsNotIn: inExpr.Operator == "NOT IN",
+	}
+
+	// 预构建HashSet以加速执行时的查找
+	inExp.BuildValueSet()
+
+	return inExp
 }
 
 // convertFunctionArgs 转换函数参数
@@ -618,8 +670,10 @@ func convertFunctionArgs(args []parser.Node) []Expression {
 	result := make([]Expression, len(args))
 	for i, arg := range args {
 		if arg.Type() == parser.AsteriskNode {
-			// TODO 根据元数据补全所有字段信息
-			result[i] = &Asterisk{}
+			// P0.2修复: 对于聚合函数参数中的星号(如COUNT(*))
+			// 星号是特殊标记,不需要展开为具体列,保留Asterisk即可
+			// 聚合函数会在执行时特殊处理COUNT(*)
+			result[i] = &Asterisk{TableName: ""}
 		} else {
 			result[i] = convertExpression(arg)
 		}
@@ -798,4 +852,101 @@ func (o *Optimizer) buildShowIndexesPlan(stmt *parser.ShowIndexesStmt) (*Plan, e
 		},
 		Children: nil,
 	}, nil
+}
+
+// ParseTableName 解析表名，提取数据库名和表名
+// 支持格式：
+//   - "table_name" -> ("", "table_name")
+//   - "database.table_name" -> ("database", "table_name")
+func (o *Optimizer) ParseTableName(fullTableName string) (database string, table string) {
+	// 查找第一个点号的位置
+	dotIndex := strings.Index(fullTableName, ".")
+	if dotIndex == -1 {
+		// 没有数据库前缀
+		return "", fullTableName
+	}
+
+	// 有数据库前缀
+	database = fullTableName[:dotIndex]
+	table = fullTableName[dotIndex+1:]
+	return database, table
+}
+
+// expandSelectAll 展开SELECT *为具体列列表
+// 这是P0.2的核心实现:在优化阶段展开星号,使投影裁剪优化生效
+func (o *Optimizer) expandSelectAll(tableName string) []ColumnRef {
+	// 如果没有catalog,无法展开,返回星号占位符
+	if o.catalog == nil {
+		logger.WithComponent("optimizer").Warn("Cannot expand SELECT * without catalog",
+			zap.String("table", tableName))
+		return []ColumnRef{{
+			Column: "*",
+			Table:  tableName,
+			Type:   ColumnRefTypeColumn,
+		}}
+	}
+
+	// 解析表名，可能包含数据库前缀（如 sys.db_metadata）
+	database, table := o.ParseTableName(tableName)
+
+	// 如果没有指定数据库，使用当前数据库
+	if database == "" {
+		database = o.currentDatabase
+		if database == "" {
+			database = "default"
+		}
+	}
+
+	// 从catalog获取表schema
+	tableMeta, err := o.catalog.GetTable(database, table)
+	if err != nil {
+		logger.WithComponent("optimizer").Error("Failed to get table schema for SELECT * expansion",
+			zap.String("database", database),
+			zap.String("table", table),
+			zap.Error(err))
+
+		// 回退到星号占位符
+		return []ColumnRef{{
+			Column: "*",
+			Table:  table,
+			Type:   ColumnRefTypeColumn,
+		}}
+	}
+
+	if tableMeta.Schema == nil {
+		logger.WithComponent("optimizer").Warn("Table schema is nil, cannot expand SELECT *",
+			zap.String("database", database),
+			zap.String("table", table))
+		return []ColumnRef{{
+			Column: "*",
+			Table:  table,
+			Type:   ColumnRefTypeColumn,
+		}}
+	}
+
+	// 展开为具体列引用列表
+	columns := make([]ColumnRef, 0, tableMeta.Schema.NumFields())
+	for i := 0; i < tableMeta.Schema.NumFields(); i++ {
+		field := tableMeta.Schema.Field(i)
+		columns = append(columns, ColumnRef{
+			Table:  tableName,
+			Column: field.Name,
+			Type:   ColumnRefTypeColumn,
+		})
+	}
+
+	logger.WithComponent("optimizer").Info("SELECT * expanded successfully",
+		zap.String("database", database),
+		zap.String("table", tableName),
+		zap.Int("column_count", len(columns)))
+
+	return columns
+}
+
+// expandAsterisk 展开函数参数中的星号(如COUNT(*))
+// 修复optimizer.go:605的TODO
+func (o *Optimizer) expandAsterisk(tableName string) []Expression {
+	// 对于聚合函数如COUNT(*),星号实际上是一个特殊标记,不需要真正展开
+	// 返回Asterisk表达式即可
+	return []Expression{&Asterisk{TableName: tableName}}
 }

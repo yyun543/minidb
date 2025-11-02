@@ -319,6 +319,35 @@ func (e *BinaryExpression) String() string {
 	return fmt.Sprintf("(%s %s %s)", e.Left, e.Operator, e.Right)
 }
 
+// InExpression IN表达式 (优化版本，使用HashSet而非OR链)
+type InExpression struct {
+	Column   Expression           // 左侧列表达式
+	Values   []Expression         // IN列表中的值
+	IsNotIn  bool                 // 是否为NOT IN
+	ValueSet map[interface{}]bool // 预编译的HashSet (仅用于字面量)
+}
+
+func (e *InExpression) String() string {
+	if e.IsNotIn {
+		return fmt.Sprintf("(%s NOT IN [%d values])", e.Column, len(e.Values))
+	}
+	return fmt.Sprintf("(%s IN [%d values])", e.Column, len(e.Values))
+}
+
+// BuildValueSet 构建值的HashSet（编译期优化）
+func (e *InExpression) BuildValueSet() {
+	if e.ValueSet == nil {
+		e.ValueSet = make(map[interface{}]bool, len(e.Values))
+	}
+
+	// 只对字面量值构建HashSet
+	for _, val := range e.Values {
+		if lit, ok := val.(*LiteralValue); ok {
+			e.ValueSet[lit.Value] = true
+		}
+	}
+}
+
 // ColumnReference 列引用表达式
 type ColumnReference struct {
 	Column string
@@ -352,9 +381,14 @@ const (
 )
 
 // Asterisk 表示 * 通配符
-type Asterisk struct{}
+type Asterisk struct {
+	TableName string // 可选的表名限定符(如t1.*中的t1)
+}
 
 func (a *Asterisk) String() string {
+	if a.TableName != "" {
+		return a.TableName + ".*"
+	}
 	return "*"
 }
 

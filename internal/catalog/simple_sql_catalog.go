@@ -344,6 +344,28 @@ func (c *SimpleSQLCatalog) createSystemTables() error {
 		{Name: "status", Type: arrow.BinaryTypes.String},
 	}, nil)
 
+	// 创建 table_statistics 系统表的 schema (ANALYZE TABLE 功能)
+	tableStatisticsSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_id", Type: arrow.BinaryTypes.String},      // format: "database.table"
+		{Name: "database", Type: arrow.BinaryTypes.String},      // 数据库名
+		{Name: "row_count", Type: arrow.PrimitiveTypes.Int64},   // 行数
+		{Name: "file_count", Type: arrow.PrimitiveTypes.Int64},  // 文件数
+		{Name: "total_size", Type: arrow.PrimitiveTypes.Int64},  // 总大小（字节）
+		{Name: "analyzed_at", Type: arrow.PrimitiveTypes.Int64}, // 分析时间戳（纳秒）
+	}, nil)
+
+	// 创建 column_statistics 系统表的 schema (ANALYZE TABLE 功能)
+	columnStatisticsSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_id", Type: arrow.BinaryTypes.String},         // format: "database.table"
+		{Name: "column_name", Type: arrow.BinaryTypes.String},      // 列名
+		{Name: "data_type", Type: arrow.BinaryTypes.String},        // 数据类型
+		{Name: "min_value", Type: arrow.BinaryTypes.String},        // 最小值（字符串表示）
+		{Name: "max_value", Type: arrow.BinaryTypes.String},        // 最大值（字符串表示）
+		{Name: "null_count", Type: arrow.PrimitiveTypes.Int64},     // NULL值数量
+		{Name: "distinct_count", Type: arrow.PrimitiveTypes.Int64}, // 不同值数量（基数）
+		{Name: "analyzed_at", Type: arrow.PrimitiveTypes.Int64},    // 分析时间戳（纳秒）
+	}, nil)
+
 	// 添加系统表到内存缓存
 	c.tables["sys"]["db_metadata"] = &TableInfo{
 		Database: "sys",
@@ -379,6 +401,18 @@ func (c *SimpleSQLCatalog) createSystemTables() error {
 		Database: "sys",
 		Name:     "table_files",
 		Schema:   tableFilesSchema,
+	}
+
+	c.tables["sys"]["table_statistics"] = &TableInfo{
+		Database: "sys",
+		Name:     "table_statistics",
+		Schema:   tableStatisticsSchema,
+	}
+
+	c.tables["sys"]["column_statistics"] = &TableInfo{
+		Database: "sys",
+		Name:     "column_statistics",
+		Schema:   columnStatisticsSchema,
 	}
 
 	return nil

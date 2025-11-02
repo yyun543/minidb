@@ -3,6 +3,7 @@ package delta
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,14 +15,16 @@ import (
 
 // OptimisticDeltaLog 实现乐观并发控制的Delta Log
 // 核心思想:
-// 1. 每个commit写入独立的版本文件 (000001.json, 000002.json, ...)
+// 1. 每个表有独立的版本号空间，每个commit写入独立的版本文件 (000001.json, 000002.json, ...)
 // 2. 使用对象存储的PutIfNotExists确保版本唯一性
 // 3. 发生冲突时返回RetryableConflictError
 // 4. 客户端自动重试
 type OptimisticDeltaLog struct {
 	objectStore objectstore.ConditionalObjectStore
 	basePath    string
-	currentVer  atomic.Int64
+	// 每个表独立的版本计数器 (tableID -> version)
+	tableVersions map[string]*atomic.Int64
+	tableMu       sync.RWMutex // 保护tableVersions map
 
 	checkpointCallback CheckpointCallback
 }
@@ -39,10 +42,10 @@ func (e *ConflictError) Error() string {
 // NewOptimisticDeltaLog 创建乐观并发控制的Delta Log
 func NewOptimisticDeltaLog(objectStore objectstore.ConditionalObjectStore, basePath string) *OptimisticDeltaLog {
 	dl := &OptimisticDeltaLog{
-		objectStore: objectStore,
-		basePath:    basePath,
+		objectStore:   objectStore,
+		basePath:      basePath,
+		tableVersions: make(map[string]*atomic.Int64),
 	}
-	dl.currentVer.Store(0)
 	return dl
 }
 
@@ -55,31 +58,53 @@ func (dl *OptimisticDeltaLog) SetCheckpointCallback(callback CheckpointCallback)
 func (dl *OptimisticDeltaLog) Bootstrap() error {
 	logger.Info("Bootstrapping OptimisticDeltaLog")
 
-	// 扫描_delta_log目录找到最新版本
-	// 格式: {basePath}/sys/_delta_log/000001.json
+	// 扫描_delta_log目录找到所有表和它们的最新版本
+	// 格式: {basePath}/sys/_delta_log/{tableID}/000001.json
 	deltaLogDir := fmt.Sprintf("%s/sys/_delta_log", dl.basePath)
 
-	files, err := dl.objectStore.List(deltaLogDir)
+	// 列出所有表目录
+	tableDirs, err := dl.objectStore.List(deltaLogDir)
 	if err != nil {
-		logger.Warn("Failed to list delta log files, starting fresh", zap.Error(err))
+		logger.Warn("Failed to list delta log directories, starting fresh", zap.Error(err))
 		return nil
 	}
 
-	maxVersion := int64(0)
-	for _, file := range files {
-		var version int64
-		// 尝试解析文件名格式: 000001.json
-		if _, err := fmt.Sscanf(file, "%d.json", &version); err == nil {
-			if version > maxVersion {
-				maxVersion = version
+	totalTables := 0
+	totalFiles := 0
+
+	// 对每个表目录，找到最新版本号
+	for _, tableID := range tableDirs {
+		tableDir := fmt.Sprintf("%s/%s", deltaLogDir, tableID)
+		files, err := dl.objectStore.List(tableDir)
+		if err != nil {
+			continue
+		}
+
+		maxVersion := int64(0)
+		for _, file := range files {
+			var version int64
+			// 尝试解析文件名格式: 000001.json
+			if _, err := fmt.Sscanf(file, "%d.json", &version); err == nil {
+				if version > maxVersion {
+					maxVersion = version
+				}
+				totalFiles++
 			}
+		}
+
+		if maxVersion > 0 {
+			tableVer := dl.getOrCreateTableVersion(tableID)
+			tableVer.Store(maxVersion)
+			totalTables++
+			logger.Debug("Bootstrapped table version",
+				zap.String("table", tableID),
+				zap.Int64("version", maxVersion))
 		}
 	}
 
-	dl.currentVer.Store(maxVersion)
 	logger.Info("OptimisticDeltaLog bootstrapped",
-		zap.Int64("latest_version", maxVersion),
-		zap.Int("file_count", len(files)))
+		zap.Int("table_count", totalTables),
+		zap.Int("file_count", totalFiles))
 
 	return nil
 }
@@ -88,20 +113,31 @@ func (dl *OptimisticDeltaLog) Bootstrap() error {
 func (dl *OptimisticDeltaLog) RestoreFromEntries(entries []LogEntry) error {
 	// 乐观锁实现中，entries存储在对象存储中
 	// 这个方法主要用于兼容性
-	var maxVersion int64 = 0
+
+	// 按表分组，找到每个表的最大版本号
+	tableMaxVersions := make(map[string]int64)
 	for _, entry := range entries {
-		if entry.Version > maxVersion {
-			maxVersion = entry.Version
+		if entry.TableID != "" {
+			if entry.Version > tableMaxVersions[entry.TableID] {
+				tableMaxVersions[entry.TableID] = entry.Version
+			}
 		}
 	}
-	dl.currentVer.Store(maxVersion)
+
+	// 为每个表设置版本号
+	for tableID, maxVersion := range tableMaxVersions {
+		tableVer := dl.getOrCreateTableVersion(tableID)
+		tableVer.Store(maxVersion)
+	}
+
 	return nil
 }
 
 // AppendAdd 追加ADD操作（乐观并发控制）
 func (dl *OptimisticDeltaLog) AppendAdd(tableID string, file *ParquetFile) error {
-	// 1. 生成新版本号（无锁）
-	version := dl.currentVer.Add(1)
+	// 1. 获取表的版本计数器并生成新版本号（无锁）
+	tableVer := dl.getOrCreateTableVersion(tableID)
+	version := tableVer.Add(1)
 	timestamp := time.Now().UnixMilli()
 
 	entry := LogEntry{
@@ -126,7 +162,7 @@ func (dl *OptimisticDeltaLog) AppendAdd(tableID string, file *ParquetFile) error
 	// 2. 序列化entry为JSON
 	data, err := json.Marshal(entry)
 	if err != nil {
-		dl.currentVer.Add(-1) // 回滚版本号
+		tableVer.Add(-1) // 回滚版本号
 		return fmt.Errorf("failed to marshal log entry: %w", err)
 	}
 
@@ -136,7 +172,7 @@ func (dl *OptimisticDeltaLog) AppendAdd(tableID string, file *ParquetFile) error
 	if err != nil {
 		// 检查是否是冲突错误
 		if isConflictError(err) {
-			dl.currentVer.Add(-1) // 回滚版本号
+			tableVer.Add(-1) // 回滚版本号
 			logger.Warn("Version conflict detected, retry needed",
 				zap.Int64("version", version),
 				zap.String("table", tableID),
@@ -146,7 +182,7 @@ func (dl *OptimisticDeltaLog) AppendAdd(tableID string, file *ParquetFile) error
 				Message: "another writer committed this version first",
 			}
 		}
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to write version file: %w", err)
 	}
 
@@ -168,7 +204,8 @@ func (dl *OptimisticDeltaLog) AppendAdd(tableID string, file *ParquetFile) error
 
 // AppendRemove 追加REMOVE操作
 func (dl *OptimisticDeltaLog) AppendRemove(tableID, filePath string) error {
-	version := dl.currentVer.Add(1)
+	tableVer := dl.getOrCreateTableVersion(tableID)
+	version := tableVer.Add(1)
 	timestamp := time.Now().UnixMilli()
 
 	entry := LogEntry{
@@ -183,7 +220,7 @@ func (dl *OptimisticDeltaLog) AppendRemove(tableID, filePath string) error {
 
 	data, err := json.Marshal(entry)
 	if err != nil {
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to marshal log entry: %w", err)
 	}
 
@@ -191,13 +228,13 @@ func (dl *OptimisticDeltaLog) AppendRemove(tableID, filePath string) error {
 	err = dl.objectStore.PutIfNotExists(versionFilePath, data)
 	if err != nil {
 		if isConflictError(err) {
-			dl.currentVer.Add(-1)
+			tableVer.Add(-1)
 			return &ConflictError{
 				Version: version,
 				Message: "version conflict on REMOVE operation",
 			}
 		}
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to write version file: %w", err)
 	}
 
@@ -212,12 +249,13 @@ func (dl *OptimisticDeltaLog) AppendRemove(tableID, filePath string) error {
 
 // AppendMetadata 追加METADATA操作
 func (dl *OptimisticDeltaLog) AppendMetadata(tableID string, schema *arrow.Schema) error {
-	version := dl.currentVer.Add(1)
+	tableVer := dl.getOrCreateTableVersion(tableID)
+	version := tableVer.Add(1)
 	timestamp := time.Now().UnixMilli()
 
 	schemaJSON, err := SchemaToJSON(schema)
 	if err != nil {
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to serialize schema: %w", err)
 	}
 
@@ -231,7 +269,7 @@ func (dl *OptimisticDeltaLog) AppendMetadata(tableID string, schema *arrow.Schem
 
 	data, err := json.Marshal(entry)
 	if err != nil {
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to marshal log entry: %w", err)
 	}
 
@@ -239,13 +277,13 @@ func (dl *OptimisticDeltaLog) AppendMetadata(tableID string, schema *arrow.Schem
 	err = dl.objectStore.PutIfNotExists(versionFilePath, data)
 	if err != nil {
 		if isConflictError(err) {
-			dl.currentVer.Add(-1)
+			tableVer.Add(-1)
 			return &ConflictError{
 				Version: version,
 				Message: "version conflict on METADATA operation",
 			}
 		}
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to write version file: %w", err)
 	}
 
@@ -259,7 +297,8 @@ func (dl *OptimisticDeltaLog) AppendMetadata(tableID string, schema *arrow.Schem
 
 // AppendIndexMetadata 追加索引元数据操作
 func (dl *OptimisticDeltaLog) AppendIndexMetadata(tableID, indexName string, indexMeta map[string]interface{}) error {
-	version := dl.currentVer.Add(1)
+	tableVer := dl.getOrCreateTableVersion(tableID)
+	version := tableVer.Add(1)
 	timestamp := time.Now().UnixMilli()
 
 	indexJSON, err := json.Marshal(map[string]interface{}{
@@ -268,7 +307,7 @@ func (dl *OptimisticDeltaLog) AppendIndexMetadata(tableID, indexName string, ind
 		"metadata":   indexMeta,
 	})
 	if err != nil {
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to marshal index metadata: %w", err)
 	}
 
@@ -282,7 +321,7 @@ func (dl *OptimisticDeltaLog) AppendIndexMetadata(tableID, indexName string, ind
 
 	data, err := json.Marshal(entry)
 	if err != nil {
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to marshal log entry: %w", err)
 	}
 
@@ -290,13 +329,13 @@ func (dl *OptimisticDeltaLog) AppendIndexMetadata(tableID, indexName string, ind
 	err = dl.objectStore.PutIfNotExists(versionFilePath, data)
 	if err != nil {
 		if isConflictError(err) {
-			dl.currentVer.Add(-1)
+			tableVer.Add(-1)
 			return &ConflictError{
 				Version: version,
 				Message: "version conflict on INDEX METADATA operation",
 			}
 		}
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to write version file: %w", err)
 	}
 
@@ -310,7 +349,8 @@ func (dl *OptimisticDeltaLog) AppendIndexMetadata(tableID, indexName string, ind
 
 // RemoveIndexMetadata 删除索引元数据操作
 func (dl *OptimisticDeltaLog) RemoveIndexMetadata(tableID, indexName string) error {
-	version := dl.currentVer.Add(1)
+	tableVer := dl.getOrCreateTableVersion(tableID)
+	version := tableVer.Add(1)
 	timestamp := time.Now().UnixMilli()
 
 	indexJSON, err := json.Marshal(map[string]interface{}{
@@ -318,7 +358,7 @@ func (dl *OptimisticDeltaLog) RemoveIndexMetadata(tableID, indexName string) err
 		"table_id":   tableID,
 	})
 	if err != nil {
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to marshal index deletion metadata: %w", err)
 	}
 
@@ -333,7 +373,7 @@ func (dl *OptimisticDeltaLog) RemoveIndexMetadata(tableID, indexName string) err
 
 	data, err := json.Marshal(entry)
 	if err != nil {
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to marshal log entry: %w", err)
 	}
 
@@ -341,13 +381,13 @@ func (dl *OptimisticDeltaLog) RemoveIndexMetadata(tableID, indexName string) err
 	err = dl.objectStore.PutIfNotExists(versionFilePath, data)
 	if err != nil {
 		if isConflictError(err) {
-			dl.currentVer.Add(-1)
+			tableVer.Add(-1)
 			return &ConflictError{
 				Version: version,
 				Message: "version conflict on INDEX DROP operation",
 			}
 		}
-		dl.currentVer.Add(-1)
+		tableVer.Add(-1)
 		return fmt.Errorf("failed to write version file: %w", err)
 	}
 
@@ -362,7 +402,9 @@ func (dl *OptimisticDeltaLog) RemoveIndexMetadata(tableID, indexName string) err
 // GetSnapshot 获取表快照（读取所有版本文件）
 func (dl *OptimisticDeltaLog) GetSnapshot(tableID string, version int64) (*Snapshot, error) {
 	if version == -1 {
-		version = dl.currentVer.Load()
+		// 获取该表的最新版本
+		tableVer := dl.getOrCreateTableVersion(tableID)
+		version = tableVer.Load()
 	}
 
 	snapshot := &Snapshot{
@@ -439,16 +481,27 @@ func (dl *OptimisticDeltaLog) GetSnapshot(tableID string, version int64) (*Snaps
 	return snapshot, nil
 }
 
-// GetLatestVersion 获取最新版本号
+// GetLatestVersion 获取最新版本号（所有表中的最大版本）
 func (dl *OptimisticDeltaLog) GetLatestVersion() int64 {
-	return dl.currentVer.Load()
+	dl.tableMu.RLock()
+	defer dl.tableMu.RUnlock()
+
+	maxVersion := int64(0)
+	for _, tableVer := range dl.tableVersions {
+		ver := tableVer.Load()
+		if ver > maxVersion {
+			maxVersion = ver
+		}
+	}
+	return maxVersion
 }
 
 // GetVersionByTimestamp 根据时间戳查找版本号
 func (dl *OptimisticDeltaLog) GetVersionByTimestamp(tableID string, ts int64) (int64, error) {
 	// 二分查找版本号
 	// 简化实现：线性扫描
-	latestVersion := dl.currentVer.Load()
+	tableVer := dl.getOrCreateTableVersion(tableID)
+	latestVersion := tableVer.Load()
 
 	for v := latestVersion; v >= 1; v-- {
 		versionFilePath := dl.getVersionFilePath(tableID, v)
@@ -472,31 +525,13 @@ func (dl *OptimisticDeltaLog) GetVersionByTimestamp(tableID string, ts int64) (i
 
 // ListTables 列出所有表
 func (dl *OptimisticDeltaLog) ListTables() []string {
-	// 扫描所有版本文件，提取唯一的table ID
-	latestVersion := dl.currentVer.Load()
-	tableSet := make(map[string]bool)
+	// 直接从tableVersions map获取所有表ID（最简单的方法）
+	dl.tableMu.RLock()
+	defer dl.tableMu.RUnlock()
 
-	for v := int64(1); v <= latestVersion; v++ {
-		// 构建版本文件路径模式
-		versionFilePath := fmt.Sprintf("%s/sys/_delta_log/%020d.json", dl.basePath, v)
-		data, err := dl.objectStore.Get(versionFilePath)
-		if err != nil {
-			continue
-		}
-
-		var entry LogEntry
-		if err := json.Unmarshal(data, &entry); err != nil {
-			continue
-		}
-
-		if entry.TableID != "" {
-			tableSet[entry.TableID] = true
-		}
-	}
-
-	tables := make([]string, 0, len(tableSet))
-	for table := range tableSet {
-		tables = append(tables, table)
+	tables := make([]string, 0, len(dl.tableVersions))
+	for tableID := range dl.tableVersions {
+		tables = append(tables, tableID)
 	}
 
 	return tables
@@ -504,11 +539,31 @@ func (dl *OptimisticDeltaLog) ListTables() []string {
 
 // GetAllEntries 获取所有日志条目
 func (dl *OptimisticDeltaLog) GetAllEntries() []LogEntry {
-	latestVersion := dl.currentVer.Load()
 	entries := make([]LogEntry, 0)
 
+	// 获取所有表的列表
+	tables := dl.ListTables()
+
+	// 遍历每个表的所有版本
+	for _, tableID := range tables {
+		tableEntries := dl.GetEntriesByTable(tableID)
+		entries = append(entries, tableEntries...)
+	}
+
+	return entries
+}
+
+// GetEntriesByTable 获取指定表的日志条目
+func (dl *OptimisticDeltaLog) GetEntriesByTable(tableID string) []LogEntry {
+	entries := make([]LogEntry, 0)
+
+	// 获取该表的最新版本号
+	tableVer := dl.getOrCreateTableVersion(tableID)
+	latestVersion := tableVer.Load()
+
+	// 遍历该表的所有版本文件
 	for v := int64(1); v <= latestVersion; v++ {
-		versionFilePath := fmt.Sprintf("%s/sys/_delta_log/%020d.json", dl.basePath, v)
+		versionFilePath := dl.getVersionFilePath(tableID, v)
 		data, err := dl.objectStore.Get(versionFilePath)
 		if err != nil {
 			continue
@@ -519,18 +574,6 @@ func (dl *OptimisticDeltaLog) GetAllEntries() []LogEntry {
 			continue
 		}
 
-		entries = append(entries, entry)
-	}
-
-	return entries
-}
-
-// GetEntriesByTable 获取指定表的日志条目
-func (dl *OptimisticDeltaLog) GetEntriesByTable(tableID string) []LogEntry {
-	allEntries := dl.GetAllEntries()
-	entries := make([]LogEntry, 0)
-
-	for _, entry := range allEntries {
 		if entry.TableID == tableID {
 			entries = append(entries, entry)
 		}
@@ -541,11 +584,36 @@ func (dl *OptimisticDeltaLog) GetEntriesByTable(tableID string) []LogEntry {
 
 // 辅助方法
 
-// getVersionFilePath 获取版本文件路径
+// getVersionFilePath 获取版本文件路径（每个表独立的版本空间）
 func (dl *OptimisticDeltaLog) getVersionFilePath(tableID string, version int64) string {
 	// 格式: {basePath}/sys/_delta_log/{table_id}/000001.json
-	// 为简化实现，先使用全局版本号
-	return fmt.Sprintf("%s/sys/_delta_log/%020d.json", dl.basePath, version)
+	// 每个表有独立的版本号空间
+	return fmt.Sprintf("%s/sys/_delta_log/%s/%020d.json", dl.basePath, tableID, version)
+}
+
+// getOrCreateTableVersion 获取或创建表的版本计数器
+func (dl *OptimisticDeltaLog) getOrCreateTableVersion(tableID string) *atomic.Int64 {
+	dl.tableMu.RLock()
+	ver, exists := dl.tableVersions[tableID]
+	dl.tableMu.RUnlock()
+
+	if exists {
+		return ver
+	}
+
+	// 不存在则创建
+	dl.tableMu.Lock()
+	defer dl.tableMu.Unlock()
+
+	// 双重检查
+	if ver, exists := dl.tableVersions[tableID]; exists {
+		return ver
+	}
+
+	ver = &atomic.Int64{}
+	ver.Store(0)
+	dl.tableVersions[tableID] = ver
+	return ver
 }
 
 // isConflictError 判断是否是冲突错误

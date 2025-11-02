@@ -320,6 +320,7 @@ type ColumnStatsCollector struct {
 	maxValue   interface{}
 	valueFreqs map[interface{}]int64 // 值频率统计
 	samples    []interface{}         // 采样值（用于直方图）
+	hll        *HyperLogLog          // HyperLogLog for cardinality estimation
 }
 
 // NewColumnStatsCollector 创建列统计收集器
@@ -329,6 +330,7 @@ func NewColumnStatsCollector(columnName string, dataType types.DataType) *Column
 		dataType:   dataType,
 		valueFreqs: make(map[interface{}]int64),
 		samples:    make([]interface{}, 0),
+		hll:        NewHyperLogLog(), // P0.3: Add HyperLogLog for accurate cardinality
 	}
 }
 
@@ -371,6 +373,9 @@ func (csc *ColumnStatsCollector) ProcessArray(arr arrow.Array) {
 		// 统计频率
 		csc.valueFreqs[value]++
 
+		// P0.3: Add value to HyperLogLog for cardinality estimation
+		csc.hll.Add(value)
+
 		// 采样（限制样本数量）
 		if len(csc.samples) < 1000 {
 			csc.samples = append(csc.samples, value)
@@ -380,11 +385,18 @@ func (csc *ColumnStatsCollector) ProcessArray(arr arrow.Array) {
 
 // Finalize 完成统计信息收集
 func (csc *ColumnStatsCollector) Finalize() *ColumnStatistics {
+	// P0.3: Use HyperLogLog for cardinality estimation when valueFreqs map is large
+	distinctCount := int64(len(csc.valueFreqs))
+	if len(csc.valueFreqs) > 10000 {
+		// For large cardinalities, use HLL estimate (more memory efficient)
+		distinctCount = csc.hll.Estimate()
+	}
+
 	stats := &ColumnStatistics{
 		ColumnName:    csc.columnName,
 		DataType:      csc.dataType,
 		NullCount:     csc.nullCount,
-		DistinctCount: int64(len(csc.valueFreqs)),
+		DistinctCount: distinctCount, // P0.3: Use HLL-based estimate
 		MinValue:      csc.minValue,
 		MaxValue:      csc.maxValue,
 		LastUpdated:   time.Now(),
@@ -393,8 +405,8 @@ func (csc *ColumnStatsCollector) Finalize() *ColumnStatistics {
 	// 计算最常见值
 	stats.MostCommonValues = csc.calculateMCV()
 
-	// 构建直方图
-	stats.Histogram = csc.buildHistogram()
+	// P0.3: Build equi-height histogram instead of equi-width
+	stats.Histogram = csc.buildEquiHeightHistogram()
 
 	return stats
 }
@@ -563,6 +575,40 @@ func (csc *ColumnStatsCollector) buildNumericHistogram(histogram *Histogram, buc
 	for i := range histogram.Buckets {
 		histogram.Buckets[i].Frequency = float64(histogram.Buckets[i].Count) / float64(csc.totalCount)
 	}
+}
+
+// buildEquiHeightHistogram builds an equi-height histogram (P0.3 improvement)
+// Better for skewed data distributions than equi-width histograms
+func (csc *ColumnStatsCollector) buildEquiHeightHistogram() *Histogram {
+	if len(csc.samples) < 10 {
+		return nil // Not enough samples
+	}
+
+	// P0.3: Use EquiHeightHistogram for better selectivity estimation
+	const bucketCount = 10
+	equiHeight := BuildEquiHeightHistogram(csc.samples, bucketCount)
+
+	if equiHeight == nil {
+		// Fallback to old equi-width histogram
+		return csc.buildHistogram()
+	}
+
+	// Convert EquiHeightHistogram to legacy Histogram format
+	histogram := &Histogram{
+		Buckets:    make([]HistogramBucket, len(equiHeight.Buckets)),
+		TotalCount: csc.totalCount,
+	}
+
+	for i, bucket := range equiHeight.Buckets {
+		histogram.Buckets[i] = HistogramBucket{
+			LowerBound: bucket.LowerBound,
+			UpperBound: bucket.UpperBound,
+			Count:      int64(bucket.RowCount),
+			Frequency:  float64(bucket.RowCount) / float64(equiHeight.TotalRows),
+		}
+	}
+
+	return histogram
 }
 
 // 工具函数

@@ -11,8 +11,11 @@ import (
 	"github.com/apache/arrow/go/v18/arrow/array"
 	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/yyun543/minidb/internal/catalog"
+	"github.com/yyun543/minidb/internal/logger"
+	"github.com/yyun543/minidb/internal/session"
 	"github.com/yyun543/minidb/internal/storage"
 	"github.com/yyun543/minidb/internal/types"
+	"go.uber.org/zap"
 )
 
 // DataManager 管理表数据的存储和查询 (v2.0)
@@ -62,6 +65,158 @@ func (dm *DataManager) InsertData(dbName, tableName string, columns []string, va
 	return nil
 }
 
+// InsertDataInTransaction 在事务中插入数据（延迟提交到Delta Log）
+func (dm *DataManager) InsertDataInTransaction(dbName, tableName string, columns []string, values []interface{}, tx interface{}) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	// Import session package to avoid circular dependency
+	// We use interface{} and type assertion
+	txSession, ok := tx.(*session.Transaction)
+	if !ok {
+		return fmt.Errorf("invalid transaction type")
+	}
+
+	// 获取表元数据
+	tableMeta, err := dm.catalog.GetTable(dbName, tableName)
+	if err != nil {
+		return fmt.Errorf("table not found: %w", err)
+	}
+
+	// 创建新记录
+	newRecord, err := dm.createRecord(tableMeta.Schema, columns, values)
+	if err != nil {
+		return err
+	}
+	defer newRecord.Release()
+
+	// 写入Parquet文件，但不提交到Delta Log
+	ctx := context.Background()
+	parquetEngine, ok := dm.storageEngine.(*storage.ParquetEngine)
+	if !ok {
+		return fmt.Errorf("storage engine does not support transactions")
+	}
+
+	parquetFile, err := parquetEngine.WriteWithoutCommit(ctx, dbName, tableName, newRecord)
+	if err != nil {
+		return fmt.Errorf("failed to write parquet file: %w", err)
+	}
+
+	// 将操作添加到事务缓冲区
+	tableID := fmt.Sprintf("%s.%s", dbName, tableName)
+	op := session.PendingOperation{
+		Type:    "ADD",
+		TableID: tableID,
+		Data:    parquetFile,
+	}
+
+	if err := txSession.AddOperation(op); err != nil {
+		return fmt.Errorf("failed to add operation to transaction: %w", err)
+	}
+
+	logger.WithComponent("data_manager").Info("Data buffered in transaction",
+		zap.String("table", tableID),
+		zap.Int("values", len(values)))
+
+	return nil
+}
+
+// DeleteDataInTransaction 在事务中删除数据（延迟提交到Delta Log）
+func (dm *DataManager) DeleteDataInTransaction(dbName, tableName string, filters []storage.Filter, tx interface{}) (int64, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	// Type assertion to avoid circular dependency
+	txSession, ok := tx.(*session.Transaction)
+	if !ok {
+		return 0, fmt.Errorf("invalid transaction type")
+	}
+
+	// Get table metadata to validate
+	_, err := dm.catalog.GetTable(dbName, tableName)
+	if err != nil {
+		return 0, fmt.Errorf("table not found: %w", err)
+	}
+
+	// KEY: Write delta file WITHOUT committing to Delta Log
+	ctx := context.Background()
+	parquetEngine, ok := dm.storageEngine.(*storage.ParquetEngine)
+	if !ok {
+		return 0, fmt.Errorf("storage engine does not support transactions")
+	}
+
+	parquetFile, affectedRows, err := parquetEngine.DeleteWithoutCommit(ctx, dbName, tableName, filters)
+	if err != nil {
+		return 0, fmt.Errorf("failed to write delta file: %w", err)
+	}
+
+	// KEY: Buffer operation in transaction
+	tableID := fmt.Sprintf("%s.%s", dbName, tableName)
+	op := session.PendingOperation{
+		Type:    "ADD", // Delta files use ADD operation type
+		TableID: tableID,
+		Data:    parquetFile,
+	}
+
+	if err := txSession.AddOperation(op); err != nil {
+		return 0, fmt.Errorf("failed to add operation to transaction: %w", err)
+	}
+
+	logger.WithComponent("data_manager").Info("DELETE buffered in transaction",
+		zap.String("table", tableID),
+		zap.Int64("affected_rows", affectedRows))
+
+	return affectedRows, nil
+}
+
+// UpdateDataInTransaction 在事务中更新数据（延迟提交到Delta Log）
+func (dm *DataManager) UpdateDataInTransaction(dbName, tableName string, assignments map[string]interface{}, filters []storage.Filter, tx interface{}) (int64, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	// Type assertion to avoid circular dependency
+	txSession, ok := tx.(*session.Transaction)
+	if !ok {
+		return 0, fmt.Errorf("invalid transaction type")
+	}
+
+	// Get table metadata to validate
+	_, err := dm.catalog.GetTable(dbName, tableName)
+	if err != nil {
+		return 0, fmt.Errorf("table not found: %w", err)
+	}
+
+	// KEY: Write delta file WITHOUT committing to Delta Log
+	ctx := context.Background()
+	parquetEngine, ok := dm.storageEngine.(*storage.ParquetEngine)
+	if !ok {
+		return 0, fmt.Errorf("storage engine does not support transactions")
+	}
+
+	parquetFile, affectedRows, err := parquetEngine.UpdateWithoutCommit(ctx, dbName, tableName, filters, assignments)
+	if err != nil {
+		return 0, fmt.Errorf("failed to write delta file: %w", err)
+	}
+
+	// KEY: Buffer operation in transaction
+	tableID := fmt.Sprintf("%s.%s", dbName, tableName)
+	op := session.PendingOperation{
+		Type:    "ADD", // Delta files use ADD operation type
+		TableID: tableID,
+		Data:    parquetFile,
+	}
+
+	if err := txSession.AddOperation(op); err != nil {
+		return 0, fmt.Errorf("failed to add operation to transaction: %w", err)
+	}
+
+	logger.WithComponent("data_manager").Info("UPDATE buffered in transaction",
+		zap.String("table", tableID),
+		zap.Int64("affected_rows", affectedRows))
+
+	return affectedRows, nil
+}
+
 // GetTableData 获取表的所有数据 (v2.0)
 func (dm *DataManager) GetTableData(dbName, tableName string) ([]*types.Batch, error) {
 	dm.mu.RLock()
@@ -90,6 +245,24 @@ func (dm *DataManager) GetTableData(dbName, tableName string) ([]*types.Batch, e
 	for iter.Next() {
 		record := iter.Record()
 		if record.NumRows() > 0 {
+			// DEBUG: 检查读取的Record
+			logger.WithComponent("data_manager").Info("GetTableData: read record",
+				zap.String("table", tableName),
+				zap.Int64("num_rows", record.NumRows()),
+				zap.Int64("num_cols", record.NumCols()))
+			for i := int64(0); i < record.NumCols() && i < 5; i++ { // 只检查前5列
+				col := record.Column(int(i))
+				fieldName := record.Schema().Field(int(i)).Name
+				logger.WithComponent("data_manager").Info("GetTableData: column info",
+					zap.String("field", fieldName),
+					zap.Int("null_count", col.NullN()))
+				if col.Len() > 0 {
+					isNull := col.IsNull(0)
+					logger.WithComponent("data_manager").Info("GetTableData: first value",
+						zap.String("field", fieldName),
+						zap.Bool("is_null", isNull))
+				}
+			}
 			batch := types.NewBatch(record)
 			batches = append(batches, batch)
 		}
@@ -587,6 +760,19 @@ func (dm *DataManager) createRecord(schema *arrow.Schema, columns []string, valu
 		}
 	}
 
+	// DEBUG: 打印values的类型和值
+	logger.WithComponent("data_manager").Info("createRecord values",
+		zap.Int("field_count", len(schema.Fields())),
+		zap.Int("column_count", len(columns)),
+		zap.Int("value_count", len(values)))
+	for i, val := range fieldValues {
+		fieldName := schema.Field(i).Name
+		logger.WithComponent("data_manager").Info("field value",
+			zap.String("field", fieldName),
+			zap.String("type", fmt.Sprintf("%T", val)),
+			zap.Any("value", val))
+	}
+
 	// 为所有字段添加值
 	for i, value := range fieldValues {
 		field := builder.Field(i)
@@ -596,7 +782,28 @@ func (dm *DataManager) createRecord(schema *arrow.Schema, columns []string, valu
 		}
 	}
 
-	return builder.NewRecord(), nil
+	record := builder.NewRecord()
+
+	// DEBUG: 检查创建的Record
+	logger.WithComponent("data_manager").Info("createRecord: built record",
+		zap.Int64("num_rows", record.NumRows()),
+		zap.Int64("num_cols", record.NumCols()))
+	for i := int64(0); i < record.NumCols(); i++ {
+		col := record.Column(int(i))
+		fieldName := schema.Field(int(i)).Name
+		logger.WithComponent("data_manager").Info("createRecord: column info",
+			zap.String("field", fieldName),
+			zap.Int64("length", int64(col.Len())),
+			zap.Int("null_count", col.NullN()))
+		if col.Len() > 0 {
+			isNull := col.IsNull(0)
+			logger.WithComponent("data_manager").Info("createRecord: first value in column",
+				zap.String("field", fieldName),
+				zap.Bool("is_null", isNull))
+		}
+	}
+
+	return record, nil
 }
 
 // updateRecord 更新记录
@@ -655,41 +862,126 @@ func (dm *DataManager) getValueFromArray(arr arrow.Array, index int) interface{}
 
 // appendValue 向字段添加值
 func (dm *DataManager) appendValue(field array.Builder, value interface{}) error {
+	logger.WithComponent("data_manager").Info("appendValue called",
+		zap.String("field_type", fmt.Sprintf("%T", field)),
+		zap.String("value_type", fmt.Sprintf("%T", value)),
+		zap.Any("value", value))
+
+	if value == nil {
+		logger.WithComponent("data_manager").Info("appendValue: value is nil, appending NULL")
+		// Explicitly append NULL for nil values
+		switch field := field.(type) {
+		case *array.Int64Builder:
+			field.AppendNull()
+		case *array.Float64Builder:
+			field.AppendNull()
+		case *array.StringBuilder:
+			field.AppendNull()
+		case *array.BooleanBuilder:
+			field.AppendNull()
+		default:
+			return fmt.Errorf("unsupported field type")
+		}
+		return nil
+	}
+
 	switch field := field.(type) {
 	case *array.Int64Builder:
-		if v, ok := value.(int64); ok {
+		// 支持多种整数类型转换
+		switch v := value.(type) {
+		case int64:
+			logger.WithComponent("data_manager").Info("appendValue: appending int64", zap.Int64("value", v))
 			field.Append(v)
-		} else if v, ok := value.(int); ok {
+		case int:
+			logger.WithComponent("data_manager").Info("appendValue: appending int as int64", zap.Int("value", v))
 			field.Append(int64(v))
-		} else {
+		case int32:
+			field.Append(int64(v))
+		case int16:
+			field.Append(int64(v))
+		case int8:
+			field.Append(int64(v))
+		case uint:
+			field.Append(int64(v))
+		case uint64:
+			field.Append(int64(v))
+		case uint32:
+			field.Append(int64(v))
+		case uint16:
+			field.Append(int64(v))
+		case uint8:
+			field.Append(int64(v))
+		case float64:
+			// 允许float64转int64
+			field.Append(int64(v))
+		case float32:
+			field.Append(int64(v))
+		default:
 			field.AppendNull()
 		}
 	case *array.Float64Builder:
-		if v, ok := value.(float64); ok {
+		// 支持多种数字类型转换
+		switch v := value.(type) {
+		case float64:
 			field.Append(v)
-		} else {
+		case float32:
+			field.Append(float64(v))
+		case int64:
+			field.Append(float64(v))
+		case int:
+			field.Append(float64(v))
+		case int32:
+			field.Append(float64(v))
+		case int16:
+			field.Append(float64(v))
+		case int8:
+			field.Append(float64(v))
+		case uint:
+			field.Append(float64(v))
+		case uint64:
+			field.Append(float64(v))
+		case uint32:
+			field.Append(float64(v))
+		case uint16:
+			field.Append(float64(v))
+		case uint8:
+			field.Append(float64(v))
+		default:
 			field.AppendNull()
 		}
 	case *array.StringBuilder:
-		if v, ok := value.(string); ok {
+		switch v := value.(type) {
+		case string:
+			logger.WithComponent("data_manager").Info("appendValue: appending string", zap.String("value", v))
 			field.Append(v)
-		} else {
-			field.AppendNull()
+		case []byte:
+			logger.WithComponent("data_manager").Info("appendValue: appending []byte as string")
+			field.Append(string(v))
+		default:
+			// 尝试转换为字符串
+			logger.WithComponent("data_manager").Info("appendValue: converting to string", zap.Any("value", value))
+			field.Append(fmt.Sprintf("%v", value))
 		}
 	case *array.BooleanBuilder:
-		if v, ok := value.(bool); ok {
+		switch v := value.(type) {
+		case bool:
 			field.Append(v)
-		} else if v, ok := value.(int64); ok {
+		case int64:
 			// 支持 0/1 转换为 false/true
 			field.Append(v != 0)
-		} else if v, ok := value.(int); ok {
-			// 支持 0/1 转换为 false/true
+		case int:
 			field.Append(v != 0)
-		} else {
+		case int32:
+			field.Append(v != 0)
+		case int16:
+			field.Append(v != 0)
+		case int8:
+			field.Append(v != 0)
+		default:
 			field.AppendNull()
 		}
 	default:
-		return fmt.Errorf("unsupported field type")
+		return fmt.Errorf("unsupported field type: %T", field)
 	}
 	return nil
 }

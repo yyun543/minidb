@@ -1,0 +1,93 @@
+# MiniDB Configuration File
+# This file contains all configurable settings for MiniDB
+
+# Server Configuration
+server:
+  host: "localhost"
+  port: 7205
+  max_connections: 100
+  read_timeout: "30s"
+  write_timeout: "30s"
+
+# Storage Configuration
+storage:
+  base_path: "./minidb_data"
+  # Optimistic locking for better concurrency
+  use_optimistic_lock: true
+  max_retries: 5
+
+# Transaction Configuration
+transaction:
+  # Default isolation level: READ_UNCOMMITTED, READ_COMMITTED, REPEATABLE_READ, SERIALIZABLE
+  # - READ_UNCOMMITTED: Allows dirty reads (lowest isolation, highest performance)
+  # - READ_COMMITTED: Prevents dirty reads (default, good balance)
+  # - REPEATABLE_READ: Prevents non-repeatable reads (snapshot-based)
+  # - SERIALIZABLE: Full serializability with write conflict detection
+  isolation_level: "READ_COMMITTED"
+  # Default transaction timeout (seconds)
+  default_timeout_seconds: 300
+
+# Query Cache Configuration (P1.1)
+cache:
+  enabled: true
+  max_size_mb: 512
+  ttl: "5m"
+  min_compute_time_ms: 10
+
+# Compaction Configuration (P1.2)
+compaction:
+  enabled: true
+  target_file_size_mb: 128
+  min_file_size_mb: 10
+  max_files_per_compaction: 10
+  check_interval: "5m"
+  max_concurrent_compactions: 2
+  io_throttle_delay: "0s"
+
+# Execution Configuration
+execution:
+  # Use vectorized execution by default
+  use_vectorized: true
+  # Worker pool size for parallel operations
+  worker_pool_size: 4
+  # Batch size for vectorized operations
+  batch_size: 1024
+
+# Statistics Configuration (P0.3)
+statistics:
+  enabled: true
+  # Auto-collect statistics interval
+  auto_collect_interval: "10m"
+  # Sample rate for large tables (0.1 = 10%)
+  sample_rate: 0.1
+
+# Logging Configuration
+logging:
+  level: "debug"  # debug, info, warn, error
+  format: "json" # json, console
+  output: "stdout" # stdout, stderr, or file path
+  # Rotate logs daily
+  rotation:
+    enabled: true
+    max_size_mb: 100
+    max_backups: 7
+    max_age_days: 30
+
+# Performance Tuning
+performance:
+  # Memory pool size for Arrow allocations
+  memory_pool_size_mb: 1024
+  # Enable query result streaming
+  enable_streaming: true
+  # Max concurrent queries
+  max_concurrent_queries: 50
+
+# Development/Debug Settings
+debug:
+  # Enable profiling endpoint
+  enable_pprof: false
+  pprof_port: 6060
+  # Enable query execution tracing
+  enable_tracing: false
+  # Dump query plans to logs
+  dump_query_plans: false

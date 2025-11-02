@@ -1,13 +1,9 @@
 package test
 
 import (
-	"context"
 	"os"
 	"testing"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/yyun543/minidb/internal/catalog"
@@ -19,10 +15,7 @@ import (
 )
 
 // TestSystemTableQueries tests querying system tables (sys.*)
-// Bug: System tables return empty results even though data exists
-// TODO: Implement system table metadata population
 func TestSystemTableQueries(t *testing.T) {
-	t.Skip("System table metadata population not yet fully implemented - tracked as known issue")
 	testDir := "./test_data/system_tables_query_test"
 	os.RemoveAll(testDir)
 	defer os.RemoveAll(testDir)
@@ -44,35 +37,37 @@ func TestSystemTableQueries(t *testing.T) {
 	require.NoError(t, err)
 	sess := sessMgr.CreateSession()
 
-	// Create test database and table
-	err = engine.CreateDatabase("testdb")
-	require.NoError(t, err)
-
-	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "name", Type: arrow.BinaryTypes.String},
-	}, nil)
-
-	err = engine.CreateTable("testdb", "users", schema)
-	require.NoError(t, err)
-
-	// Insert some data
-	pool := memory.NewGoAllocator()
-	builder := array.NewRecordBuilder(pool, schema)
-	defer builder.Release()
-
-	builder.Field(0).(*array.Int64Builder).Append(1)
-	builder.Field(1).(*array.StringBuilder).Append("John")
-
-	record := builder.NewRecord()
-	defer record.Release()
-
-	err = engine.Write(context.Background(), "testdb", "users", record)
-	require.NoError(t, err)
-
 	// Create executor for testing
 	exec := executor.NewExecutor(cat)
 	opt := optimizer.NewOptimizer()
+
+	// Create test database through SQL (to populate system tables)
+	createDBSQL := "CREATE DATABASE testdb"
+	stmt, err := parser.Parse(createDBSQL)
+	require.NoError(t, err)
+	plan, err := opt.Optimize(stmt)
+	require.NoError(t, err)
+	_, err = exec.Execute(plan, sess)
+	require.NoError(t, err)
+
+	// Create test table through SQL (to populate system tables)
+	sess.CurrentDB = "testdb"
+	createTableSQL := `CREATE TABLE users (id INTEGER, name VARCHAR(255))`
+	stmt, err = parser.Parse(createTableSQL)
+	require.NoError(t, err)
+	plan, err = opt.Optimize(stmt)
+	require.NoError(t, err)
+	_, err = exec.Execute(plan, sess)
+	require.NoError(t, err)
+
+	// Insert some data through SQL
+	insertSQL := "INSERT INTO users VALUES (1, 'John')"
+	stmt, err = parser.Parse(insertSQL)
+	require.NoError(t, err)
+	plan, err = opt.Optimize(stmt)
+	require.NoError(t, err)
+	_, err = exec.Execute(plan, sess)
+	require.NoError(t, err)
 
 	t.Run("QuerySysDbMetadataShouldReturnDatabases", func(t *testing.T) {
 		sql := "SELECT * FROM sys.db_metadata"
@@ -181,7 +176,7 @@ func TestSystemTableQueries(t *testing.T) {
 	})
 
 	t.Run("QuerySysDeltaLogShouldReturnLogEntries", func(t *testing.T) {
-		sql := "SELECT table_id, operation FROM sys.delta_log WHERE table_id LIKE 'testdb%' LIMIT 5"
+		sql := "SELECT db_name, table_name, operation FROM sys.delta_log WHERE db_name = 'testdb' LIMIT 5"
 		stmt, err := parser.Parse(sql)
 		require.NoError(t, err)
 
