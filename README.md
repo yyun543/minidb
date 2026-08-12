@@ -1,3 +1,5 @@
+
+
 # MiniDB
 
 <div align="center">
@@ -75,6 +77,7 @@ The server will start on `localhost:7205`.
 ```bash
 # Connect to MiniDB
 nc localhost 7205
+# Note: Press Enter after each SQL statement to execute it
 
 # Or use telnet
 telnet localhost 7205
@@ -389,7 +392,7 @@ Average file skip rate: 54% → Half the data read
    - Narrower Min/Max value ranges
 
 2. Query optimizer utilizes statistics:
-   SELECT * FROM logs WHERE source_ip = 'x'
+ SELECT * FROM logs WHERE source_ip = 'x'
 
    → Scan Min/Max statistics
    → Skip 93% of irrelevant files
